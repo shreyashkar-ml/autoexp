@@ -1,4 +1,3 @@
-import json
 import os
 from pathlib import Path
 from typing import Any
@@ -46,79 +45,6 @@ class MCPOverride(BaseModel):
     timeout_s: int | None = None
 
 
-PNG_1X1 = bytes(
-    [
-        137,
-        80,
-        78,
-        71,
-        13,
-        10,
-        26,
-        10,
-        0,
-        0,
-        0,
-        13,
-        73,
-        72,
-        68,
-        82,
-        0,
-        0,
-        0,
-        1,
-        0,
-        0,
-        0,
-        1,
-        8,
-        6,
-        0,
-        0,
-        0,
-        31,
-        21,
-        196,
-        137,
-        0,
-        0,
-        0,
-        10,
-        73,
-        68,
-        65,
-        84,
-        120,
-        156,
-        99,
-        248,
-        15,
-        0,
-        1,
-        5,
-        1,
-        2,
-        164,
-        42,
-        160,
-        201,
-        0,
-        0,
-        0,
-        0,
-        73,
-        69,
-        78,
-        68,
-        174,
-        66,
-        96,
-        130,
-    ]
-)
-
-
 def _load_registry(path: Path) -> dict[str, Any]:
     return read_json(path, {"schema_version": SCHEMA_VERSION, "profiles": {}})
 
@@ -128,19 +54,11 @@ def _save_registry(path: Path, payload: dict[str, Any]) -> None:
     write_json(path, payload)
 
 
-def _append_event(paths: RepoPaths, run_id: str, event: dict[str, Any]) -> None:
-    events_file = paths.runs_dir / run_id / "events.jsonl"
-    events_file.parent.mkdir(parents=True, exist_ok=True)
-    with events_file.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"ts": utc_now_iso(), **event}, sort_keys=True))
-        handle.write("\n")
-
-
-def _append_jsonl(path: Path, payload: dict[str, Any]) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    with path.open("a", encoding="utf-8") as handle:
-        handle.write(json.dumps(payload, sort_keys=True))
-        handle.write("\n")
+def _apply_override(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
+    merged = dict(base)
+    for key, value in override.items():
+        merged[key] = value
+    return merged
 
 
 def add_profile(
@@ -156,6 +74,7 @@ def add_profile(
 ) -> dict[str, Any]:
     ensure_repo_layout(paths)
     ensure_user_layout(paths)
+
     if scope == "user":
         profile = MCPProfile(
             name=name,
@@ -167,12 +86,11 @@ def add_profile(
             enabled=enabled,
         )
         registry = _load_registry(paths.user_registry_file)
-        registry["profiles"][name] = profile.model_dump()
+        registry.setdefault("profiles", {})[name] = profile.model_dump()
         _save_registry(paths.user_registry_file, registry)
         return registry["profiles"][name]
 
     if scope == "project":
-        overrides = _load_registry(paths.project_overrides_file)
         override = MCPOverride(
             enabled=enabled,
             transport=transport or None,
@@ -181,13 +99,12 @@ def add_profile(
             required_env=required_env,
             timeout_s=timeout_s,
         )
-        overrides["profiles"][name] = {
-            key: value
-            for key, value in override.model_dump().items()
-            if value is not None
+        registry = _load_registry(paths.project_overrides_file)
+        registry.setdefault("profiles", {})[name] = {
+            key: value for key, value in override.model_dump().items() if value is not None
         }
-        _save_registry(paths.project_overrides_file, overrides)
-        return overrides["profiles"][name]
+        _save_registry(paths.project_overrides_file, registry)
+        return registry["profiles"][name]
 
     raise ValueError("scope must be user or project")
 
@@ -197,11 +114,11 @@ def remove_profile(paths: RepoPaths, scope: str, name: str) -> bool:
     ensure_user_layout(paths)
     if scope not in {"user", "project"}:
         raise ValueError("scope must be user or project")
-    file_path = paths.user_registry_file if scope == "user" else paths.project_overrides_file
-    payload = _load_registry(file_path)
-    existed = name in payload.get("profiles", {})
-    payload.get("profiles", {}).pop(name, None)
-    _save_registry(file_path, payload)
+    registry_file = paths.user_registry_file if scope == "user" else paths.project_overrides_file
+    registry = _load_registry(registry_file)
+    existed = name in registry.get("profiles", {})
+    registry.get("profiles", {}).pop(name, None)
+    _save_registry(registry_file, registry)
     return existed
 
 
@@ -218,12 +135,12 @@ def set_profile_enabled(paths: RepoPaths, scope: str, name: str, enabled: bool) 
         return registry["profiles"][name]
 
     if scope == "project":
-        overrides = _load_registry(paths.project_overrides_file)
-        current = overrides.get("profiles", {}).get(name, {})
-        current["enabled"] = bool(enabled)
-        overrides.setdefault("profiles", {})[name] = current
-        _save_registry(paths.project_overrides_file, overrides)
-        return overrides["profiles"][name]
+        registry = _load_registry(paths.project_overrides_file)
+        profile = dict(registry.get("profiles", {}).get(name, {}))
+        profile["enabled"] = bool(enabled)
+        registry.setdefault("profiles", {})[name] = profile
+        _save_registry(paths.project_overrides_file, registry)
+        return registry["profiles"][name]
 
     raise ValueError("scope must be user or project")
 
@@ -243,25 +160,14 @@ def set_auth_ref(paths: RepoPaths, name: str, auth_ref: str) -> dict[str, Any]:
     return {"name": name, "auth_ref": auth_ref}
 
 
-def _apply_override(base: dict[str, Any], override: dict[str, Any]) -> dict[str, Any]:
-    merged = dict(base)
-    for key, value in override.items():
-        merged[key] = value
-    return merged
-
-
 def resolve_effective_profiles(paths: RepoPaths) -> dict[str, dict[str, Any]]:
     ensure_repo_layout(paths)
     ensure_user_layout(paths)
+    user_profiles = _load_registry(paths.user_registry_file).get("profiles", {})
+    project_overrides = _load_registry(paths.project_overrides_file).get("profiles", {})
 
-    registry = _load_registry(paths.user_registry_file)
-    overrides = _load_registry(paths.project_overrides_file)
-
-    user_profiles = registry.get("profiles", {})
-    project_profiles = overrides.get("profiles", {})
-
-    merged: dict[str, dict[str, Any]] = {}
-    for name in sorted(set(user_profiles) | set(project_profiles)):
+    effective: dict[str, dict[str, Any]] = {}
+    for name in sorted(set(user_profiles) | set(project_overrides)):
         if name in user_profiles:
             base = dict(user_profiles[name])
         else:
@@ -274,44 +180,41 @@ def resolve_effective_profiles(paths: RepoPaths) -> dict[str, dict[str, Any]]:
                 "timeout_s": 60,
                 "enabled": True,
             }
-        if name in project_profiles:
-            base = _apply_override(base, project_profiles[name])
+        if name in project_overrides:
+            base = _apply_override(base, project_overrides[name])
         base["name"] = name
-        merged[name] = base
-    return merged
+        effective[name] = base
+    return effective
 
 
 def _preflight(profile: dict[str, Any], auth_refs: dict[str, str]) -> tuple[bool, str | None]:
     errors: list[str] = []
-
     try:
         parsed = MCPProfile(**profile)
     except ValidationError as exc:
         return False, str(exc)
 
-    for env_name in parsed.required_env:
-        if os.getenv(env_name) is None:
-            errors.append(f"missing env var: {env_name}")
+    for name in parsed.required_env:
+        if os.getenv(name) is None:
+            errors.append(f"missing env var: {name}")
 
     if parsed.auth_ref and auth_refs.get(parsed.name) != parsed.auth_ref:
         errors.append(f"auth_ref mismatch for profile {parsed.name}")
 
     if errors:
         return False, "; ".join(errors)
-
     return True, None
 
 
 def connect_profile(paths: RepoPaths, name: str) -> dict[str, Any]:
     ensure_repo_layout(paths)
     ensure_user_layout(paths)
+
     effective = resolve_effective_profiles(paths)
     if name not in effective:
         raise KeyError(name)
-
     refs = read_json(paths.user_auth_refs_file, {"schema_version": SCHEMA_VERSION, "refs": {}})
     auth_refs = refs.get("refs", {})
-
     ok, error = _preflight(effective[name], auth_refs)
 
     health = read_json(paths.user_health_file, {"schema_version": SCHEMA_VERSION, "profiles": {}})
@@ -324,8 +227,7 @@ def connect_profile(paths: RepoPaths, name: str) -> dict[str, Any]:
     write_json(paths.user_health_file, health)
 
     if not ok:
-        raise ValueError(error or "preflight failed")
-
+        raise ValueError(error or "profile preflight failed")
     return health["profiles"][name]
 
 
@@ -358,24 +260,19 @@ def list_profiles(paths: RepoPaths, scope: str = "effective") -> dict[str, Any]:
     raise ValueError("scope must be user, project, or effective")
 
 
-def resolve_runtime_profiles(
-    paths: RepoPaths,
-    agent_filter: set[str] | None = None,
-) -> dict[str, dict[str, Any]]:
+def resolve_runtime_profiles(paths: RepoPaths) -> dict[str, dict[str, Any]]:
     effective = resolve_effective_profiles(paths)
     refs = read_json(paths.user_auth_refs_file, {"schema_version": SCHEMA_VERSION, "refs": {}})
     auth_refs = refs.get("refs", {})
 
-    resolved: dict[str, dict[str, Any]] = {}
+    runtime: dict[str, dict[str, Any]] = {}
     for name, profile in effective.items():
         if not profile.get("enabled", True):
             continue
-        if agent_filter and name not in agent_filter and profile.get("tool_namespace") not in agent_filter:
-            continue
         ok, _ = _preflight(profile, auth_refs)
         if ok:
-            resolved[name] = profile
-    return resolved
+            runtime[name] = profile
+    return runtime
 
 
 def map_tool_selector_to_profile(
@@ -386,123 +283,10 @@ def map_tool_selector_to_profile(
     runtime = resolve_runtime_profiles(paths)
     if namespace:
         for name, profile in runtime.items():
-            if profile.get("tool_namespace") == namespace or name == namespace:
+            if name == namespace or profile.get("tool_namespace") == namespace:
                 return profile
     if selector:
         for name, profile in runtime.items():
             if name == selector or profile.get("tool_namespace") == selector:
                 return profile
     return None
-
-
-def run_browser_scenario(
-    paths: RepoPaths,
-    run_id: str,
-    profile_name: str,
-    scenario: str,
-) -> dict[str, Any]:
-    runtime_profiles = resolve_runtime_profiles(paths)
-    if profile_name not in runtime_profiles:
-        raise ValueError(f"profile not available for runtime: {profile_name}")
-
-    run_dir = paths.runs_dir / run_id / "browser"
-    screenshot_dir = run_dir / "screenshots"
-    screenshot_dir.mkdir(parents=True, exist_ok=True)
-
-    screenshot_file = screenshot_dir / "step_001.png"
-    screenshot_file.write_bytes(PNG_1X1)
-
-    assertions = {
-        "schema_version": SCHEMA_VERSION,
-        "run_id": run_id,
-        "profile": profile_name,
-        "scenario": scenario,
-        "passed": True,
-        "assertions": [
-            {"name": "screenshot_written", "passed": True},
-            {"name": "scenario_recorded", "passed": True},
-        ],
-        "created_at": utc_now_iso(),
-    }
-    assertions_file = run_dir / "assertions.json"
-    write_json(assertions_file, assertions)
-
-    _append_event(
-        paths,
-        run_id,
-        {
-            "type": "browser_test_completed",
-            "profile": profile_name,
-            "scenario": scenario,
-            "artifacts": {
-                "screenshot": str(screenshot_file),
-                "assertions": str(assertions_file),
-            },
-        },
-    )
-
-    return {
-        "screenshot": str(screenshot_file),
-        "assertions": str(assertions_file),
-        "passed": True,
-    }
-
-
-def record_slack_notification(
-    paths: RepoPaths,
-    run_id: str,
-    channel: str,
-    message: str,
-    requested_by: str = "orchestrator",
-) -> dict[str, Any]:
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "run_id": run_id,
-        "channel": channel,
-        "message": message,
-        "requested_by": requested_by,
-        "created_at": utc_now_iso(),
-    }
-    jsonl_file = paths.runs_dir / run_id / "communications" / "slack_messages.jsonl"
-    _append_jsonl(jsonl_file, payload)
-    _append_event(
-        paths,
-        run_id,
-        {
-            "type": "slack_notification_sent",
-            "channel": channel,
-            "requested_by": requested_by,
-        },
-    )
-    return payload
-
-
-def record_github_operation(
-    paths: RepoPaths,
-    run_id: str,
-    operation: str,
-    summary: str,
-    requested_by: str = "orchestrator",
-    metadata: dict[str, Any] | None = None,
-) -> dict[str, Any]:
-    payload = {
-        "schema_version": SCHEMA_VERSION,
-        "run_id": run_id,
-        "operation": operation,
-        "summary": summary,
-        "requested_by": requested_by,
-        "metadata": metadata or {},
-        "created_at": utc_now_iso(),
-    }
-    jsonl_file = paths.runs_dir / run_id / "vcs" / "github_operations.jsonl"
-    _append_jsonl(jsonl_file, payload)
-    _append_event(
-        paths,
-        run_id,
-        {
-            "type": "github_operation_recorded",
-            "operation": operation,
-            "requested_by": requested_by,
-        },
-    )
-    return payload

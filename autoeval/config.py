@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 SCHEMA_VERSION = 1
+CONTRACT_VERSION = "1.0"
 
 
 def utc_now_iso() -> str:
@@ -17,7 +18,7 @@ def default_user_home() -> Path:
     env = os.getenv("AUTOEVAL_HOME")
     if env:
         return Path(env).expanduser().resolve()
-    return (Path.home() / ".config" / "autoeval").resolve()
+    return Path("/tmp/autoeval").resolve()
 
 
 @dataclass(frozen=True)
@@ -46,8 +47,20 @@ class RepoPaths:
         return self.autoeval_dir / "runs"
 
     @property
-    def memory_dir(self) -> Path:
-        return self.autoeval_dir / "memory"
+    def verifier_file(self) -> Path:
+        return self.autoeval_dir / "verifier.yaml"
+
+    @property
+    def autocheck_map_file(self) -> Path:
+        return self.rpi_dir / "autocheck_map.json"
+
+    @property
+    def review_file(self) -> Path:
+        return self.rpi_dir / "review.md"
+
+    @property
+    def tool_calls_file(self) -> Path:
+        return self.rpi_dir / "tool_calls.json"
 
     @property
     def mcp_project_dir(self) -> Path:
@@ -73,14 +86,6 @@ class RepoPaths:
     def user_health_file(self) -> Path:
         return self.user_mcp_dir / "health.json"
 
-    @property
-    def user_state_dir(self) -> Path:
-        return self.user_home / "state"
-
-    @property
-    def user_preferences_file(self) -> Path:
-        return self.user_state_dir / "preferences.json"
-
 
 def read_json(path: Path, default: Any) -> Any:
     if not path.exists():
@@ -100,19 +105,19 @@ def ensure_repo_layout(paths: RepoPaths) -> None:
     paths.autoeval_dir.mkdir(parents=True, exist_ok=True)
     paths.rpi_dir.mkdir(parents=True, exist_ok=True)
     paths.runs_dir.mkdir(parents=True, exist_ok=True)
-    paths.memory_dir.mkdir(parents=True, exist_ok=True)
     paths.mcp_project_dir.mkdir(parents=True, exist_ok=True)
 
     if not paths.state_file.exists():
+        now = utc_now_iso()
         write_json(
             paths.state_file,
             {
                 "schema_version": SCHEMA_VERSION,
-                "contract_version": "1.0",
+                "contract_version": CONTRACT_VERSION,
                 "provider": "codex",
                 "last_run_id": None,
-                "created_at": utc_now_iso(),
-                "updated_at": utc_now_iso(),
+                "created_at": now,
+                "updated_at": now,
             },
         )
 
@@ -123,7 +128,6 @@ def ensure_repo_layout(paths: RepoPaths) -> None:
 def ensure_user_layout(paths: RepoPaths) -> None:
     paths.user_home.mkdir(parents=True, exist_ok=True)
     paths.user_mcp_dir.mkdir(parents=True, exist_ok=True)
-    paths.user_state_dir.mkdir(parents=True, exist_ok=True)
 
     if not paths.user_registry_file.exists():
         write_json(paths.user_registry_file, {"schema_version": SCHEMA_VERSION, "profiles": {}})
@@ -134,14 +138,11 @@ def ensure_user_layout(paths: RepoPaths) -> None:
     if not paths.user_health_file.exists():
         write_json(paths.user_health_file, {"schema_version": SCHEMA_VERSION, "profiles": {}})
 
-    if not paths.user_preferences_file.exists():
-        write_json(paths.user_preferences_file, {"schema_version": SCHEMA_VERSION, "preferences": {}})
-
 
 def touch_state(paths: RepoPaths, **updates: Any) -> None:
     state = read_json(paths.state_file, {"schema_version": SCHEMA_VERSION})
     state.update(updates)
     state["schema_version"] = SCHEMA_VERSION
-    state["contract_version"] = "1.0"
+    state["contract_version"] = CONTRACT_VERSION
     state["updated_at"] = utc_now_iso()
     write_json(paths.state_file, state)

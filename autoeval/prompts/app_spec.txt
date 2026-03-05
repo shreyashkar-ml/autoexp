@@ -1,9 +1,0 @@
-# Generic Application Spec Seed
-
-Use this file as a high-level specification reference when bootstrapping autonomous runs.
-
-Include:
-- Product objective
-- Primary user flows
-- Non-functional constraints
-- Validation scenarios

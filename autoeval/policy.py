@@ -2,127 +2,115 @@ from __future__ import annotations
 
 from typing import Any, Callable
 
-from .agent_contract import ActionRequest, PolicyDecision, TaskEnvelope
+from pydantic import BaseModel, Field
 
-RuntimeApprover = Callable[[ActionRequest], bool | tuple[bool, str] | dict[str, Any]]
+from .security import validate_command, validate_pytest_target
 
-HIGH_RISK_ACTIONS = {"run", "cmd", "mcp_call", "github"}
+RuntimeApprover = Callable[[str, dict[str, Any]], bool | tuple[bool, str] | dict[str, Any]]
+
+HIGH_RISK_TOKENS = ("rm ", "pkill ", "chmod ", "curl ", "git push", "git reset")
 NETWORK_TOKENS = ("http://", "https://", "curl ", "wget ", "pip install", "npm install")
 
 
-def _allowed_action(task_envelope: TaskEnvelope, request: ActionRequest) -> tuple[bool, str]:
-    for action in task_envelope.allowed_actions:
-        if action.type != request.type:
-            continue
-        if action.selectors and request.selector and request.selector not in action.selectors:
-            continue
-        return True, "action allowed by task envelope"
-    return False, f"action type not allowed: {request.type}"
-
-
-def _network_violation(task_envelope: TaskEnvelope, request: ActionRequest) -> str | None:
-    constraints = task_envelope.context.constraints
-    if not constraints.no_network:
-        return None
-    cmd = str(request.parameters.get("cmd", "")).lower()
-    if any(token in cmd for token in NETWORK_TOKENS):
-        return "network command blocked by no_network constraint"
-    return None
-
-
-def _repo_edit_violation(task_envelope: TaskEnvelope, request: ActionRequest) -> str | None:
-    constraints = task_envelope.context.constraints
-    if request.type in {"write_file", "propose_patch"} and not constraints.allow_repo_edits:
-        return "repo edits blocked by allow_repo_edits=false"
-    return None
+class PolicyDecision(BaseModel):
+    allowed: bool
+    reason: str
+    policy_stage: str = "static"
+    runtime_approval_required: bool = False
+    metadata: dict[str, Any] = Field(default_factory=dict)
 
 
 class PolicyEngine:
-    def __init__(self, runtime_approver: RuntimeApprover | None = None) -> None:
+    def __init__(self, runtime_approver: RuntimeApprover | None = None, no_network: bool = True) -> None:
         self.runtime_approver = runtime_approver
+        self.no_network = no_network
 
-    def evaluate(self, task_envelope: TaskEnvelope, request: ActionRequest) -> PolicyDecision:
-        allowed, reason = _allowed_action(task_envelope, request)
-        if not allowed:
+    def evaluate_terminal_command(
+        self,
+        command: str,
+        *,
+        target: str | None = None,
+        metadata: dict[str, Any] | None = None,
+    ) -> PolicyDecision:
+        info = dict(metadata or {})
+        command_text = command.strip()
+        if not command_text:
+            return PolicyDecision(allowed=False, reason="empty command", policy_stage="static", metadata=info)
+
+        cmd_check = validate_command(command_text)
+        if not cmd_check.allowed:
+            info["security_check"] = "command_allowlist"
             return PolicyDecision(
                 allowed=False,
+                reason=cmd_check.reason,
+                policy_stage="security",
+                runtime_approval_required=False,
+                metadata=info,
+            )
+
+        if target is not None:
+            target_check = validate_pytest_target(target)
+            if not target_check.allowed:
+                info["security_check"] = "pytest_target"
+                return PolicyDecision(
+                    allowed=False,
+                    reason=target_check.reason,
+                    policy_stage="security",
+                    runtime_approval_required=False,
+                    metadata=info,
+                )
+
+        if bool(info.get("no_network", self.no_network)):
+            lowered = command_text.lower()
+            if any(token in lowered for token in NETWORK_TOKENS):
+                info["security_check"] = "no_network"
+                return PolicyDecision(
+                    allowed=False,
+                    reason="network command blocked by no_network constraint",
+                    policy_stage="security",
+                    runtime_approval_required=False,
+                    metadata=info,
+                )
+
+        lowered = command_text.lower()
+        runtime_required = any(token in lowered for token in HIGH_RISK_TOKENS)
+        if runtime_required and self.runtime_approver is not None:
+            response = self.runtime_approver(command_text, info)
+            if isinstance(response, bool):
+                approved = response
+                reason = "runtime approver decision"
+                mutation: dict[str, Any] = {}
+            elif isinstance(response, tuple):
+                approved = bool(response[0])
+                reason = str(response[1])
+                mutation = {}
+            else:
+                approved = bool(response.get("allowed", False))
+                reason = str(response.get("reason", "runtime approver decision"))
+                mutation = dict(response.get("metadata", {}))
+
+            info.update(mutation)
+            return PolicyDecision(
+                allowed=approved,
                 reason=reason,
-                policy_stage="static",
-                needs_orchestrator_verification=True,
-                runtime_approval_required=False,
+                policy_stage="runtime",
+                runtime_approval_required=True,
+                metadata=info,
             )
-
-        violation = _repo_edit_violation(task_envelope, request)
-        if violation:
-            return PolicyDecision(
-                allowed=False,
-                reason=violation,
-                policy_stage="static",
-                needs_orchestrator_verification=True,
-                runtime_approval_required=False,
-            )
-
-        violation = _network_violation(task_envelope, request)
-        if violation:
-            return PolicyDecision(
-                allowed=False,
-                reason=violation,
-                policy_stage="static",
-                needs_orchestrator_verification=True,
-                runtime_approval_required=False,
-            )
-
-        runtime_required = request.type in HIGH_RISK_ACTIONS
-        if not runtime_required or self.runtime_approver is None:
-            return PolicyDecision(
-                allowed=True,
-                reason="approved by static policy",
-                policy_stage="static",
-                needs_orchestrator_verification=True,
-                runtime_approval_required=runtime_required,
-            )
-
-        response = self.runtime_approver(request)
-        if isinstance(response, bool):
-            approved = response
-            runtime_reason = "runtime approver decision"
-            mutation: dict[str, Any] = {}
-        elif isinstance(response, tuple):
-            approved = bool(response[0])
-            runtime_reason = str(response[1])
-            mutation = {}
-        else:
-            approved = bool(response.get("allowed", False))
-            runtime_reason = str(response.get("reason", "runtime approver decision"))
-            mutation = dict(response.get("mutated_parameters", {}))
-
-        if mutation:
-            request.parameters.update(mutation)
 
         return PolicyDecision(
-            allowed=approved,
-            reason=runtime_reason,
-            policy_stage="runtime",
-            needs_orchestrator_verification=True,
-            runtime_approval_required=True,
-            metadata={"mutated_parameters": sorted(mutation.keys()) if mutation else []},
+            allowed=True,
+            reason="approved by static policy",
+            policy_stage="static",
+            runtime_approval_required=runtime_required,
+            metadata=info,
         )
 
 
 def evaluate_action(payload: dict[str, Any]) -> dict[str, Any]:
-    action = dict(payload.get("action", {}))
-    action_type = str(action.get("type", ""))
-    constraints = dict(payload.get("constraints", {}))
-    allowed = set(payload.get("allowed_actions", []))
-
-    allow_repo_edits = bool(constraints.get("allow_repo_edits", False))
-    action_allowed = action_type in allowed
-    if action_type in {"write_file", "propose_patch"} and not allow_repo_edits:
-        action_allowed = False
-
-    needs_verification = action_type in {"write_file", "propose_patch", "run", "cmd", "mcp_call"}
-    return {
-        "allowed": action_allowed,
-        "needs_orchestrator_verification": needs_verification,
-        "reason": "allowed" if action_allowed else "blocked",
-    }
+    command = str(payload.get("command", ""))
+    target = payload.get("target")
+    no_network = bool(payload.get("no_network", True))
+    engine = PolicyEngine(no_network=no_network)
+    decision = engine.evaluate_terminal_command(command=command, target=str(target) if target is not None else None)
+    return decision.model_dump()

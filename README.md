@@ -1,131 +1,80 @@
 # autoeval
 
-`autoeval` is a terminal-first harness for long-running autonomous coding workflows with resumable sessions, policy-gated actions, and structured RPI artifacts.
+`autoeval` is a harness layer for coding agents.
+It manages artifacts, loop control, verifier checks, guardrails, and evidence.
+It does not perform coding edits/patch execution itself.
 
-## What Is Implemented
+## Core artifacts
 
-1. **RPI artifacts** with template-driven generation:
-   - `.autoeval/instructions/research.md`
-   - `.autoeval/instructions/plan.md`
-   - `.autoeval/instructions/feature_list.json`
-2. **Execution loop** with run/session artifacts:
-   - `events.jsonl`, `progress.md`, `session_meta.json`, `usage.json`, `metrics.json`
-   - snapshots + checkpoints for handoff/fork workflows
-3. **Reference-style multi-agent parity (without Linear)**:
-   - orchestrator + coding + github + slack role model
-   - delegation trace recorded in events
-   - Slack/GitHub operation artifacts written per run
-4. **Security guardrails for shell actions**:
-   - command allowlist + sensitive command validators in `autoeval/security.py`
-   - policy gate in `autoeval/policy.py` before execution
-5. **MCP lifecycle management**:
-   - `mcp list/add/remove/enable/disable/connect/disconnect/set-auth`
-   - runtime profile resolution with preflight checks
-6. **Evaluation harness and completion gate**:
-   - `autoeval/evals.py` runs deterministic eval checks against run artifacts
-   - task completion is gated by eval pass unless bypassed
+Under `.autoeval/instructions/`:
+- `research.md`
+- `implementation.md`
+- `plan.md`
+- `review.md` (Lessons + final Review sections)
+- `feature_list.json`
+- `autocheck_map.json`
+- `tool_calls.json` (callable harness tool contract)
 
-## Install
+Verifier link config:
+- `.autoeval/verifier.yaml` is developer/end-user authored from fixed template.
+- It links individual test files or entire test directories.
 
-```bash
-uv venv
-uv sync --extra dev
-uv run autoeval --help
-```
+## Harness loop
 
-## Quickstart (Step-by-Step)
+1. Initialize artifacts and verifier mapping from `verifier.yaml`.
+2. Coding agent calls `tools decide-mode` first.
+3. If mode is `instant`, skip harness loop and execute directly.
+4. If mode is `planning`, continue harness loop:
+5. Coding agent reads artifacts + `tool_calls.json`.
+6. Coding agent checks terminal commands with guardrail tools.
+7. Coding agent executes implementation outside harness.
+8. Coding agent runs `autocheck` for linked targets referenced by feature criteria and updates status.
+9. Repeat until all sub-tasks pass.
 
-```bash
-# 1) Initialize harness files in target repo
-uv run autoeval init \
-  --repo . \
-  --provider codex \
-  --task "Implement feature set"
+## Guardrails
 
-# 2) Run autonomous loop
-uv run autoeval run \
-  --repo . \
-  --provider codex \
-  --task "Implement feature set"
+Two-layer harness safety:
+- `security.py`: allowlist + sensitive command validation
+- `policy.py`: action gating over security outcomes
 
-# 2.1) Optional: bypass eval gating for experimental runs
-uv run autoeval run \
-  --repo . \
-  --provider codex \
-  --task "Implement feature set" \
-  --no-require-eval-pass
+## Callable tools for coding agent
 
-# 3) Check current run status
-uv run autoeval status --repo .
+Use `autoeval tools list --repo .` to inspect tool details.
 
-# 4) Resume previous run if needed
-uv run autoeval resume \
-  --repo . \
-  --provider codex \
-  --task "Continue implementation"
+Available tool commands:
+- `autoeval tools decide-mode`
+- `autoeval tools guardrail-check`
+- `autoeval tools feature-status-set`
+- `autoeval tools feature-status-get`
+- `autoeval tools autocheck`
+- `autoeval tools run-status`
+- `autoeval tools run-eval`
+- `autoeval tools append-lesson`
+- `autoeval tools append-review`
 
-# 5) Request intervention when blocked
-uv run autoeval intervene \
-  --repo . \
-  --reason "Need product clarification"
-
-# 6) Emit structured review
-uv run autoeval review --repo . --severity medium
-
-# 7) Re-run eval suite explicitly
-uv run autoeval eval --repo . --profile default
-```
-
-## Slack/GitHub Artifact Flow
-
-During execution, orchestrated actions generate:
-- `.autoeval/runs/<run_id>/communications/slack_messages.jsonl`
-- `.autoeval/runs/<run_id>/vcs/github_operations.jsonl`
-
-Manual Slack notification is also available:
+## Quickstart
 
 ```bash
-uv run autoeval notify \
-  --repo . \
-  --channel new-channel \
-  --message "Session progress update"
+uv run autoeval init --repo . --provider codex --task "Implement feature set"
+uv run autoeval verifier template
+uv run autoeval verifier sync --repo .
+# edit .autoeval/verifier.yaml to link file/directory tests, then sync again
+uv run autoeval tools decide-mode --repo . --request "Implement feature set" --mode auto
+uv run autoeval run --repo . --task "Implement feature set" --mode auto
+uv run autoeval tools list --repo .
+uv run autoeval tools guardrail-check --command "pytest -q tests/test_api.py::test_ok"
+uv run autoeval tools autocheck --repo .
+uv run autoeval tools run-status --repo .
+uv run autoeval tools run-eval --repo .
 ```
 
-## MCP + Browser Validation Example
+## MCP lifecycle
 
 ```bash
-uv run autoeval mcp add \
-  --scope user \
-  --name puppeteer \
-  --transport stdio \
-  --command "echo puppeteer" \
-  --tool-namespace puppeteer \
-  --repo .
-
-uv run autoeval mcp connect --repo . --name puppeteer
-
-uv run autoeval test browser \
-  --repo . \
-  --mcp puppeteer \
-  --scenario "open homepage and verify key UI"
+uv run autoeval mcp add --scope user --name playwright --transport stdio --command "playwright-mcp" --tool-namespace playwright --repo .
+uv run autoeval mcp connect --repo . --name playwright
+uv run autoeval mcp list --scope effective --repo .
 ```
-
-## Security Model
-
-`run` actions are enforced by:
-1. static + runtime policy checks (`autoeval/policy.py`)
-2. command allowlist and targeted validators (`autoeval/security.py`)
-3. repository path boundary checks (`autoeval/executor.py`)
-
-Sensitive commands such as dangerous `rm`, unrestricted `chmod`, and unsafe `pkill` patterns are blocked.
-
-## Testing
-
-```bash
-uv run pytest phase_test/tests
-```
-
-Current baseline: `32 passed`.
 
 ## License
 

@@ -4,7 +4,7 @@ import json
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import SCHEMA_VERSION, RepoPaths, read_json, utc_now_iso, write_json
+from .config import RepoPaths, SCHEMA_VERSION, read_json, utc_now_iso, write_json
 from .tracker import completion_counts
 
 EvalCheck = Callable[[RepoPaths, str], dict[str, Any]]
@@ -35,13 +35,17 @@ def _load_events(events_file: Path) -> list[dict[str, Any]]:
 
 def _check_required_artifacts(paths: RepoPaths, run_id: str) -> dict[str, Any]:
     run_dir = _run_dir(paths, run_id)
-    required = [
+    required_core = [
         run_dir / "events.jsonl",
         run_dir / "progress.md",
         run_dir / "session_meta.json",
         run_dir / "usage.json",
     ]
-    missing = [str(path) for path in required if not path.exists()]
+    missing_core = [str(path) for path in required_core if not path.exists()]
+    has_context = (run_dir / "loop_context.json").exists() or (run_dir / "instant_context.json").exists()
+    missing = list(missing_core)
+    if not has_context:
+        missing.append("loop_context.json or instant_context.json")
     return {
         "id": "required_artifacts",
         "passed": not missing,
@@ -51,24 +55,32 @@ def _check_required_artifacts(paths: RepoPaths, run_id: str) -> dict[str, Any]:
     }
 
 
-def _check_action_lifecycle(paths: RepoPaths, run_id: str) -> dict[str, Any]:
+def _check_session_lifecycle(paths: RepoPaths, run_id: str) -> dict[str, Any]:
     events = _load_events(_run_dir(paths, run_id) / "events.jsonl")
     counts = {
-        "action_requested": 0,
-        "action_result": 0,
+        "session_started": 0,
         "session_finished": 0,
-        "provider_subagent_plan": 0,
+        "loop_context_written": 0,
+        "instant_mode_selected": 0,
+        "instant_context_written": 0,
     }
     for event in events:
         event_type = str(event.get("type", ""))
         if event_type in counts:
             counts[event_type] += 1
-    passed = all(value > 0 for value in counts.values())
+    started = counts["session_started"]
+    finished = counts["session_finished"]
+    loop_context = counts["loop_context_written"]
+    instant_mode = counts["instant_mode_selected"]
+    instant_context = counts["instant_context_written"]
+    planning_ok = loop_context >= started and instant_mode == 0
+    instant_ok = instant_mode >= started and instant_context >= started
+    passed = started > 0 and started == finished and (planning_ok or instant_ok)
     return {
-        "id": "action_lifecycle",
+        "id": "session_lifecycle",
         "passed": passed,
         "severity": "error",
-        "summary": "Action lifecycle and sub-agent planning events are present",
+        "summary": "Harness session lifecycle and loop-context accounting are consistent",
         "evidence": counts,
     }
 
@@ -80,52 +92,47 @@ def _check_feature_completion(paths: RepoPaths, run_id: str) -> dict[str, Any]:
         "passed": total_count > 0 and done_count == total_count,
         "severity": "error",
         "summary": "Feature list is fully completed",
+        "evidence": {"done_count": done_count, "total_count": total_count},
+    }
+
+
+def _check_autocheck_pass(paths: RepoPaths, run_id: str) -> dict[str, Any]:
+    report_file = _run_dir(paths, run_id) / "autocheck" / "report.json"
+    if not report_file.exists():
+        return {
+            "id": "autocheck_passed",
+            "passed": False,
+            "severity": "error",
+            "summary": "Autocheck report exists and passes",
+            "evidence": {"missing_report": str(report_file)},
+        }
+
+    report = read_json(report_file, {})
+    return {
+        "id": "autocheck_passed",
+        "passed": bool(report.get("passed", False)),
+        "severity": "error",
+        "summary": "Autocheck checks pass for selected linked verifier targets",
         "evidence": {
-            "done_count": done_count,
-            "total_count": total_count,
+            "passed_checks": int(report.get("passed_checks", 0)),
+            "failed_checks": int(report.get("failed_checks", 0)),
         },
     }
 
 
-def _check_failed_actions(paths: RepoPaths, run_id: str) -> dict[str, Any]:
+def _check_guardrail_denials(paths: RepoPaths, run_id: str) -> dict[str, Any]:
     events = _load_events(_run_dir(paths, run_id) / "events.jsonl")
-    failures = 0
+    denials = 0
     for event in events:
-        if event.get("type") != "action_result":
+        if event.get("type") != "autocheck_guardrail_denied":
             continue
-        result = event.get("result", {})
-        if isinstance(result, dict) and str(result.get("status", "")) in {"failed", "denied"}:
-            failures += 1
+        denials += 1
     return {
-        "id": "no_failed_actions",
-        "passed": failures == 0,
+        "id": "no_guardrail_denials",
+        "passed": denials == 0,
         "severity": "error",
-        "summary": "No denied/failed actions in final run trace",
-        "evidence": {"failures": failures},
-    }
-
-
-def _check_reference_artifacts(paths: RepoPaths, run_id: str) -> dict[str, Any]:
-    run_dir = _run_dir(paths, run_id)
-    slack_file = run_dir / "communications" / "slack_messages.jsonl"
-    github_file = run_dir / "vcs" / "github_operations.jsonl"
-
-    def _has_data(path: Path) -> bool:
-        return path.exists() and bool(path.read_text(encoding="utf-8").strip())
-
-    has_slack = _has_data(slack_file)
-    has_github = _has_data(github_file)
-    return {
-        "id": "reference_artifacts",
-        "passed": has_slack and has_github,
-        "severity": "error",
-        "summary": "Slack and GitHub operation artifacts are present",
-        "evidence": {
-            "slack_file": str(slack_file),
-            "github_file": str(github_file),
-            "has_slack": has_slack,
-            "has_github": has_github,
-        },
+        "summary": "No guardrail denials were recorded during harness verification",
+        "evidence": {"denials": denials},
     }
 
 
@@ -142,10 +149,10 @@ def _normalize_check(result: dict[str, Any]) -> dict[str, Any]:
 def default_eval_checks() -> list[EvalCheck]:
     return [
         _check_required_artifacts,
-        _check_action_lifecycle,
+        _check_session_lifecycle,
         _check_feature_completion,
-        _check_failed_actions,
-        _check_reference_artifacts,
+        _check_autocheck_pass,
+        _check_guardrail_denials,
     ]
 
 
@@ -161,16 +168,16 @@ def run_eval_suite(
     results: list[dict[str, Any]] = []
     for check in checks:
         try:
-            raw_result = check(paths, run_id)
+            raw = check(paths, run_id)
         except Exception as exc:
-            raw_result = {
+            raw = {
                 "id": getattr(check, "__name__", "eval_check"),
                 "passed": False,
                 "severity": "error",
                 "summary": "Eval check raised an exception",
                 "evidence": {"error": str(exc)},
             }
-        results.append(_normalize_check(raw_result))
+        results.append(_normalize_check(raw))
 
     passed = all(item["passed"] for item in results)
     failures = [item["id"] for item in results if not item["passed"]]

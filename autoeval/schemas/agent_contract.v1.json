@@ -1,48 +1,150 @@
 {
-  "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "autoeval.agent_contract.v1",
-  "title": "TaskEnvelope",
-  "type": "object",
-  "required": [
-    "contract_version",
-    "task_id",
-    "repo_snapshot_id",
-    "goal",
-    "context",
-    "allowed_actions",
-    "success_criteria"
-  ],
-  "properties": {
-    "contract_version": {
-      "type": "string",
-      "const": "1.0"
-    },
-    "task_id": {
-      "type": "string"
-    },
-    "repo_snapshot_id": {
-      "type": "string"
-    },
-    "goal": {
-      "type": "string"
-    },
-    "context": {
+  "$defs": {
+    "ArtifactPaths": {
+      "properties": {
+        "autocheck_map": {
+          "title": "Autocheck Map",
+          "type": "string"
+        },
+        "decision_prompt": {
+          "title": "Decision Prompt",
+          "type": "string"
+        },
+        "feature_list": {
+          "title": "Feature List",
+          "type": "string"
+        },
+        "implementation": {
+          "title": "Implementation",
+          "type": "string"
+        },
+        "plan": {
+          "title": "Plan",
+          "type": "string"
+        },
+        "research": {
+          "title": "Research",
+          "type": "string"
+        },
+        "review": {
+          "title": "Review",
+          "type": "string"
+        },
+        "tool_calls": {
+          "title": "Tool Calls",
+          "type": "string"
+        },
+        "verifier_yaml": {
+          "title": "Verifier Yaml",
+          "type": "string"
+        }
+      },
+      "required": [
+        "research",
+        "implementation",
+        "plan",
+        "review",
+        "decision_prompt",
+        "feature_list",
+        "verifier_yaml",
+        "autocheck_map",
+        "tool_calls"
+      ],
+      "title": "ArtifactPaths",
       "type": "object"
     },
-    "allowed_actions": {
-      "type": "array"
-    },
-    "success_criteria": {
-      "type": "array",
-      "items": {
-        "type": "string"
-      }
-    },
-    "provider_capabilities": {
+    "ToolCallSpec": {
+      "properties": {
+        "cli": {
+          "title": "Cli",
+          "type": "string"
+        },
+        "description": {
+          "title": "Description",
+          "type": "string"
+        },
+        "id": {
+          "title": "Id",
+          "type": "string"
+        },
+        "parameters": {
+          "items": {
+            "$ref": "#/$defs/ToolParameter"
+          },
+          "title": "Parameters",
+          "type": "array"
+        }
+      },
+      "required": [
+        "id",
+        "description",
+        "cli"
+      ],
+      "title": "ToolCallSpec",
       "type": "object"
     },
-    "metadata": {
+    "ToolParameter": {
+      "properties": {
+        "name": {
+          "title": "Name",
+          "type": "string"
+        },
+        "required": {
+          "default": false,
+          "title": "Required",
+          "type": "boolean"
+        },
+        "type": {
+          "title": "Type",
+          "type": "string"
+        }
+      },
+      "required": [
+        "name",
+        "type"
+      ],
+      "title": "ToolParameter",
       "type": "object"
     }
-  }
+  },
+  "properties": {
+    "artifact_paths": {
+      "$ref": "#/$defs/ArtifactPaths"
+    },
+    "contract_version": {
+      "default": "1.0",
+      "title": "Contract Version",
+      "type": "string"
+    },
+    "execution_model": {
+      "default": "harness_only",
+      "title": "Execution Model",
+      "type": "string"
+    },
+    "loop_steps": {
+      "items": {
+        "type": "string"
+      },
+      "title": "Loop Steps",
+      "type": "array"
+    },
+    "metadata": {
+      "additionalProperties": true,
+      "title": "Metadata",
+      "type": "object"
+    },
+    "tool_calls": {
+      "items": {
+        "$ref": "#/$defs/ToolCallSpec"
+      },
+      "title": "Tool Calls",
+      "type": "array"
+    }
+  },
+  "required": [
+    "artifact_paths",
+    "tool_calls"
+  ],
+  "title": "HarnessLoopContract",
+  "type": "object"
 }

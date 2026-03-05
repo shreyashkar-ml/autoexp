@@ -21,6 +21,7 @@ Purpose:
 6. Do not store planning prose in this artifact.
 7. Criteria must be objectively verifiable (tests, commands, outputs, or concrete observable behavior).
 8. Every `sub_task` must map cleanly to a specific phase boundary from `plan.md`.
+9. For test verification, reference linked pytest targets from `.autoeval/instructions/autocheck_map.json`.
 
 ## JSON Shape
 ```json

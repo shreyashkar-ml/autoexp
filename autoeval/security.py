@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+from pathlib import PurePosixPath
 import re
 import shlex
 from typing import Any, NamedTuple
@@ -44,9 +45,12 @@ ALLOWED_COMMANDS: set[str] = {
     "sleep",
     "pkill",
     "init.sh",
+    "pytest",
 }
 
 COMMANDS_NEEDING_EXTRA_VALIDATION: set[str] = {"pkill", "chmod", "init.sh", "rm"}
+PYTEST_NODE_SEGMENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+MAX_ALLOWED_TIMEOUT_SEC = 1800
 
 
 def split_command_segments(command_string: str) -> list[str]:
@@ -118,7 +122,8 @@ def extract_commands(command_string: str) -> list[str]:
 
 
 def validate_pkill_command(command_string: str) -> ValidationResult:
-    allowed_process_names = {"node", "npm", "npx", "vite", "next"}
+    allowed_process_names = {"node", "npm", "npx", "vite", "next", "pytest"}
+
     try:
         tokens = shlex.split(command_string)
     except ValueError:
@@ -232,13 +237,9 @@ def validate_rm_command(command_string: str) -> ValidationResult:
             if dangerous == "/":
                 continue
             if normalized == dangerous or (
-                normalized.startswith(dangerous + "/")
-                and normalized.count("/") <= dangerous.count("/") + 1
+                normalized.startswith(dangerous + "/") and normalized.count("/") <= dangerous.count("/") + 1
             ):
-                return ValidationResult(
-                    False,
-                    f"rm too close to system directory '{dangerous}' is not allowed",
-                )
+                return ValidationResult(False, f"rm too close to system directory '{dangerous}' is not allowed")
 
         if path == "/*" or path.startswith("/*"):
             return ValidationResult(False, "rm on root wildcard is not allowed")
@@ -279,6 +280,63 @@ def validate_command(command: str) -> ValidationResult:
     return ValidationResult(True)
 
 
+def validate_repo_relative_path(path_value: str) -> ValidationResult:
+    normalized = path_value.replace("\\", "/").strip()
+    if not normalized:
+        return ValidationResult(False, "path is empty")
+    if "\x00" in normalized:
+        return ValidationResult(False, "path contains null byte")
+    if normalized.startswith("/"):
+        return ValidationResult(False, "absolute paths are not allowed")
+
+    pure = PurePosixPath(normalized)
+    if any(part in {"..", ""} for part in pure.parts):
+        return ValidationResult(False, "path traversal is not allowed")
+
+    return ValidationResult(True)
+
+
+def validate_pytest_target(target: str) -> ValidationResult:
+    value = target.strip()
+    if not value:
+        return ValidationResult(False, "pytest target is empty")
+
+    chunks = value.split("::")
+    path_part = chunks[0]
+    path_check = validate_repo_relative_path(path_part)
+    if not path_check.allowed:
+        return ValidationResult(False, f"invalid pytest target path: {path_check.reason}")
+
+    if len(chunks) > 3:
+        return ValidationResult(False, "pytest target has too many node segments")
+
+    for segment in chunks[1:]:
+        if not PYTEST_NODE_SEGMENT_RE.match(segment):
+            return ValidationResult(False, f"invalid pytest node segment: {segment}")
+
+    return ValidationResult(True)
+
+
+def validate_timeout(timeout_sec: int, *, min_timeout: int = 1, max_timeout: int = MAX_ALLOWED_TIMEOUT_SEC) -> ValidationResult:
+    if timeout_sec < min_timeout:
+        return ValidationResult(False, f"timeout_sec must be >= {min_timeout}")
+    if timeout_sec > max_timeout:
+        return ValidationResult(False, f"timeout_sec must be <= {max_timeout}")
+    return ValidationResult(True)
+
+
+def guardrail_summary() -> dict[str, Any]:
+    return {
+        "allowed_commands": sorted(ALLOWED_COMMANDS),
+        "extra_validation_commands": sorted(COMMANDS_NEEDING_EXTRA_VALIDATION),
+        "max_allowed_timeout_sec": MAX_ALLOWED_TIMEOUT_SEC,
+        "notes": [
+            "policy.py gates command execution based on security.py decisions",
+            "autocheck uses linked pytest targets from verifier.yaml and feature criteria",
+        ],
+    }
+
+
 def bash_security_hook(input_data: dict[str, Any]) -> dict[str, str]:
     if input_data.get("tool_name") != "Bash":
         return {}
@@ -291,4 +349,3 @@ def bash_security_hook(input_data: dict[str, Any]) -> dict[str, str]:
     if result.allowed:
         return {}
     return {"decision": "block", "reason": result.reason}
-

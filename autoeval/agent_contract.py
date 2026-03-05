@@ -3,147 +3,111 @@ from typing import Any
 
 from pydantic import BaseModel, Field
 
+from .config import RepoPaths
+from .harness_tools import tool_catalog_payload
+
 CONTRACT_VERSION = "1.0"
 
 
-class AllowedAction(BaseModel):
+class ToolParameter(BaseModel):
+    name: str
     type: str
-    selectors: list[str] = Field(default_factory=list)
-    format: str | None = None
-    max_bytes: int | None = None
+    required: bool = False
 
 
-class TaskConstraints(BaseModel):
-    no_network: bool = True
-    max_runtime_sec: int = 900
-    allow_repo_edits: bool = True
-    sandbox_mode: str = "workspace-write"
+class ToolCallSpec(BaseModel):
+    id: str
+    description: str
+    cli: str
+    parameters: list[ToolParameter] = Field(default_factory=list)
 
 
-class TaskContext(BaseModel):
-    repo_map: str | None = None
-    symbol_index: str | None = None
-    recent_runs: list[str] = Field(default_factory=list)
-    constraints: TaskConstraints = Field(default_factory=TaskConstraints)
-    metadata: dict[str, Any] = Field(default_factory=dict)
+class ArtifactPaths(BaseModel):
+    research: str
+    implementation: str
+    plan: str
+    review: str
+    decision_prompt: str
+    feature_list: str
+    verifier_yaml: str
+    autocheck_map: str
+    tool_calls: str
 
 
-class TaskEnvelope(BaseModel):
+class HarnessLoopContract(BaseModel):
     contract_version: str = CONTRACT_VERSION
-    task_id: str
-    repo_snapshot_id: str
-    goal: str
-    context: TaskContext
-    allowed_actions: list[AllowedAction]
-    success_criteria: list[str]
-    provider_capabilities: dict[str, Any] = Field(default_factory=dict)
+    execution_model: str = "harness_only"
+    artifact_paths: ArtifactPaths
+    tool_calls: list[ToolCallSpec]
+    loop_steps: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
-class ActionRequest(BaseModel):
-    action_id: str
-    type: str
-    selector: str | None = None
-    parameters: dict[str, Any] = Field(default_factory=dict)
-    requested_by: str = "worker"
+DEFAULT_LOOP_STEPS = [
+    "read research/plan/implementation/review/feature_list artifacts",
+    "run guardrail.check_command before terminal command execution",
+    "perform coding externally to harness",
+    "run verifier.autocheck and inspect outcomes",
+    "update only feature_list status via feature.status_set",
+    "check run.status and run.eval",
+    "repeat until all feature sub-tasks pass",
+]
 
 
-class PolicyDecision(BaseModel):
-    allowed: bool
-    reason: str
-    policy_stage: str = "static"
-    needs_orchestrator_verification: bool = True
-    runtime_approval_required: bool = False
-    metadata: dict[str, Any] = Field(default_factory=dict)
+def build_agent_contract(paths: RepoPaths) -> HarnessLoopContract:
+    catalog = tool_catalog_payload(paths)
+    artifacts = catalog.get("artifact_paths", {})
+    tools_raw = catalog.get("tools", [])
 
+    tool_calls: list[ToolCallSpec] = []
+    for item in tools_raw:
+        if not isinstance(item, dict):
+            continue
+        parameters: list[ToolParameter] = []
+        for parameter in item.get("parameters", []):
+            if isinstance(parameter, dict):
+                parameters.append(
+                    ToolParameter(
+                        name=str(parameter.get("name", "")),
+                        type=str(parameter.get("type", "string")),
+                        required=bool(parameter.get("required", False)),
+                    )
+                )
+        tool_calls.append(
+            ToolCallSpec(
+                id=str(item.get("id", "")),
+                description=str(item.get("description", "")),
+                cli=str(item.get("cli", "")),
+                parameters=parameters,
+            )
+        )
 
-class ActionResult(BaseModel):
-    action_id: str
-    status: str
-    output: dict[str, Any] = Field(default_factory=dict)
-    error: str | None = None
-    started_at: str | None = None
-    finished_at: str | None = None
-
-
-class UsageTelemetry(BaseModel):
-    input_tokens: int = 0
-    output_tokens: int = 0
-    total_tokens: int = 0
-    estimated_cost_usd: float = 0.0
-
-
-class CompletionEnvelope(BaseModel):
-    completed_sub_task_ids: list[str] = Field(default_factory=list)
-    summary: str
-    evidence: dict[str, Any] = Field(default_factory=dict)
-    unresolved_blockers: list[str] = Field(default_factory=list)
-    proposed_diffs: list[str] = Field(default_factory=list)
-    context_ratio: float = 1.0
-    usage: UsageTelemetry = Field(default_factory=UsageTelemetry)
-
-
-def default_allowed_actions() -> list[AllowedAction]:
-    return [
-        AllowedAction(type="read_file", max_bytes=200000),
-        AllowedAction(type="write_file"),
-        AllowedAction(type="propose_patch", format="unified_diff"),
-        AllowedAction(type="run", selectors=["build", "test", "cmd"]),
-        AllowedAction(type="mcp_call"),
-        AllowedAction(type="notify", selectors=["slack"]),
-        AllowedAction(type="github", selectors=["commit", "create_pr", "push"]),
-    ]
-
-
-def success_criteria_from_feature_payload(feature_payload: dict[str, Any]) -> list[str]:
-    criteria: list[str] = []
-    for item in feature_payload.get("sub_tasks", []):
-        for criterion in item.get("criteria", []):
-            if criterion not in criteria:
-                criteria.append(criterion)
-    return criteria or ["all_sub_tasks_completed"]
-
-
-def build_task_envelope(
-    run_id: str,
-    session_number: int,
-    task: str,
-    feature_payload: dict[str, Any],
-    provider_capabilities: dict[str, Any] | None = None,
-    rpi_instructions: dict[str, str] | None = None,
-    requested_task: str | None = None,
-    repo_root: str | None = None,
-    rpi_bootstrap_pending: bool = False,
-) -> TaskEnvelope:
-    return TaskEnvelope(
-        task_id=f"{run_id}:session:{session_number}",
-        repo_snapshot_id=run_id,
-        goal=task,
-        context=TaskContext(
-            repo_map="artifact://repo_map.json",
-            symbol_index="artifact://symbols.parquet",
-            recent_runs=[f"artifact://{run_id}/events.jsonl"],
-            constraints=TaskConstraints(),
+    return HarnessLoopContract(
+        artifact_paths=ArtifactPaths(
+            research=str(artifacts.get("research", paths.rpi_dir / "research.md")),
+            implementation=str(artifacts.get("implementation", paths.rpi_dir / "implementation.md")),
+            plan=str(artifacts.get("plan", paths.rpi_dir / "plan.md")),
+            review=str(artifacts.get("review", paths.review_file)),
+            decision_prompt=str(
+                artifacts.get("decision_prompt", Path(__file__).resolve().parent / "prompts" / "decision.md")
+            ),
+            feature_list=str(artifacts.get("feature_list", paths.rpi_dir / "feature_list.json")),
+            verifier_yaml=str(artifacts.get("verifier_yaml", paths.verifier_file)),
+            autocheck_map=str(artifacts.get("autocheck_map", paths.autocheck_map_file)),
+            tool_calls=str(paths.tool_calls_file),
         ),
-        allowed_actions=default_allowed_actions(),
-        success_criteria=success_criteria_from_feature_payload(feature_payload),
-        provider_capabilities=provider_capabilities or {},
+        tool_calls=tool_calls,
+        loop_steps=[str(step) for step in catalog.get("loop", {}).get("steps", DEFAULT_LOOP_STEPS)],
         metadata={
             "workflow_model": "research-plan-implementation",
-            "feature_count": len(feature_payload.get("sub_tasks", [])),
-            "feature_list_path": ".autoeval/instructions/feature_list.json",
-            "completion_signal": "PROJECT_COMPLETE:",
-            "orchestration_pattern": "orchestrator->coding->github->slack",
-            "requested_task": requested_task or task,
-            "repo_root": repo_root or ".",
-            "rpi_bootstrap_pending": bool(rpi_bootstrap_pending),
-            "rpi_instructions": rpi_instructions or {},
+            "catalog_version": str(catalog.get("catalog_version", "1.0.0")),
+            "schema_version": int(catalog.get("schema_version", 1)),
         },
     )
 
 
 def contract_schema() -> dict[str, Any]:
-    return TaskEnvelope.model_json_schema()
+    return HarnessLoopContract.model_json_schema()
 
 
 def contract_schema_file() -> Path:

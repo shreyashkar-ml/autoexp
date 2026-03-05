@@ -28,8 +28,15 @@ def run_migrations(paths: RepoPaths) -> None:
     _ensure_schema(paths.user_registry_file, {"schema_version": SCHEMA_VERSION, "profiles": {}})
     _ensure_schema(paths.user_auth_refs_file, {"schema_version": SCHEMA_VERSION, "refs": {}})
     _ensure_schema(paths.user_health_file, {"schema_version": SCHEMA_VERSION, "profiles": {}})
-    _ensure_schema(paths.user_preferences_file, {"schema_version": SCHEMA_VERSION, "preferences": {}})
 
     feature_file = paths.rpi_dir / "feature_list.json"
     if feature_file.exists():
         _ensure_schema(feature_file, {"schema_version": SCHEMA_VERSION, "sub_tasks": []})
+
+    autocheck_map_file = paths.autocheck_map_file
+    if autocheck_map_file.exists():
+        _ensure_schema(autocheck_map_file, {"schema_version": SCHEMA_VERSION, "links": [], "targets": []})
+
+    tool_calls_file = paths.tool_calls_file
+    if tool_calls_file.exists():
+        _ensure_schema(tool_calls_file, {"schema_version": SCHEMA_VERSION, "tools": []})
