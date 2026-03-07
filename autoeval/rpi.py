@@ -1,68 +1,61 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Any, Callable
 
 from .config import RepoPaths, SCHEMA_VERSION, ensure_repo_layout, read_json, utc_now_iso, write_json
 from .harness_tools import DEFAULT_REVIEW_ARTIFACT, ensure_review_artifact, write_tool_catalog
+from .tracker import require_verifications
 from .verifier import ensure_verifier_file, sync_autocheck_map_from_verifier
 
 TEMPLATE_VERSION = "2.2.0"
 ARTIFACT_FILES = ("research.md", "implementation.md", "plan.md", "review.md", "feature_list.json", "tool_calls.json")
+TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+
+
+def _load_template(name: str) -> str:
+    template_path = TEMPLATES_DIR / name
+    return template_path.read_text(encoding="utf-8").rstrip()
+
+
+def _render_markdown_artifact(name: str, context_lines: list[str]) -> str:
+    template_body = _load_template(name)
+    context_block = ["## Bootstrap Context", *context_lines]
+    return template_body + "\n\n" + "\n".join(context_block) + "\n"
 
 
 def _research_artifact(task: str) -> str:
-    return (
-        f"<!-- template_id: rpi_research -->\n"
-        f"<!-- template_version: {TEMPLATE_VERSION} -->\n\n"
-        "# Research\n\n"
-        "Repository-level context for the harness run.\n\n"
-        "## Task Context\n"
-        f"- Requested task: {task}\n\n"
-        "## Required Content\n"
-        "- Architecture and module map\n"
-        "- Flow and integration notes\n"
-        "- Runtime/testing/dependency baseline\n"
-        "- Known gaps and unknowns\n"
+    return _render_markdown_artifact(
+        "rpi_research.md",
+        [
+            f"- Requested task: {task}",
+            "- Generated during `autoeval init` for repository-level context seeding.",
+            "- Use this template to produce repository-specific research, not generic prose.",
+        ],
     )
 
 
 def _implementation_artifact(task: str, provider_name: str) -> str:
     init_file = "CLAUDE.md" if provider_name.strip().lower() in {"claude", "claude-code"} else "AGENTS.md"
-    return (
-        f"<!-- template_id: rpi_implementation -->\n"
-        f"<!-- template_version: {TEMPLATE_VERSION} -->\n\n"
-        "# Implementation\n\n"
-        "Harness loop instructions for coding-agent execution.\n\n"
-        "## Provider Initialization\n"
-        f"- Provider: {provider_name}\n"
-        f"- Initialize repository guidance as `{init_file}`\n\n"
-        "## Task Context\n"
-        f"- Requested task: {task}\n\n"
-        "## Harness Rules\n"
-        "- first call must be `workflow.decide_mode` from tool catalog\n"
-        "- if selected mode is `instant`, skip harness loop and execute directly\n"
-        "- autoeval does not execute edits/patches for coding agent\n"
-        "- verifier.yaml links are owned by developer/end-user, not coding agent\n"
-        "- coding agent must use harness tool calls from `.autoeval/instructions/tool_calls.json`\n"
-        "- coding agent should build feature criteria from linked pytest targets in `autocheck_map.json`\n"
-        "- guardrail checks are mandatory before terminal commands\n"
-        "- only `status` may be mutated in `feature_list.json`\n"
-        "- keep evidence in `.autoeval/runs/<run_id>/`\n"
+    return _render_markdown_artifact(
+        "rpi_implementation.md",
+        [
+            f"- Requested task: {task}",
+            f"- Provider: {provider_name}",
+            f"- Initialize repository guidance as `{init_file}`",
+            "- Express implementation work through typed `verifications`, not free-text criteria.",
+        ],
     )
 
 
 def _plan_artifact(task: str) -> str:
-    return (
-        f"<!-- template_id: rpi_plan -->\n"
-        f"<!-- template_version: {TEMPLATE_VERSION} -->\n\n"
-        "# Plan\n\n"
-        f"Phased plan for task: {task}\n\n"
-        "## Phase Template\n"
-        "- phase_id\n"
-        "- planned changes\n"
-        "- suggested changes\n"
-        "- validation criteria\n"
-        "- status\n"
+    return _render_markdown_artifact(
+        "rpi_plan.md",
+        [
+            f"- Requested task: {task}",
+            "- Reference concrete files/modules when known.",
+            "- Define validation per phase before implementation starts.",
+        ],
     )
 
 
@@ -84,13 +77,7 @@ def _normalize_feature_payload(payload: dict[str, Any]) -> dict[str, Any]:
     for index, item in enumerate(raw_tasks, start=1):
         if not isinstance(item, dict):
             continue
-        criteria = item.get("criteria", [])
-        if isinstance(criteria, list):
-            normalized_criteria = [str(entry) for entry in criteria if str(entry).strip()]
-        else:
-            normalized_criteria = [str(criteria)] if str(criteria).strip() else []
-        if not normalized_criteria:
-            normalized_criteria = [f"verification evidence captured for sub_task_{index}"]
+        normalized_verifications = require_verifications(item.get("verifications", []), index=index)
 
         normalized_tasks.append(
             {
@@ -98,7 +85,7 @@ def _normalize_feature_payload(payload: dict[str, Any]) -> dict[str, Any]:
                 "phase_id": str(item.get("phase_id") or f"phase_{index}"),
                 "phase": str(item.get("phase") or f"Phase {index}"),
                 "sub_task_description": str(item.get("sub_task_description") or f"Execute sub_task_{index}"),
-                "criteria": normalized_criteria,
+                "verifications": normalized_verifications,
                 "status": bool(item.get("status", False)),
             }
         )

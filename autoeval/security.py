@@ -332,7 +332,7 @@ def guardrail_summary() -> dict[str, Any]:
         "max_allowed_timeout_sec": MAX_ALLOWED_TIMEOUT_SEC,
         "notes": [
             "policy.py gates command execution based on security.py decisions",
-            "autocheck uses linked pytest targets from verifier.yaml and feature criteria",
+            "autocheck uses linked pytest targets from verifier.yaml and feature verifications",
         ],
     }
 

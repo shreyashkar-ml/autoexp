@@ -3,7 +3,37 @@ from typing import Any
 
 from .config import SCHEMA_VERSION, read_json, write_json
 
-IMMUTABLE_FIELDS = ("id", "phase_id", "phase", "sub_task_description", "criteria")
+IMMUTABLE_FIELDS = ("id", "phase_id", "phase", "sub_task_description", "verifications")
+
+
+def normalize_verifications(raw_verifications: Any, *, index: int) -> list[dict[str, Any]]:
+    if not isinstance(raw_verifications, list):
+        raw_verifications = []
+
+    normalized: list[dict[str, Any]] = []
+    for item in raw_verifications:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip().lower()
+        target = str(item.get("target") or "").strip()
+        if not kind or not target:
+            continue
+        normalized.append(
+            {
+                "kind": kind,
+                "target": target,
+                "required": bool(item.get("required", True)),
+            }
+        )
+
+    return normalized
+
+
+def require_verifications(raw_verifications: Any, *, index: int) -> list[dict[str, Any]]:
+    normalized = normalize_verifications(raw_verifications, index=index)
+    if normalized:
+        return normalized
+    raise ValueError(f"sub_task_{index} must define at least one typed verification binding")
 
 
 def load_feature_list(feature_file: Path) -> dict[str, Any]:

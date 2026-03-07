@@ -13,7 +13,7 @@ Purpose:
 3. If mode is `planning`, continue the harness loop with artifacts and tool calls.
 4. Before terminal command execution, call `guardrail.check_command`.
 5. Use verifier/autocheck to validate progress from developer-linked tests in `verifier.yaml`.
-6. Create feature sub-task criteria using relevant linked pytest targets from `autocheck_map.json`.
+6. Create feature sub-task `verifications` using relevant linked pytest targets from `autocheck_map.json`.
 7. Update feature status through `feature.status_set`.
 
 ## Constraints

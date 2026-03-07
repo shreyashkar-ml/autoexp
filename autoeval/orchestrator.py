@@ -154,7 +154,15 @@ def _build_loop_context_payload(
                 "phase_id": str(item.get("phase_id", "")),
                 "phase": str(item.get("phase", "")),
                 "sub_task_description": str(item.get("sub_task_description", "")),
-                "criteria": [str(entry) for entry in item.get("criteria", [])],
+                "verifications": [
+                    {
+                        "kind": str(entry.get("kind", "")),
+                        "target": str(entry.get("target", "")),
+                        "required": bool(entry.get("required", True)),
+                    }
+                    for entry in item.get("verifications", [])
+                    if isinstance(entry, dict)
+                ],
             }
             for item in pending
         ],

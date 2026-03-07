@@ -5,16 +5,16 @@ import json
 import os
 from pathlib import Path
 import re
-import shlex
 import subprocess
 from typing import Any
 
 from pydantic import BaseModel, Field
+import yaml
 
 from .config import RepoPaths, SCHEMA_VERSION, ensure_repo_layout, read_json, utc_now_iso, write_json
 from .policy import PolicyEngine
 from .security import validate_pytest_target, validate_repo_relative_path, validate_timeout
-from .tracker import assert_status_only_mutation
+from .tracker import assert_status_only_mutation, normalize_verifications
 
 VERIFIER_YAML_TEMPLATE = f"""# Autoeval verifier configuration
 # Fixed template: developer/end-user maintains this file.
@@ -38,21 +38,6 @@ tests:
   #   mcp_profiles: []
 """
 
-PYTEST_OPTIONS_WITH_VALUE = {
-    "-k",
-    "-m",
-    "--maxfail",
-    "--tb",
-    "--rootdir",
-    "-c",
-    "--confcutdir",
-    "--durations",
-    "--junitxml",
-    "--cov",
-    "--cov-report",
-}
-
-
 class VerifierTest(BaseModel):
     path: str
     scope: str = "file"  # file | directory
@@ -67,124 +52,12 @@ class VerifierConfig(BaseModel):
     tests: list[VerifierTest] = Field(default_factory=list)
 
 
-def _new_test_entry() -> dict[str, Any]:
-    return {
-        "path": "",
-        "scope": "file",
-        "framework": "pytest",
-        "pattern": "test_*.py",
-        "recursive": True,
-        "mcp_profiles": [],
-    }
-
-
 def default_verifier_payload() -> dict[str, Any]:
     return {"schema_version": SCHEMA_VERSION, "tests": []}
 
 
 def verifier_template_text() -> str:
     return VERIFIER_YAML_TEMPLATE
-
-
-def _parse_inline_list(value: str) -> list[str]:
-    text = value.strip()
-    if not (text.startswith("[") and text.endswith("]")):
-        return []
-    body = text[1:-1].strip()
-    if not body:
-        return []
-    out: list[str] = []
-    for token in body.split(","):
-        cleaned = token.strip().strip('"').strip("'")
-        if cleaned:
-            out.append(cleaned)
-    return out
-
-
-def _parse_bool(value: str, default: bool = True) -> bool:
-    lowered = value.strip().lower()
-    if lowered in {"true", "yes", "1", "on"}:
-        return True
-    if lowered in {"false", "no", "0", "off"}:
-        return False
-    return default
-
-
-def _apply_test_key(entry: dict[str, Any], key: str, value: str) -> None:
-    normalized_key = key.strip()
-    cleaned = value.strip()
-    if normalized_key == "path":
-        entry["path"] = cleaned.strip('"').strip("'")
-    elif normalized_key == "scope":
-        entry["scope"] = cleaned.strip('"').strip("'") or "file"
-    elif normalized_key == "framework":
-        entry["framework"] = cleaned.strip('"').strip("'") or "pytest"
-    elif normalized_key == "pattern":
-        entry["pattern"] = cleaned.strip('"').strip("'") or "test_*.py"
-    elif normalized_key == "recursive":
-        entry["recursive"] = _parse_bool(cleaned, default=True)
-    elif normalized_key == "mcp_profiles":
-        entry["mcp_profiles"] = _parse_inline_list(cleaned)
-
-
-def _parse_verifier_yaml(text: str) -> dict[str, Any]:
-    schema_version = SCHEMA_VERSION
-    tests: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    collecting_mcp = False
-
-    for raw in text.splitlines():
-        line = raw.rstrip()
-        stripped = line.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-
-        if stripped.startswith("schema_version:"):
-            value = stripped.split(":", 1)[1].strip()
-            try:
-                schema_version = int(value)
-            except ValueError:
-                schema_version = SCHEMA_VERSION
-            continue
-
-        if stripped == "tests:":
-            continue
-
-        if stripped.startswith("- "):
-            current = _new_test_entry()
-            tests.append(current)
-            collecting_mcp = False
-            remainder = stripped[2:].strip()
-            if ":" in remainder:
-                key, value = remainder.split(":", 1)
-                _apply_test_key(current, key, value)
-            continue
-
-        if current is None:
-            continue
-
-        if stripped.startswith("mcp_profiles:"):
-            value = stripped.split(":", 1)[1].strip()
-            if value:
-                current["mcp_profiles"] = _parse_inline_list(value)
-                collecting_mcp = False
-            else:
-                current["mcp_profiles"] = []
-                collecting_mcp = True
-            continue
-
-        if collecting_mcp and stripped.startswith("- "):
-            value = stripped[2:].strip().strip('"').strip("'")
-            if value:
-                current.setdefault("mcp_profiles", []).append(value)
-            continue
-
-        collecting_mcp = False
-        if ":" in stripped:
-            key, value = stripped.split(":", 1)
-            _apply_test_key(current, key, value)
-
-    return {"schema_version": schema_version, "tests": tests}
 
 
 def ensure_verifier_file(paths: RepoPaths) -> None:
@@ -197,12 +70,18 @@ def ensure_verifier_file(paths: RepoPaths) -> None:
 def load_verifier_config(paths: RepoPaths) -> VerifierConfig:
     ensure_verifier_file(paths)
     raw_text = paths.verifier_file.read_text(encoding="utf-8")
-    raw = _parse_verifier_yaml(raw_text)
+    try:
+        raw = yaml.safe_load(raw_text) or {}
+    except yaml.YAMLError as exc:
+        raise ValueError(f"invalid verifier yaml: {exc}") from exc
     if not isinstance(raw, dict):
         raw = default_verifier_payload()
 
     normalized_tests: list[dict[str, Any]] = []
-    for item in raw.get("tests", []):
+    raw_tests = raw.get("tests", [])
+    if not isinstance(raw_tests, list):
+        raw_tests = []
+    for item in raw_tests:
         if not isinstance(item, dict):
             continue
         path_value = str(item.get("path", "")).strip()
@@ -482,70 +361,35 @@ def _run_pytest_target(repo: Path, target: str, timeout_sec: int) -> dict[str, A
     }
 
 
-def _extract_pytest_targets_from_text(text: str) -> set[str]:
-    targets: set[str] = set()
-    try:
-        tokens = shlex.split(text)
-    except ValueError:
-        tokens = text.split()
-
-    in_pytest_cmd = False
-    index = 0
-    while index < len(tokens):
-        token = tokens[index]
-        if token in {";", "&&", "||", "|"}:
-            in_pytest_cmd = False
-            index += 1
-            continue
-        if token == "pytest":
-            in_pytest_cmd = True
-            index += 1
-            continue
-        if not in_pytest_cmd:
-            index += 1
-            continue
-
-        if token.startswith("-"):
-            if token in PYTEST_OPTIONS_WITH_VALUE and index + 1 < len(tokens):
-                index += 2
-            else:
-                index += 1
-            continue
-
-        candidate = token.strip().strip(",")
-        if not ("/" in candidate or ".py" in candidate or "::" in candidate):
-            index += 1
-            continue
-        target_check = validate_pytest_target(candidate)
-        if target_check.allowed:
-            targets.add(candidate)
-        index += 1
-
-    return targets
-
-
-def _task_targets_from_criteria(criteria: list[str], linked_targets: set[str]) -> tuple[set[str], set[str]]:
+def _task_targets_from_verifications(task: dict[str, Any], linked_targets: set[str]) -> tuple[set[str], set[str]]:
     referenced: set[str] = set()
-    unlinked: set[str] = set()
+    unresolved: set[str] = set()
 
-    for item in criteria:
-        text = str(item or "").strip()
-        if not text:
+    raw_verifications = normalize_verifications(task.get("verifications", []), index=1)
+    if not raw_verifications:
+        unresolved.add("missing_verifications")
+        return referenced, unresolved
+    for item in raw_verifications:
+        kind = str(item.get("kind", "")).strip().lower()
+        target = str(item.get("target", "")).strip()
+        if not target:
             continue
 
-        parsed_targets = _extract_pytest_targets_from_text(text)
-        for target in parsed_targets:
-            if target in linked_targets:
-                referenced.add(target)
-            else:
-                unlinked.add(target)
+        if kind != "pytest":
+            unresolved.add(f"{kind}:{target}")
+            continue
 
-        for token in re.findall(r"[A-Za-z0-9_./:-]+", text):
-            normalized = token.strip().strip("`")
-            if normalized in linked_targets:
-                referenced.add(normalized)
+        target_check = validate_pytest_target(target)
+        if not target_check.allowed:
+            unresolved.add(target)
+            continue
 
-    return referenced, unlinked
+        if target in linked_targets:
+            referenced.add(target)
+        else:
+            unresolved.add(target)
+
+    return referenced, unresolved
 
 
 def _load_feature_payload(paths: RepoPaths) -> dict[str, Any]:
@@ -588,8 +432,7 @@ def _select_autocheck_targets(
         task_id = str(task.get("id", "")).strip()
         if not task_id:
             continue
-        criteria = [str(entry) for entry in task.get("criteria", [])]
-        task_targets, unlinked = _task_targets_from_criteria(criteria, linked_targets)
+        task_targets, unlinked = _task_targets_from_verifications(task, linked_targets)
         if task_targets:
             task_ref_map[task_id] = sorted(task_targets)
             selected_targets.update(task_targets)
@@ -714,8 +557,7 @@ def run_autocheck(
             if not task_id:
                 continue
 
-            criteria = [str(entry) for entry in task.get("criteria", [])]
-            task_targets, unlinked_refs = _task_targets_from_criteria(criteria, linked_targets)
+            task_targets, unlinked_refs = _task_targets_from_verifications(task, linked_targets)
             if unlinked_refs:
                 task["status"] = False
                 blocked_task_ids.append(task_id)

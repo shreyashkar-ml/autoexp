@@ -14,17 +14,9 @@ TOOL_CATALOG_VERSION = "1.0.0"
 VALID_MODES = {"planning", "instant"}
 
 
-DEFAULT_REVIEW_ARTIFACT = """<!-- template_id: rpi_review -->
-<!-- template_version: 2.2.0 -->
-
-# Review and Lessons
-
-## Lessons
-- Add user-interruption correction patterns here.
-
-## Review
-- Add end-to-end implementation review summary here.
-"""
+DEFAULT_REVIEW_ARTIFACT = (
+    (Path(__file__).resolve().parent / "templates" / "rpi_review.md").read_text(encoding="utf-8").rstrip() + "\n"
+)
 
 
 def _append_event(paths: RepoPaths, run_id: str, payload: dict[str, Any]) -> None:
@@ -56,6 +48,11 @@ def _tool_specifications() -> list[dict[str, Any]]:
                 {"name": "mode", "type": "string", "required": False},
                 {"name": "run_id", "type": "string", "required": False},
             ],
+            "outputs": {
+                "type": "object",
+                "required": ["mode", "run_id", "source", "reasons", "created_at"],
+            },
+            "errors": ["empty_request", "invalid_mode"],
         },
         {
             "id": "guardrail.check_command",
@@ -66,6 +63,11 @@ def _tool_specifications() -> list[dict[str, Any]]:
                 {"name": "target", "type": "string", "required": False},
                 {"name": "no_network", "type": "boolean", "required": False},
             ],
+            "outputs": {
+                "type": "object",
+                "required": ["allowed", "reason", "policy_stage", "runtime_approval_required", "metadata"],
+            },
+            "errors": ["invalid_command", "invalid_pytest_target"],
         },
         {
             "id": "feature.status_set",
@@ -78,16 +80,26 @@ def _tool_specifications() -> list[dict[str, Any]]:
                 {"name": "actor", "type": "string", "required": False},
                 {"name": "note", "type": "string", "required": False},
             ],
+            "outputs": {
+                "type": "object",
+                "required": ["ok", "run_id", "task_id", "status", "done_count", "total_count"],
+            },
+            "errors": ["unknown_task_id", "invalid_status_mutation"],
         },
         {
             "id": "feature.status_get",
             "description": "Get a sub-task status from feature_list.json.",
             "cli": "autoeval tools feature-status-get --repo . --task-id <id>",
             "parameters": [{"name": "task_id", "type": "string", "required": True}],
+            "outputs": {
+                "type": "object",
+                "required": ["task_id", "status", "phase_id", "phase", "verifications"],
+            },
+            "errors": ["unknown_task_id"],
         },
         {
             "id": "verifier.autocheck",
-            "description": "Run linked verifier tests for relevant feature criteria and optionally update feature status.",
+            "description": "Run linked verifier tests for typed feature verifications and optionally update feature status.",
             "cli": "autoeval tools autocheck --repo . [--run-id <id>] [--selection-mode feature-list|all] [--target <pytest_target>]",
             "parameters": [
                 {"name": "run_id", "type": "string", "required": False},
@@ -97,12 +109,22 @@ def _tool_specifications() -> list[dict[str, Any]]:
                 {"name": "target", "type": "string[]", "required": False},
                 {"name": "timeout_sec", "type": "integer", "required": False},
             ],
+            "outputs": {
+                "type": "object",
+                "required": ["run_id", "passed", "total_checks", "results", "feature_task_target_refs"],
+            },
+            "errors": ["invalid_selection_mode", "invalid_timeout", "invalid_verification_binding"],
         },
         {
             "id": "run.status",
             "description": "Read harness run status and completion counters.",
             "cli": "autoeval tools run-status --repo . [--run-id <id>]",
             "parameters": [{"name": "run_id", "type": "string", "required": False}],
+            "outputs": {
+                "type": "object",
+                "required": ["run_id", "provider", "executor_mode", "mode", "done_count", "total_count", "completed"],
+            },
+            "errors": [],
         },
         {
             "id": "run.eval",
@@ -112,18 +134,33 @@ def _tool_specifications() -> list[dict[str, Any]]:
                 {"name": "run_id", "type": "string", "required": False},
                 {"name": "profile", "type": "string", "required": False},
             ],
+            "outputs": {
+                "type": "object",
+                "required": ["run_id", "profile", "passed", "checks", "summary"],
+            },
+            "errors": ["missing_run_id"],
         },
         {
             "id": "rpi.append_lesson",
             "description": "Append a lesson pattern in review.md Lessons section.",
             "cli": "autoeval tools append-lesson --repo . --text <lesson>",
             "parameters": [{"name": "text", "type": "string", "required": True}],
+            "outputs": {
+                "type": "object",
+                "required": ["ok", "run_id", "review_file", "section"],
+            },
+            "errors": ["empty_text"],
         },
         {
             "id": "rpi.append_review",
             "description": "Append final review summary in review.md Review section.",
             "cli": "autoeval tools append-review --repo . --text <summary>",
             "parameters": [{"name": "text", "type": "string", "required": True}],
+            "outputs": {
+                "type": "object",
+                "required": ["ok", "run_id", "review_file", "section"],
+            },
+            "errors": ["empty_text"],
         },
     ]
 
@@ -152,7 +189,7 @@ def tool_catalog_payload(paths: RepoPaths) -> dict[str, Any]:
                 "if mode=instant: skip harness loop and jump directly to coding execution",
                 "if mode=planning: continue harness loop",
                 "read artifacts + tool catalog",
-                "read verifier.yaml/autocheck_map linked targets and map relevant ones into feature criteria",
+                "read verifier.yaml/autocheck_map linked targets and map relevant ones into typed feature verifications",
                 "check terminal commands with guardrail.check_command",
                 "implement changes with coding agent outside harness",
                 "run verifier.autocheck",
@@ -260,43 +297,57 @@ def _normalize_mode(mode: str) -> str:
     return value
 
 
-def _auto_select_mode(request_text: str) -> tuple[str, list[str]]:
+MODE_SIGNAL_RULES: tuple[tuple[str, int, str], ...] = (
+    ("architecture", 2, "architectural scope"),
+    ("refactor", 2, "refactor scope"),
+    ("integration", 2, "integration work"),
+    ("new functionality", 2, "new capability"),
+    ("mcp", 2, "tool/runtime integration"),
+    ("web search", 2, "external research required"),
+    ("across files", 2, "multi-file scope"),
+    ("multi", 1, "multi-step wording"),
+    ("multiple", 1, "multiple deliverables"),
+    ("phase", 1, "phase-oriented request"),
+    ("complex", 1, "explicit complexity wording"),
+    ("three steps", 1, "multi-step wording"),
+)
+
+
+def _auto_select_mode(request_text: str) -> tuple[str, list[str], dict[str, Any]]:
     text = request_text.strip()
     lowered = text.lower()
-    planning_hits = 0
     reasons: list[str] = []
+    signals: list[dict[str, Any]] = []
+    planning_score = 0
 
-    keywords = (
-        "architecture",
-        "multi",
-        "multiple",
-        "phase",
-        "refactor",
-        "new functionality",
-        "integration",
-        "mcp",
-        "web search",
-        "complex",
-        "across files",
-        "3+",
-        "three steps",
-    )
-    for keyword in keywords:
+    for keyword, weight, label in MODE_SIGNAL_RULES:
         if keyword in lowered:
-            planning_hits += 1
             reasons.append(f"contains '{keyword}'")
+            planning_score += weight
+            signals.append({"type": "keyword", "keyword": keyword, "weight": weight, "label": label})
 
     estimated_steps = len([item for item in re.split(r"[.;\\n]", text) if item.strip()])
     if estimated_steps >= 3:
-        planning_hits += 1
         reasons.append("contains 3+ action chunks")
+        planning_score += 2
+        signals.append({"type": "structure", "label": "3+ action chunks", "weight": 2, "value": estimated_steps})
     if len(text) > 220:
-        planning_hits += 1
         reasons.append("request length suggests non-trivial scope")
+        planning_score += 1
+        signals.append({"type": "structure", "label": "long request", "weight": 1, "value": len(text)})
 
-    if planning_hits >= 2:
-        return "planning", reasons or ["non-trivial scope"]
-    return "instant", reasons or ["simple/trivial scope heuristic"]
+    decision = "planning" if planning_score >= 3 else "instant"
+    if not reasons:
+        reasons = ["simple/trivial scope rule match"]
+
+    diagnostics = {
+        "planning_score": planning_score,
+        "estimated_steps": estimated_steps,
+        "request_length": len(text),
+        "threshold": 3,
+        "signals": signals,
+    }
+    return decision, reasons, diagnostics
 
 
 def decide_mode(
@@ -312,11 +363,18 @@ def decide_mode(
 
     mode_input = mode.strip().lower()
     if mode_input == "auto":
-        selected_mode, reasons = _auto_select_mode(request_text)
-        decision_source = "heuristic_auto_from_decision_md"
+        selected_mode, reasons, diagnostics = _auto_select_mode(request_text)
+        decision_source = "rule_based_auto_from_decision_md"
     else:
         selected_mode = _normalize_mode(mode_input)
         reasons = [f"explicit mode override: {selected_mode}"]
+        diagnostics = {
+            "planning_score": None,
+            "estimated_steps": len([item for item in re.split(r"[.;\\n]", request_text) if item.strip()]),
+            "request_length": len(request_text),
+            "threshold": None,
+            "signals": [],
+        }
         decision_source = "explicit_override"
 
     active_run = _resolve_run_id(paths, run_id=run_id)
@@ -327,6 +385,7 @@ def decide_mode(
         "mode": selected_mode,
         "source": decision_source,
         "reasons": reasons,
+        "diagnostics": diagnostics,
         "decision_prompt_file": str(Path(__file__).resolve().parent / "prompts" / "decision.md"),
         "decision_prompt_text": load_decision_prompt(),
         "created_at": utc_now_iso(),
@@ -397,6 +456,14 @@ def get_feature_status(paths: RepoPaths, task_id: str) -> dict[str, Any]:
                 "status": bool(item.get("status", False)),
                 "phase_id": str(item.get("phase_id", "")),
                 "phase": str(item.get("phase", "")),
-                "criteria": [str(entry) for entry in item.get("criteria", [])],
+                "verifications": [
+                    {
+                        "kind": str(entry.get("kind", "")),
+                        "target": str(entry.get("target", "")),
+                        "required": bool(entry.get("required", True)),
+                    }
+                    for entry in item.get("verifications", [])
+                    if isinstance(entry, dict)
+                ],
             }
     raise KeyError(f"unknown sub-task id: {task_id}")

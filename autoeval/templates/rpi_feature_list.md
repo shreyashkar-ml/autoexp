@@ -4,7 +4,7 @@
 # Feature List Artifact Instruction
 
 Purpose:
-- Break down each phase as described in `plan.md` into multiple sub-tasks each with independently verifiable passing criteria for success.
+- Break down each phase as described in `plan.md` into multiple sub-tasks each with independently verifiable bindings for success.
 - Represent phase-to-sub-task mapping where each plan phase can contain multiple sub-tasks.
 
 ## Rules
@@ -12,14 +12,14 @@ Purpose:
    - `id`
    - `phase_id` (stable link to a phase in `plan.md`)
    - `sub_task_description` (smallest independently testable unit)
-   - `criteria` (array of objective pass checks)
+   - `verifications` (array of typed verification bindings)
    - `status` (boolean)
 2. Order `sub_tasks` by phase order in `plan.md`, then by execution order within each phase.
 3. Agents CAN only mutate `status`. All other fields are immutable.
-4. Completion is valid only when evidence satisfies every criterion.
-5. Use rebaseline workflow for criteria changes; do not edit in place.
+4. Completion is valid only when evidence satisfies every required verification.
+5. Use rebaseline workflow for verification-binding changes; do not edit in place.
 6. Do not store planning prose in this artifact.
-7. Criteria must be objectively verifiable (tests, commands, outputs, or concrete observable behavior).
+7. Verification bindings must be typed and objectively verifiable.
 8. Every `sub_task` must map cleanly to a specific phase boundary from `plan.md`.
 9. For test verification, reference linked pytest targets from `.autoeval/instructions/autocheck_map.json`.
 
@@ -37,9 +37,12 @@ Purpose:
       "id": "phase_1_subtask_1",
       "phase_id": "phase_1",
       "sub_task_description": "<smallest testable implementation unit>",
-      "criteria": [
-        "<objective pass check 1>",
-        "<objective pass check 2>"
+      "verifications": [
+        {
+          "kind": "pytest",
+          "target": "tests/unit/test_example.py::test_ok",
+          "required": true
+        }
       ],
       "status": false
     }

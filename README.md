@@ -28,7 +28,7 @@ Verifier link config:
 5. Coding agent reads artifacts + `tool_calls.json`.
 6. Coding agent checks terminal commands with guardrail tools.
 7. Coding agent executes implementation outside harness.
-8. Coding agent runs `autocheck` for linked targets referenced by feature criteria and updates status.
+8. Coding agent runs `autocheck` for linked targets referenced by typed feature verifications and updates status.
 9. Repeat until all sub-tasks pass.
 
 ## Guardrails

@@ -1,13 +1,14 @@
 [project]
-name = "phase-test-autoeval"
+name = "autoeval"
 version = "0.1.0"
-description = "Phase 1-5 MVP harness implementation test"
+description = "Harness-first control plane for long-running coding-agent workflows"
 readme = "README.md"
 license = { text = "Apache-2.0" }
 requires-python = ">=3.10"
 dependencies = [
   "typer>=0.12.3",
   "pydantic>=2.6.0",
+  "PyYAML>=6.0.2",
 ]
 
 [project.optional-dependencies]
@@ -30,7 +31,7 @@ include = ["autoeval*"]
 autoeval = ["schemas/*.json"]
 
 [tool.pytest.ini_options]
-testpaths = ["phase_test/tests"]
+testpaths = ["tests"]
 addopts = "-q"
 
 [tool.ruff]

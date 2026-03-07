@@ -1,5 +1,5 @@
 guide_docs/
-phase_test/
+tests/
 .venv/
 *.egg-info/
 __pycache__/

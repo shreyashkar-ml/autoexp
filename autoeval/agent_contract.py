@@ -20,6 +20,8 @@ class ToolCallSpec(BaseModel):
     description: str
     cli: str
     parameters: list[ToolParameter] = Field(default_factory=list)
+    outputs: dict[str, Any] = Field(default_factory=dict)
+    errors: list[str] = Field(default_factory=list)
 
 
 class ArtifactPaths(BaseModel):
@@ -79,6 +81,8 @@ def build_agent_contract(paths: RepoPaths) -> HarnessLoopContract:
                 description=str(item.get("description", "")),
                 cli=str(item.get("cli", "")),
                 parameters=parameters,
+                outputs=dict(item.get("outputs", {})) if isinstance(item.get("outputs", {}), dict) else {},
+                errors=[str(error) for error in item.get("errors", []) if str(error).strip()],
             )
         )
 
