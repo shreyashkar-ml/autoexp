@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import json
 from pathlib import Path
 import shutil
@@ -11,10 +9,10 @@ from .evals import EvalCheck, run_eval_suite
 from .harness_tools import decide_mode, tool_catalog_payload, write_tool_catalog
 from .rpi import init_rpi_artifacts, is_rpi_initialized
 from .security import guardrail_summary
-from .tracker import all_completed, completion_counts
+from .tracker import all_completed, completion_counts, load_feature_list
 from .verifier import mapped_target_ids, run_autocheck
 
-VALID_MODES = {"planning", "instant", "auto"}
+VALID_MODES = {"planning", "instant"}
 
 
 def _append_event(run_dir: Path, payload: dict[str, Any]) -> None:
@@ -111,8 +109,8 @@ def _build_loop_context_payload(
     task: str,
     provider: str,
 ) -> dict[str, Any]:
-    feature_payload = read_json(paths.rpi_dir / "feature_list.json", {"sub_tasks": []})
-    sub_tasks = [item for item in feature_payload.get("sub_tasks", []) if isinstance(item, dict)]
+    feature_payload = load_feature_list(paths.rpi_dir / "feature_list.json")
+    sub_tasks = feature_payload["sub_tasks"]
     pending = [item for item in sub_tasks if not bool(item.get("status", False))]
     completed = [item for item in sub_tasks if bool(item.get("status", False))]
 
@@ -133,10 +131,8 @@ def _build_loop_context_payload(
             "implementation": str(paths.rpi_dir / "implementation.md"),
             "plan": str(paths.rpi_dir / "plan.md"),
             "review": str(paths.review_file),
-            "decision_prompt": str(Path(__file__).resolve().parent / "prompts" / "decision.md"),
             "feature_list": str(paths.rpi_dir / "feature_list.json"),
             "verifier_yaml": str(paths.verifier_file),
-            "autocheck_map": str(paths.autocheck_map_file),
             "tool_calls": str(paths.tool_calls_file),
         },
         "summary": {
@@ -160,23 +156,22 @@ def _build_loop_context_payload(
                         "target": str(entry.get("target", "")),
                         "required": bool(entry.get("required", True)),
                     }
-                    for entry in item.get("verifications", [])
-                    if isinstance(entry, dict)
+                    for entry in item["verifications"]
                 ],
             }
             for item in pending
         ],
         "instructions": [
             "autoeval is harness-only; use tool calls for status/verification/guardrails.",
-            "read .autoeval/instructions/tool_calls.json and call tools explicitly in loop.",
+            "read .autoeval/runtime/tool_calls.json and call tools explicitly in loop.",
             "mutate only feature_list status through harness tool interfaces.",
         ],
     }
 
 
 def _build_instant_context_payload(paths: RepoPaths, run_id: str, task: str, provider: str) -> dict[str, Any]:
-    feature_payload = read_json(paths.rpi_dir / "feature_list.json", {"sub_tasks": []})
-    sub_tasks = [item for item in feature_payload.get("sub_tasks", []) if isinstance(item, dict)]
+    feature_payload = load_feature_list(paths.rpi_dir / "feature_list.json")
+    sub_tasks = feature_payload["sub_tasks"]
     done_count, total_count = completion_counts(paths.rpi_dir / "feature_list.json")
     return {
         "schema_version": SCHEMA_VERSION,
@@ -190,7 +185,6 @@ def _build_instant_context_payload(paths: RepoPaths, run_id: str, task: str, pro
             "implementation": str(paths.rpi_dir / "implementation.md"),
             "plan": str(paths.rpi_dir / "plan.md"),
             "review": str(paths.review_file),
-            "decision_prompt": str(Path(__file__).resolve().parent / "prompts" / "decision.md"),
             "feature_list": str(paths.rpi_dir / "feature_list.json"),
             "tool_calls": str(paths.tool_calls_file),
         },
@@ -227,7 +221,7 @@ def _write_metrics(
     done_count, total_count = completion_counts(paths.rpi_dir / "feature_list.json")
     usage_file = paths.runs_dir / run_id / "usage.json"
     usage_payload = read_json(usage_file, {"totals": {}})
-    totals = usage_payload.get("totals", {}) if isinstance(usage_payload, dict) else {}
+    totals = usage_payload.get("totals", {})
 
     completed = done_count == total_count and total_count > 0
     if completed_override is not None:
@@ -383,7 +377,7 @@ def run_task(
     paths: RepoPaths,
     task: str,
     provider: str = "codex",
-    mode: str = "auto",
+    mode: str = "planning",
     run_id: str | None = None,
     context_threshold: float = 0.6,
     max_sessions: int = 30,
@@ -401,7 +395,10 @@ def run_task(
     if not is_rpi_initialized(paths):
         init_rpi_artifacts(paths, task=task, provider_name=provider)
 
-    mode_input = _normalize_mode(mode)
+    mode_input = mode.strip().lower()
+    if mode_input == "auto":
+        raise ValueError("mode='auto' is not supported; choose planning or instant using the inline workflow.decide_mode policy")
+    mode_input = _normalize_mode(mode_input)
     active_run_id = run_id or _next_run_id()
     run_dir = paths.runs_dir / active_run_id
     run_dir.mkdir(parents=True, exist_ok=True)
@@ -538,7 +535,6 @@ def run_task(
         "provider": provider,
         "executor_mode": "external_agent",
         "mode": selected_mode,
-        "mode_decision_file": str(run_dir / "mode_decision.json"),
         "mode_decision": mode_decision,
         "metrics": metrics,
         "loop_context_file": str(run_dir / "loop_context.json") if selected_mode == "planning" else None,
@@ -682,7 +678,6 @@ def fork_run(paths: RepoPaths, source_run_id: str, target_run_id: str | None = N
         "metrics.json",
         "loop_context.json",
         "instant_context.json",
-        "mode_decision.json",
     ]:
         src = source_dir / name
         if src.exists():

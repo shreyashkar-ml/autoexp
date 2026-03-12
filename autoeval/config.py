@@ -47,12 +47,12 @@ class RepoPaths:
         return self.autoeval_dir / "runs"
 
     @property
-    def verifier_file(self) -> Path:
-        return self.autoeval_dir / "verifier.yaml"
+    def runtime_dir(self) -> Path:
+        return self.autoeval_dir / "runtime"
 
     @property
-    def autocheck_map_file(self) -> Path:
-        return self.rpi_dir / "autocheck_map.json"
+    def verifier_file(self) -> Path:
+        return self.autoeval_dir / "verifier.yaml"
 
     @property
     def review_file(self) -> Path:
@@ -60,7 +60,7 @@ class RepoPaths:
 
     @property
     def tool_calls_file(self) -> Path:
-        return self.rpi_dir / "tool_calls.json"
+        return self.runtime_dir / "tool_calls.json"
 
     @property
     def mcp_project_dir(self) -> Path:
@@ -104,6 +104,7 @@ def write_json(path: Path, payload: Any) -> None:
 def ensure_repo_layout(paths: RepoPaths) -> None:
     paths.autoeval_dir.mkdir(parents=True, exist_ok=True)
     paths.rpi_dir.mkdir(parents=True, exist_ok=True)
+    paths.runtime_dir.mkdir(parents=True, exist_ok=True)
     paths.runs_dir.mkdir(parents=True, exist_ok=True)
     paths.mcp_project_dir.mkdir(parents=True, exist_ok=True)
 

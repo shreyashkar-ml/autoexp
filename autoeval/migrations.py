@@ -10,6 +10,13 @@ def _ensure_schema(path: Path, default_payload: dict[str, Any]) -> None:
     write_json(path, payload)
 
 
+def _migrate_runtime_file(old_path: Path, new_path: Path) -> None:
+    if new_path.exists() or not old_path.exists():
+        return
+    new_path.parent.mkdir(parents=True, exist_ok=True)
+    old_path.replace(new_path)
+
+
 def run_migrations(paths: RepoPaths) -> None:
     ensure_repo_layout(paths)
     ensure_user_layout(paths)
@@ -33,9 +40,7 @@ def run_migrations(paths: RepoPaths) -> None:
     if feature_file.exists():
         _ensure_schema(feature_file, {"schema_version": SCHEMA_VERSION, "sub_tasks": []})
 
-    autocheck_map_file = paths.autocheck_map_file
-    if autocheck_map_file.exists():
-        _ensure_schema(autocheck_map_file, {"schema_version": SCHEMA_VERSION, "links": [], "targets": []})
+    _migrate_runtime_file(paths.rpi_dir / "tool_calls.json", paths.tool_calls_file)
 
     tool_calls_file = paths.tool_calls_file
     if tool_calls_file.exists():

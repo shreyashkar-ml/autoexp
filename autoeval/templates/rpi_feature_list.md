@@ -21,7 +21,7 @@ Purpose:
 6. Do not store planning prose in this artifact.
 7. Verification bindings must be typed and objectively verifiable.
 8. Every `sub_task` must map cleanly to a specific phase boundary from `plan.md`.
-9. For test verification, reference linked pytest targets from `.autoeval/instructions/autocheck_map.json`.
+9. For test verification, reference linked pytest targets returned by `autoeval verifier sync --repo .`.
 
 ## JSON Shape
 ```json

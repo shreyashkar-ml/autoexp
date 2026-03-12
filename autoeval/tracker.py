@@ -1,8 +1,9 @@
 from pathlib import Path
 from typing import Any
 
-from .config import SCHEMA_VERSION, read_json, write_json
+from .config import SCHEMA_VERSION, read_json, utc_now_iso, write_json
 
+FEATURE_LIST_TEMPLATE_VERSION = "2.2.0"
 IMMUTABLE_FIELDS = ("id", "phase_id", "phase", "sub_task_description", "verifications")
 
 
@@ -36,15 +37,61 @@ def require_verifications(raw_verifications: Any, *, index: int) -> list[dict[st
     raise ValueError(f"sub_task_{index} must define at least one typed verification binding")
 
 
+def normalize_feature_list_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    raw_tasks = payload.get("sub_tasks", [])
+    if not isinstance(raw_tasks, list):
+        raise ValueError("feature list payload 'sub_tasks' must be a list")
+
+    normalized_tasks: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_tasks, start=1):
+        if not isinstance(item, dict):
+            continue
+        normalized_tasks.append(
+            {
+                "id": str(item.get("id") or f"sub_task_{index}"),
+                "phase_id": str(item.get("phase_id") or f"phase_{index}"),
+                "phase": str(item.get("phase") or f"Phase {index}"),
+                "sub_task_description": str(item.get("sub_task_description") or f"Execute sub_task_{index}"),
+                "verifications": require_verifications(item.get("verifications", []), index=index),
+                "status": bool(item.get("status", False)),
+            }
+        )
+
+    _assert_unique_task_ids(normalized_tasks)
+
+    template = payload.get("template", {})
+    if template and not isinstance(template, dict):
+        raise ValueError("feature list payload 'template' must be an object")
+    version = (
+        str(template.get("version"))
+        if isinstance(template, dict) and str(template.get("version", "")).strip()
+        else FEATURE_LIST_TEMPLATE_VERSION
+    )
+
+    return {
+        "schema_version": SCHEMA_VERSION,
+        "template": {"id": "rpi_feature_list", "version": version},
+        "generated_at": str(payload.get("generated_at") or utc_now_iso()),
+        "sub_tasks": normalized_tasks,
+    }
+
+
+def _assert_unique_task_ids(tasks: list[dict[str, Any]]) -> None:
+    task_ids = [str(item.get("id", "")).strip() for item in tasks]
+    if len(task_ids) != len(set(task_ids)):
+        raise ValueError("feature list payload 'sub_tasks' must have unique ids")
+
+
 def load_feature_list(feature_file: Path) -> dict[str, Any]:
-    return read_json(
+    payload = read_json(
         feature_file,
         {
             "schema_version": SCHEMA_VERSION,
-            "template": {"id": "rpi_feature_list", "version": "2.2.0"},
+            "template": {"id": "rpi_feature_list", "version": FEATURE_LIST_TEMPLATE_VERSION},
             "sub_tasks": [],
         },
     )
+    return normalize_feature_list_payload(payload)
 
 
 def save_feature_list(feature_file: Path, payload: dict[str, Any]) -> None:
@@ -54,9 +101,7 @@ def save_feature_list(feature_file: Path, payload: dict[str, Any]) -> None:
 
 def _tasks_by_id(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     result: dict[str, dict[str, Any]] = {}
-    for item in payload.get("sub_tasks", []):
-        if not isinstance(item, dict):
-            continue
+    for item in payload["sub_tasks"]:
         task_id = str(item.get("id", ""))
         if task_id:
             result[task_id] = item
@@ -64,8 +109,8 @@ def _tasks_by_id(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
 
 
 def assert_status_only_mutation(before: dict[str, Any], after: dict[str, Any]) -> None:
-    before_ids = [str(item.get("id", "")) for item in before.get("sub_tasks", []) if isinstance(item, dict)]
-    after_ids = [str(item.get("id", "")) for item in after.get("sub_tasks", []) if isinstance(item, dict)]
+    before_ids = [str(item.get("id", "")) for item in before["sub_tasks"]]
+    after_ids = [str(item.get("id", "")) for item in after["sub_tasks"]]
     if before_ids != after_ids:
         raise ValueError("sub_task ids and order cannot change")
 
@@ -86,8 +131,8 @@ def assert_status_only_mutation(before: dict[str, Any], after: dict[str, Any]) -
 def update_sub_task_status(feature_file: Path, task_id: str, status: bool) -> dict[str, Any]:
     payload = load_feature_list(feature_file)
     found = False
-    for item in payload.get("sub_tasks", []):
-        if isinstance(item, dict) and str(item.get("id", "")) == task_id:
+    for item in payload["sub_tasks"]:
+        if str(item.get("id", "")) == task_id:
             item["status"] = bool(status)
             found = True
             break
@@ -99,12 +144,12 @@ def update_sub_task_status(feature_file: Path, task_id: str, status: bool) -> di
 
 def all_completed(feature_file: Path) -> bool:
     payload = load_feature_list(feature_file)
-    tasks = [item for item in payload.get("sub_tasks", []) if isinstance(item, dict)]
+    tasks = payload["sub_tasks"]
     return bool(tasks) and all(bool(item.get("status", False)) for item in tasks)
 
 
 def completion_counts(feature_file: Path) -> tuple[int, int]:
     payload = load_feature_list(feature_file)
-    tasks = [item for item in payload.get("sub_tasks", []) if isinstance(item, dict)]
+    tasks = payload["sub_tasks"]
     done_count = sum(1 for item in tasks if bool(item.get("status", False)))
     return done_count, len(tasks)

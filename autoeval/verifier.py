@@ -1,5 +1,3 @@
-from __future__ import annotations
-
 import ast
 import json
 import os
@@ -8,17 +6,17 @@ import re
 import subprocess
 from typing import Any
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 import yaml
 
 from .config import RepoPaths, SCHEMA_VERSION, ensure_repo_layout, read_json, utc_now_iso, write_json
 from .policy import PolicyEngine
 from .security import validate_pytest_target, validate_repo_relative_path, validate_timeout
-from .tracker import assert_status_only_mutation, normalize_verifications
+from .tracker import assert_status_only_mutation, load_feature_list
 
 VERIFIER_YAML_TEMPLATE = f"""# Autoeval verifier configuration
 # Fixed template: developer/end-user maintains this file.
-# Coding agent should not author links; it only consumes linked targets.
+# Coding agent should not author verifier entries; it only consumes resolved outputs.
 schema_version: {SCHEMA_VERSION}
 tests:
   # Link a single test file
@@ -36,6 +34,22 @@ tests:
   #   pattern: "test_*.py"
   #   recursive: true
   #   mcp_profiles: []
+
+prompts:
+  # Reserved standardized section for future MCP/service-backed verifier inputs.
+  # Phase 1 keeps this declarative only; runtime execution is deferred.
+  # - id: linear_triage
+  #   profile: linear
+  #   prompt: "List backend issues marked blocked"
+  #   required: false
+
+connections:
+  # Reserved standardized section for future connector/MCP dependencies.
+  # Phase 1 keeps this declarative only; runtime execution is deferred.
+  # - id: jira
+  #   profile: jira
+  #   purpose: issue_tracking
+  #   required: false
 """
 
 class VerifierTest(BaseModel):
@@ -50,10 +64,30 @@ class VerifierTest(BaseModel):
 class VerifierConfig(BaseModel):
     schema_version: int = SCHEMA_VERSION
     tests: list[VerifierTest] = Field(default_factory=list)
+    prompts: list[dict[str, Any]] = Field(default_factory=list)
+    connections: list[dict[str, Any]] = Field(default_factory=list)
+
+
+class AutocheckTarget(BaseModel):
+    target_id: str
+    target: str
+    kind: str
+    path: str
+    node_id: str = ""
+    framework: str = "pytest"
+    mcp_profiles: list[str] = Field(default_factory=list)
+    link_ids: list[str] = Field(default_factory=list)
+
+
+class AutocheckMap(BaseModel):
+    schema_version: int = SCHEMA_VERSION
+    generated_at: str | None = None
+    links: list[dict[str, Any]] = Field(default_factory=list)
+    targets: list[AutocheckTarget] = Field(default_factory=list)
 
 
 def default_verifier_payload() -> dict[str, Any]:
-    return {"schema_version": SCHEMA_VERSION, "tests": []}
+    return {"schema_version": SCHEMA_VERSION, "tests": [], "prompts": [], "connections": []}
 
 
 def verifier_template_text() -> str:
@@ -71,22 +105,29 @@ def load_verifier_config(paths: RepoPaths) -> VerifierConfig:
     ensure_verifier_file(paths)
     raw_text = paths.verifier_file.read_text(encoding="utf-8")
     try:
-        raw = yaml.safe_load(raw_text) or {}
+        raw = yaml.safe_load(raw_text)
     except yaml.YAMLError as exc:
         raise ValueError(f"invalid verifier yaml: {exc}") from exc
+    if raw is None:
+        return VerifierConfig()
     if not isinstance(raw, dict):
-        raw = default_verifier_payload()
+        raise ValueError("invalid verifier yaml: top-level document must be a mapping")
 
     normalized_tests: list[dict[str, Any]] = []
     raw_tests = raw.get("tests", [])
-    if not isinstance(raw_tests, list):
+    if raw_tests is None:
         raw_tests = []
-    for item in raw_tests:
+    elif not isinstance(raw_tests, list):
+        raise ValueError("invalid verifier yaml: 'tests' must be a list")
+    for index, item in enumerate(raw_tests, start=1):
         if not isinstance(item, dict):
-            continue
+            raise ValueError(f"invalid verifier yaml: test entry {index} must be a mapping")
         path_value = str(item.get("path", "")).strip()
         if not path_value:
-            continue
+            raise ValueError(f"invalid verifier yaml: test entry {index} must define a non-empty path")
+        mcp_profiles = item.get("mcp_profiles", [])
+        if not isinstance(mcp_profiles, list):
+            raise ValueError(f"invalid verifier yaml: test entry {index} field 'mcp_profiles' must be a list")
         normalized_tests.append(
             {
                 "path": path_value,
@@ -94,12 +135,64 @@ def load_verifier_config(paths: RepoPaths) -> VerifierConfig:
                 "framework": str(item.get("framework", "pytest") or "pytest"),
                 "pattern": str(item.get("pattern", "test_*.py") or "test_*.py"),
                 "recursive": bool(item.get("recursive", True)),
-                "mcp_profiles": [str(value) for value in item.get("mcp_profiles", []) if str(value).strip()],
+                "mcp_profiles": [str(value) for value in mcp_profiles if str(value).strip()],
             }
         )
 
-    payload = {"schema_version": int(raw.get("schema_version", SCHEMA_VERSION)), "tests": normalized_tests}
-    return VerifierConfig.model_validate(payload)
+    normalized_prompts = _normalize_named_verifier_section(
+        raw.get("prompts", []),
+        field_name="prompts",
+        required_fields=("id", "profile", "prompt"),
+    )
+    normalized_connections = _normalize_named_verifier_section(
+        raw.get("connections", []),
+        field_name="connections",
+        required_fields=("id", "profile"),
+        optional_fields=("purpose",),
+    )
+
+    payload = {
+        "schema_version": int(raw.get("schema_version", SCHEMA_VERSION)),
+        "tests": normalized_tests,
+        "prompts": normalized_prompts,
+        "connections": normalized_connections,
+    }
+    try:
+        return VerifierConfig.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError(f"invalid verifier config: {exc}") from exc
+
+
+def _normalize_named_verifier_section(
+    raw_section: Any,
+    *,
+    field_name: str,
+    required_fields: tuple[str, ...],
+    optional_fields: tuple[str, ...] = (),
+) -> list[dict[str, Any]]:
+    if raw_section is None:
+        return []
+    if not isinstance(raw_section, list):
+        raise ValueError(f"invalid verifier yaml: '{field_name}' must be a list")
+
+    normalized: list[dict[str, Any]] = []
+    for index, item in enumerate(raw_section, start=1):
+        if not isinstance(item, dict):
+            raise ValueError(f"invalid verifier yaml: {field_name} entry {index} must be a mapping")
+
+        entry: dict[str, Any] = {"required": bool(item.get("required", True))}
+        for key in required_fields:
+            value = str(item.get(key, "")).strip()
+            if not value:
+                raise ValueError(f"invalid verifier yaml: {field_name} entry {index} must define '{key}'")
+            entry[key] = value
+        for key in optional_fields:
+            value = str(item.get(key, "")).strip()
+            if value:
+                entry[key] = value
+        normalized.append(entry)
+
+    return normalized
 
 
 def _normalize_rel_path(path_value: str) -> str:
@@ -288,12 +381,12 @@ def build_autocheck_map_from_verifier(paths: RepoPaths) -> dict[str, Any]:
 def sync_autocheck_map_from_verifier(paths: RepoPaths) -> dict[str, Any]:
     ensure_repo_layout(paths)
     map_payload = build_autocheck_map_from_verifier(paths)
-    write_json(paths.autocheck_map_file, map_payload)
     return {
         "ok": True,
-        "autocheck_map": str(paths.autocheck_map_file),
         "link_count": len(map_payload.get("links", [])),
         "target_count": len(map_payload.get("targets", [])),
+        "links": map_payload.get("links", []),
+        "targets": map_payload.get("targets", []),
     }
 
 
@@ -303,15 +396,7 @@ def sync_feature_list_from_verifier(paths: RepoPaths) -> dict[str, Any]:
 
 
 def mapped_target_ids(paths: RepoPaths) -> set[str]:
-    payload = read_json(paths.autocheck_map_file, {"targets": []})
-    target_ids: set[str] = set()
-    for item in payload.get("targets", []):
-        if not isinstance(item, dict):
-            continue
-        target = str(item.get("target", "")).strip()
-        if target:
-            target_ids.add(target)
-    return target_ids
+    return {item.target for item in _build_autocheck_map(paths).targets}
 
 
 def mapped_sub_task_ids(paths: RepoPaths) -> set[str]:
@@ -365,11 +450,11 @@ def _task_targets_from_verifications(task: dict[str, Any], linked_targets: set[s
     referenced: set[str] = set()
     unresolved: set[str] = set()
 
-    raw_verifications = normalize_verifications(task.get("verifications", []), index=1)
-    if not raw_verifications:
+    verifications = task["verifications"]
+    if not verifications:
         unresolved.add("missing_verifications")
         return referenced, unresolved
-    for item in raw_verifications:
+    for item in verifications:
         kind = str(item.get("kind", "")).strip().lower()
         target = str(item.get("target", "")).strip()
         if not target:
@@ -393,14 +478,15 @@ def _task_targets_from_verifications(task: dict[str, Any], linked_targets: set[s
 
 
 def _load_feature_payload(paths: RepoPaths) -> dict[str, Any]:
-    return read_json(
-        paths.rpi_dir / "feature_list.json",
-        {
-            "schema_version": SCHEMA_VERSION,
-            "template": {"id": "rpi_feature_list", "version": "2.2.0"},
-            "sub_tasks": [],
-        },
-    )
+    return load_feature_list(paths.rpi_dir / "feature_list.json")
+
+
+def _build_autocheck_map(paths: RepoPaths) -> AutocheckMap:
+    payload = build_autocheck_map_from_verifier(paths)
+    try:
+        return AutocheckMap.model_validate(payload)
+    except ValidationError as exc:
+        raise ValueError(f"invalid verifier target map: {exc}") from exc
 
 
 def _select_autocheck_targets(
@@ -426,9 +512,7 @@ def _select_autocheck_targets(
     task_unlinked_map: dict[str, list[str]] = {}
     selected_targets: set[str] = set()
 
-    for task in feature_payload.get("sub_tasks", []):
-        if not isinstance(task, dict):
-            continue
+    for task in feature_payload["sub_tasks"]:
         task_id = str(task.get("id", "")).strip()
         if not task_id:
             continue
@@ -459,9 +543,8 @@ def run_autocheck(
     if sync_verifier_map:
         sync_autocheck_map_from_verifier(paths)
 
-    map_payload = read_json(paths.autocheck_map_file, {"schema_version": SCHEMA_VERSION, "links": [], "targets": []})
-    target_entries = [item for item in map_payload.get("targets", []) if isinstance(item, dict)]
-    target_index = {str(item.get("target", "")): item for item in target_entries if str(item.get("target", "")).strip()}
+    autocheck_map = _build_autocheck_map(paths)
+    target_index = {item.target: item for item in autocheck_map.targets}
     linked_targets = set(target_index.keys())
 
     feature_payload = _load_feature_payload(paths)
@@ -490,8 +573,8 @@ def run_autocheck(
 
     for target in selected_targets:
         target_meta = target_index[target]
-        target_id = str(target_meta.get("target_id", _target_id(target)))
-        mcp_profiles = [str(value) for value in target_meta.get("mcp_profiles", []) if str(value).strip()]
+        target_id = target_meta.target_id
+        mcp_profiles = target_meta.mcp_profiles
 
         policy_decision = policy_engine.evaluate_terminal_command(
             command=f"{pytest_bin} -q {target}",
@@ -533,9 +616,9 @@ def run_autocheck(
             {
                 "target": target,
                 "target_id": target_id,
-                "kind": str(target_meta.get("kind", "")),
-                "path": str(target_meta.get("path", "")),
-                "node_id": str(target_meta.get("node_id", "")),
+                "kind": target_meta.kind,
+                "path": target_meta.path,
+                "node_id": target_meta.node_id,
                 "passed": passed,
                 "policy": policy_decision.model_dump(),
                 "missing_mcp_profiles": missing_mcp,
@@ -550,9 +633,7 @@ def run_autocheck(
         feature_payload = _load_feature_payload(paths)
         result_by_target = {item["target"]: item for item in results}
 
-        for task in feature_payload.get("sub_tasks", []):
-            if not isinstance(task, dict):
-                continue
+        for task in feature_payload["sub_tasks"]:
             task_id = str(task.get("id", "")).strip()
             if not task_id:
                 continue

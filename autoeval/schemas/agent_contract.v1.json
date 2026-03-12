@@ -2,14 +2,6 @@
   "$defs": {
     "ArtifactPaths": {
       "properties": {
-        "autocheck_map": {
-          "title": "Autocheck Map",
-          "type": "string"
-        },
-        "decision_prompt": {
-          "title": "Decision Prompt",
-          "type": "string"
-        },
         "feature_list": {
           "title": "Feature List",
           "type": "string"
@@ -44,10 +36,8 @@
         "implementation",
         "plan",
         "review",
-        "decision_prompt",
         "feature_list",
         "verifier_yaml",
-        "autocheck_map",
         "tool_calls"
       ],
       "title": "ArtifactPaths",

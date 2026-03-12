@@ -19,6 +19,7 @@ from .harness_tools import (
     append_review,
     check_command_guardrail,
     decide_mode,
+    generate_feature_list,
     get_feature_status,
     set_feature_status,
     write_tool_catalog,
@@ -75,7 +76,7 @@ def run(
     repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
     task: str = typer.Option(...),
     provider: str = typer.Option("codex"),
-    mode: str = typer.Option("auto", help="auto, planning, or instant"),
+    mode: str = typer.Option(..., help="planning or instant, selected from the inline workflow.decide_mode policy"),
     run_id: str | None = typer.Option(None),
     context_threshold: float = typer.Option(0.6),
     eval_profile: str = typer.Option("default"),
@@ -111,7 +112,7 @@ def resume(
     repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
     task: str = typer.Option("Continue target repository execution"),
     provider: str = typer.Option("codex"),
-    mode: str | None = typer.Option(None, help="auto, planning, or instant; default keeps previous mode"),
+    mode: str | None = typer.Option(None, help="planning or instant; default keeps previous mode"),
     run_id: str | None = typer.Option(None),
     context_threshold: float = typer.Option(0.6),
     eval_profile: str = typer.Option("default"),
@@ -370,7 +371,7 @@ def tools_list(
 def tools_decide_mode(
     repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
     request: str = typer.Option(..., help="User request text to classify"),
-    mode: str = typer.Option("auto", help="auto, planning, or instant"),
+    mode: str = typer.Option(..., help="planning or instant, selected by the coding agent from the inline workflow.decide_mode policy"),
     run_id: str | None = typer.Option(None),
 ) -> None:
     paths = _paths(repo)
@@ -422,6 +423,19 @@ def tools_feature_status_set(
             note=note,
         )
     )
+
+
+@tools_app.command("feature-list-generate")
+def tools_feature_list_generate(
+    repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    input_json: str = typer.Option(..., help="Full feature_list payload as JSON"),
+    run_id: str | None = typer.Option(None),
+    actor: str = typer.Option("coding_agent"),
+) -> None:
+    paths = _paths(repo)
+    ensure_repo_layout(paths)
+    ensure_user_layout(paths)
+    _emit(generate_feature_list(paths=paths, input_json=input_json, run_id=run_id, actor=actor))
 
 
 @tools_app.command("feature-status-get")

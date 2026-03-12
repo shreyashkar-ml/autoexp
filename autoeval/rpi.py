@@ -1,15 +1,13 @@
-from __future__ import annotations
-
 from pathlib import Path
 from typing import Any, Callable
 
 from .config import RepoPaths, SCHEMA_VERSION, ensure_repo_layout, read_json, utc_now_iso, write_json
 from .harness_tools import DEFAULT_REVIEW_ARTIFACT, ensure_review_artifact, write_tool_catalog
-from .tracker import require_verifications
+from .tracker import FEATURE_LIST_TEMPLATE_VERSION, load_feature_list as load_normalized_feature_list, normalize_feature_list_payload
 from .verifier import ensure_verifier_file, sync_autocheck_map_from_verifier
 
-TEMPLATE_VERSION = "2.2.0"
-ARTIFACT_FILES = ("research.md", "implementation.md", "plan.md", "review.md", "feature_list.json", "tool_calls.json")
+TEMPLATE_VERSION = FEATURE_LIST_TEMPLATE_VERSION
+ARTIFACT_FILES = ("research.md", "implementation.md", "plan.md", "review.md", "feature_list.json")
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
 
 
@@ -67,44 +65,6 @@ def _default_feature_list() -> dict[str, Any]:
         "sub_tasks": [],
     }
 
-
-def _normalize_feature_payload(payload: dict[str, Any]) -> dict[str, Any]:
-    raw_tasks = payload.get("sub_tasks", [])
-    if not isinstance(raw_tasks, list):
-        raw_tasks = []
-
-    normalized_tasks: list[dict[str, Any]] = []
-    for index, item in enumerate(raw_tasks, start=1):
-        if not isinstance(item, dict):
-            continue
-        normalized_verifications = require_verifications(item.get("verifications", []), index=index)
-
-        normalized_tasks.append(
-            {
-                "id": str(item.get("id") or f"sub_task_{index}"),
-                "phase_id": str(item.get("phase_id") or f"phase_{index}"),
-                "phase": str(item.get("phase") or f"Phase {index}"),
-                "sub_task_description": str(item.get("sub_task_description") or f"Execute sub_task_{index}"),
-                "verifications": normalized_verifications,
-                "status": bool(item.get("status", False)),
-            }
-        )
-
-    template = payload.get("template", {})
-    version = (
-        str(template.get("version"))
-        if isinstance(template, dict) and str(template.get("version", "")).strip()
-        else TEMPLATE_VERSION
-    )
-
-    return {
-        "schema_version": SCHEMA_VERSION,
-        "template": {"id": "rpi_feature_list", "version": version},
-        "generated_at": str(payload.get("generated_at") or utc_now_iso()),
-        "sub_tasks": normalized_tasks,
-    }
-
-
 def commit_rpi_artifacts(paths: RepoPaths, payload: dict[str, Any]) -> list[str]:
     ensure_repo_layout(paths)
     written: list[str] = []
@@ -131,7 +91,7 @@ def commit_rpi_artifacts(paths: RepoPaths, payload: dict[str, Any]) -> list[str]
 
     if isinstance(payload.get("feature_list"), dict):
         target = paths.rpi_dir / "feature_list.json"
-        write_json(target, _normalize_feature_payload(payload["feature_list"]))
+        write_json(target, normalize_feature_list_payload(payload["feature_list"]))
         written.append(str(target))
 
     if isinstance(payload.get("tool_calls"), dict):
@@ -211,10 +171,7 @@ def bootstrap_rpi_with_provider(
     def _status(message: str) -> None:
         if status_callback is None:
             return
-        try:
-            status_callback(message)
-        except Exception:
-            return
+        status_callback(message)
 
     _status("harness_bootstrap_requested")
     outputs = init_rpi_artifacts(paths=paths, task=task, provider_name=provider_name, force=force)
@@ -236,4 +193,4 @@ def is_rpi_initialized(paths: RepoPaths) -> bool:
 
 
 def load_feature_list(paths: RepoPaths) -> dict[str, Any]:
-    return read_json(paths.rpi_dir / "feature_list.json", _default_feature_list())
+    return load_normalized_feature_list(paths.rpi_dir / "feature_list.json")

@@ -29,10 +29,8 @@ class ArtifactPaths(BaseModel):
     implementation: str
     plan: str
     review: str
-    decision_prompt: str
     feature_list: str
     verifier_yaml: str
-    autocheck_map: str
     tool_calls: str
 
 
@@ -59,32 +57,7 @@ DEFAULT_LOOP_STEPS = [
 def build_agent_contract(paths: RepoPaths) -> HarnessLoopContract:
     catalog = tool_catalog_payload(paths)
     artifacts = catalog.get("artifact_paths", {})
-    tools_raw = catalog.get("tools", [])
-
-    tool_calls: list[ToolCallSpec] = []
-    for item in tools_raw:
-        if not isinstance(item, dict):
-            continue
-        parameters: list[ToolParameter] = []
-        for parameter in item.get("parameters", []):
-            if isinstance(parameter, dict):
-                parameters.append(
-                    ToolParameter(
-                        name=str(parameter.get("name", "")),
-                        type=str(parameter.get("type", "string")),
-                        required=bool(parameter.get("required", False)),
-                    )
-                )
-        tool_calls.append(
-            ToolCallSpec(
-                id=str(item.get("id", "")),
-                description=str(item.get("description", "")),
-                cli=str(item.get("cli", "")),
-                parameters=parameters,
-                outputs=dict(item.get("outputs", {})) if isinstance(item.get("outputs", {}), dict) else {},
-                errors=[str(error) for error in item.get("errors", []) if str(error).strip()],
-            )
-        )
+    tool_calls = [ToolCallSpec.model_validate(item) for item in catalog.get("tools", [])]
 
     return HarnessLoopContract(
         artifact_paths=ArtifactPaths(
@@ -92,12 +65,8 @@ def build_agent_contract(paths: RepoPaths) -> HarnessLoopContract:
             implementation=str(artifacts.get("implementation", paths.rpi_dir / "implementation.md")),
             plan=str(artifacts.get("plan", paths.rpi_dir / "plan.md")),
             review=str(artifacts.get("review", paths.review_file)),
-            decision_prompt=str(
-                artifacts.get("decision_prompt", Path(__file__).resolve().parent / "prompts" / "decision.md")
-            ),
             feature_list=str(artifacts.get("feature_list", paths.rpi_dir / "feature_list.json")),
             verifier_yaml=str(artifacts.get("verifier_yaml", paths.verifier_file)),
-            autocheck_map=str(artifacts.get("autocheck_map", paths.autocheck_map_file)),
             tool_calls=str(paths.tool_calls_file),
         ),
         tool_calls=tool_calls,

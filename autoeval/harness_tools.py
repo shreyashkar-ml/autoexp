@@ -1,14 +1,18 @@
-from __future__ import annotations
-
+import inspect
 import json
 from pathlib import Path
-import re
 from typing import Any
 
 from .config import RepoPaths, SCHEMA_VERSION, read_json, utc_now_iso, write_json
 from .policy import PolicyEngine
-from .prompts import load_decision_prompt
-from .tracker import assert_status_only_mutation, completion_counts, load_feature_list, update_sub_task_status
+from .tracker import (
+    assert_status_only_mutation,
+    completion_counts,
+    load_feature_list,
+    normalize_feature_list_payload,
+    save_feature_list,
+    update_sub_task_status,
+)
 
 TOOL_CATALOG_VERSION = "1.0.0"
 VALID_MODES = {"planning", "instant"}
@@ -17,6 +21,19 @@ VALID_MODES = {"planning", "instant"}
 DEFAULT_REVIEW_ARTIFACT = (
     (Path(__file__).resolve().parent / "templates" / "rpi_review.md").read_text(encoding="utf-8").rstrip() + "\n"
 )
+
+
+def _mode_decision_policy() -> str:
+    """First tool call for every new user request must be mode decision: choose `planning` or `instant`.
+
+    Evaluate the user's task request for current repository / parent directory based on complexity, estimated efforts, multi-turn changes spanning across multiple files or simple trivial edits/updates.
+
+    - `planning`: Invoke this when user's request is complex, introduces a new functionality, adds independent modules or greatly extends functionality for any existing implementation, relates to architectural decisions or 3+ steps, planning for tasks is required, more context or knowledge for the task execution is required including web search or MCP access.
+
+    - `instant`: Invoke for all simple trivial request that do not require much planning, and can be completed with simple changes.
+    """
+
+    return inspect.getdoc(_mode_decision_policy) or ""
 
 
 def _append_event(paths: RepoPaths, run_id: str, payload: dict[str, Any]) -> None:
@@ -41,18 +58,18 @@ def _tool_specifications() -> list[dict[str, Any]]:
     return [
         {
             "id": "workflow.decide_mode",
-            "description": "First tool call. Decide workflow mode using decision.md (planning or instant).",
-            "cli": "autoeval tools decide-mode --repo . --request \"<user request>\" [--mode auto|planning|instant]",
+            "description": "First tool call. The coding agent must choose planning or instant using the inline mode-decision policy in autoeval.harness_tools.",
+            "cli": "autoeval tools decide-mode --repo . --request \"<user request>\" --mode planning|instant",
             "parameters": [
                 {"name": "request", "type": "string", "required": True},
-                {"name": "mode", "type": "string", "required": False},
+                {"name": "mode", "type": "string", "required": True},
                 {"name": "run_id", "type": "string", "required": False},
             ],
             "outputs": {
                 "type": "object",
                 "required": ["mode", "run_id", "source", "reasons", "created_at"],
             },
-            "errors": ["empty_request", "invalid_mode"],
+            "errors": ["empty_request", "invalid_mode", "unsupported_auto_mode"],
         },
         {
             "id": "guardrail.check_command",
@@ -68,6 +85,32 @@ def _tool_specifications() -> list[dict[str, Any]]:
                 "required": ["allowed", "reason", "policy_stage", "runtime_approval_required", "metadata"],
             },
             "errors": ["invalid_command", "invalid_pytest_target"],
+        },
+        {
+            "id": "verifier.sync",
+            "description": "Resolve linked pytest targets from verifier.yaml and return them without creating a stored artifact file.",
+            "cli": "autoeval verifier sync --repo .",
+            "parameters": [],
+            "outputs": {
+                "type": "object",
+                "required": ["ok", "link_count", "target_count", "links", "targets"],
+            },
+            "errors": ["invalid_verifier_yaml", "invalid_verifier_target"],
+        },
+        {
+            "id": "feature.list_generate",
+            "description": "Replace feature_list.json through harness normalization so every sub-task matches the typed template.",
+            "cli": "autoeval tools feature-list-generate --repo . --input-json '<json payload>'",
+            "parameters": [
+                {"name": "input_json", "type": "string", "required": True},
+                {"name": "run_id", "type": "string", "required": False},
+                {"name": "actor", "type": "string", "required": False},
+            ],
+            "outputs": {
+                "type": "object",
+                "required": ["ok", "run_id", "feature_list_file", "sub_task_count", "template"],
+            },
+            "errors": ["invalid_json", "invalid_feature_list_payload", "missing_verifications"],
         },
         {
             "id": "feature.status_set",
@@ -178,18 +221,17 @@ def tool_catalog_payload(paths: RepoPaths) -> dict[str, Any]:
             "review": str(paths.rpi_dir / "review.md"),
             "feature_list": str(paths.rpi_dir / "feature_list.json"),
             "verifier_yaml": str(paths.verifier_file),
-            "autocheck_map": str(paths.autocheck_map_file),
             "tool_calls": str(paths.tool_calls_file),
-            "decision_prompt": str(Path(__file__).resolve().parent / "prompts" / "decision.md"),
         },
         "tools": _tool_specifications(),
         "loop": {
             "steps": [
                 "call workflow.decide_mode first",
+                "choose planning or instant using the inline workflow.decide_mode policy",
                 "if mode=instant: skip harness loop and jump directly to coding execution",
                 "if mode=planning: continue harness loop",
                 "read artifacts + tool catalog",
-                "read verifier.yaml/autocheck_map linked targets and map relevant ones into typed feature verifications",
+                "call verifier.sync when you need resolved linked pytest targets from verifier.yaml",
                 "check terminal commands with guardrail.check_command",
                 "implement changes with coding agent outside harness",
                 "run verifier.autocheck",
@@ -296,65 +338,11 @@ def _normalize_mode(mode: str) -> str:
         raise ValueError(f"invalid mode '{mode}', expected one of: {sorted(VALID_MODES)}")
     return value
 
-
-MODE_SIGNAL_RULES: tuple[tuple[str, int, str], ...] = (
-    ("architecture", 2, "architectural scope"),
-    ("refactor", 2, "refactor scope"),
-    ("integration", 2, "integration work"),
-    ("new functionality", 2, "new capability"),
-    ("mcp", 2, "tool/runtime integration"),
-    ("web search", 2, "external research required"),
-    ("across files", 2, "multi-file scope"),
-    ("multi", 1, "multi-step wording"),
-    ("multiple", 1, "multiple deliverables"),
-    ("phase", 1, "phase-oriented request"),
-    ("complex", 1, "explicit complexity wording"),
-    ("three steps", 1, "multi-step wording"),
-)
-
-
-def _auto_select_mode(request_text: str) -> tuple[str, list[str], dict[str, Any]]:
-    text = request_text.strip()
-    lowered = text.lower()
-    reasons: list[str] = []
-    signals: list[dict[str, Any]] = []
-    planning_score = 0
-
-    for keyword, weight, label in MODE_SIGNAL_RULES:
-        if keyword in lowered:
-            reasons.append(f"contains '{keyword}'")
-            planning_score += weight
-            signals.append({"type": "keyword", "keyword": keyword, "weight": weight, "label": label})
-
-    estimated_steps = len([item for item in re.split(r"[.;\\n]", text) if item.strip()])
-    if estimated_steps >= 3:
-        reasons.append("contains 3+ action chunks")
-        planning_score += 2
-        signals.append({"type": "structure", "label": "3+ action chunks", "weight": 2, "value": estimated_steps})
-    if len(text) > 220:
-        reasons.append("request length suggests non-trivial scope")
-        planning_score += 1
-        signals.append({"type": "structure", "label": "long request", "weight": 1, "value": len(text)})
-
-    decision = "planning" if planning_score >= 3 else "instant"
-    if not reasons:
-        reasons = ["simple/trivial scope rule match"]
-
-    diagnostics = {
-        "planning_score": planning_score,
-        "estimated_steps": estimated_steps,
-        "request_length": len(text),
-        "threshold": 3,
-        "signals": signals,
-    }
-    return decision, reasons, diagnostics
-
-
 def decide_mode(
     paths: RepoPaths,
     request: str,
     *,
-    mode: str = "auto",
+    mode: str,
     run_id: str | None = None,
 ) -> dict[str, Any]:
     request_text = request.strip()
@@ -363,19 +351,16 @@ def decide_mode(
 
     mode_input = mode.strip().lower()
     if mode_input == "auto":
-        selected_mode, reasons, diagnostics = _auto_select_mode(request_text)
-        decision_source = "rule_based_auto_from_decision_md"
-    else:
-        selected_mode = _normalize_mode(mode_input)
-        reasons = [f"explicit mode override: {selected_mode}"]
-        diagnostics = {
-            "planning_score": None,
-            "estimated_steps": len([item for item in re.split(r"[.;\\n]", request_text) if item.strip()]),
-            "request_length": len(request_text),
-            "threshold": None,
-            "signals": [],
-        }
-        decision_source = "explicit_override"
+        raise ValueError("mode='auto' is not supported; choose planning or instant using the inline workflow.decide_mode policy")
+
+    selected_mode = _normalize_mode(mode_input)
+    reasons = [f"selected by executor using the inline mode-decision policy: {selected_mode}"]
+    diagnostics = {
+        "decision_policy": "inline",
+        "agent_selected": True,
+        "auto_selection": False,
+    }
+    decision_source = "agent_selected"
 
     active_run = _resolve_run_id(paths, run_id=run_id)
     decision = {
@@ -386,12 +371,8 @@ def decide_mode(
         "source": decision_source,
         "reasons": reasons,
         "diagnostics": diagnostics,
-        "decision_prompt_file": str(Path(__file__).resolve().parent / "prompts" / "decision.md"),
-        "decision_prompt_text": load_decision_prompt(),
         "created_at": utc_now_iso(),
     }
-    mode_file = paths.runs_dir / active_run / "mode_decision.json"
-    write_json(mode_file, decision)
     _append_event(
         paths,
         active_run,
@@ -404,6 +385,45 @@ def decide_mode(
         },
     )
     return decision
+
+
+def generate_feature_list(
+    paths: RepoPaths,
+    input_json: str,
+    *,
+    run_id: str | None = None,
+    actor: str = "coding_agent",
+) -> dict[str, Any]:
+    try:
+        raw_payload = json.loads(input_json)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"invalid feature list json: {exc}") from exc
+    if not isinstance(raw_payload, dict):
+        raise ValueError("feature list payload must be a JSON object")
+
+    normalized = normalize_feature_list_payload(raw_payload)
+    feature_file = paths.rpi_dir / "feature_list.json"
+    save_feature_list(feature_file, normalized)
+
+    active_run = _resolve_run_id(paths, run_id=run_id)
+    _append_event(
+        paths,
+        active_run,
+        {
+            "type": "tool_feature_list_generate",
+            "run_id": active_run,
+            "actor": actor,
+            "sub_task_count": len(normalized.get("sub_tasks", [])),
+            "template": dict(normalized.get("template", {})),
+        },
+    )
+    return {
+        "ok": True,
+        "run_id": active_run,
+        "feature_list_file": str(feature_file),
+        "sub_task_count": len(normalized.get("sub_tasks", [])),
+        "template": dict(normalized.get("template", {})),
+    }
 
 
 def set_feature_status(
@@ -449,21 +469,13 @@ def set_feature_status(
 
 def get_feature_status(paths: RepoPaths, task_id: str) -> dict[str, Any]:
     payload = load_feature_list(paths.rpi_dir / "feature_list.json")
-    for item in payload.get("sub_tasks", []):
-        if isinstance(item, dict) and str(item.get("id", "")) == task_id:
+    for item in payload["sub_tasks"]:
+        if str(item.get("id", "")) == task_id:
             return {
                 "task_id": task_id,
                 "status": bool(item.get("status", False)),
                 "phase_id": str(item.get("phase_id", "")),
                 "phase": str(item.get("phase", "")),
-                "verifications": [
-                    {
-                        "kind": str(entry.get("kind", "")),
-                        "target": str(entry.get("target", "")),
-                        "required": bool(entry.get("required", True)),
-                    }
-                    for entry in item.get("verifications", [])
-                    if isinstance(entry, dict)
-                ],
+                "verifications": list(item["verifications"]),
             }
     raise KeyError(f"unknown sub-task id: {task_id}")

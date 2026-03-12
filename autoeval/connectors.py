@@ -165,21 +165,14 @@ def resolve_effective_profiles(paths: RepoPaths) -> dict[str, dict[str, Any]]:
     ensure_user_layout(paths)
     user_profiles = _load_registry(paths.user_registry_file).get("profiles", {})
     project_overrides = _load_registry(paths.project_overrides_file).get("profiles", {})
+    override_only_profiles = sorted(set(project_overrides) - set(user_profiles))
+    if override_only_profiles:
+        names = ", ".join(override_only_profiles)
+        raise ValueError(f"project overrides require a matching user profile: {names}")
 
     effective: dict[str, dict[str, Any]] = {}
-    for name in sorted(set(user_profiles) | set(project_overrides)):
-        if name in user_profiles:
-            base = dict(user_profiles[name])
-        else:
-            base = {
-                "name": name,
-                "transport": "stdio",
-                "command": "",
-                "tool_namespace": "",
-                "required_env": [],
-                "timeout_s": 60,
-                "enabled": True,
-            }
+    for name in sorted(user_profiles):
+        base = dict(user_profiles[name])
         if name in project_overrides:
             base = _apply_override(base, project_overrides[name])
         base["name"] = name
