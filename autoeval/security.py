@@ -11,6 +11,7 @@ class ValidationResult(NamedTuple):
 
 
 ALLOWED_COMMANDS: set[str] = {
+    "autoeval",
     "ls",
     "cat",
     "head",

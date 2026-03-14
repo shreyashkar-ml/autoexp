@@ -26,14 +26,18 @@ from .harness_tools import (
 )
 from .migrations import run_migrations
 from .orchestrator import fork_run, intervene, resume_task, run_task, status
+from .provider_surface import ProviderLaunchRequest, build_provider_session_payload, write_provider_session
+from .providers import resolve_provider_adapter
 from .rpi import bootstrap_rpi_with_provider
 from .verifier import load_verifier_config, run_autocheck, sync_autocheck_map_from_verifier, verifier_template_text
 
 app = typer.Typer(help="Minimal autoeval harness CLI")
 mcp_app = typer.Typer(help="MCP lifecycle commands")
+provider_app = typer.Typer(help="Provider integration surface and adapter launch commands")
 verifier_app = typer.Typer(help="Verifier mapping commands")
 tools_app = typer.Typer(help="Tool-call interfaces exposed by autoeval for coding-agent loops")
 app.add_typer(mcp_app, name="mcp")
+app.add_typer(provider_app, name="provider")
 app.add_typer(verifier_app, name="verifier")
 app.add_typer(tools_app, name="tools")
 
@@ -258,6 +262,71 @@ def verifier_template_cmd() -> None:
     typer.echo(verifier_template_text())
 
 
+@provider_app.command("session")
+def provider_session_cmd(
+    repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    provider: str = typer.Option("codex"),
+    run_id: str | None = typer.Option(None),
+    task: str | None = typer.Option(None),
+    mode: str | None = typer.Option(None),
+) -> None:
+    paths = _paths(repo)
+    ensure_repo_layout(paths)
+    ensure_user_layout(paths)
+    state = read_json(paths.state_file, {"last_run_id": None})
+    active_run = run_id or state.get("last_run_id")
+    if not active_run:
+        raise typer.BadParameter("no active run found; provide --run-id or create a run first")
+    _emit(write_provider_session(paths=paths, run_id=str(active_run), provider=provider, task=task, mode=mode))
+
+
+@provider_app.command("launch")
+def provider_launch_cmd(
+    repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    provider: str = typer.Option("codex"),
+    run_id: str | None = typer.Option(None),
+    task: str | None = typer.Option(None),
+    mode: str | None = typer.Option(None),
+    sandbox_mode: str = typer.Option("workspace-write"),
+    timeout_sec: int = typer.Option(90),
+    model: str | None = typer.Option(None),
+    config_profile: str | None = typer.Option(None, "--profile"),
+    extra_arg: list[str] = typer.Option([], "--extra-arg"),
+) -> None:
+    paths = _paths(repo)
+    ensure_repo_layout(paths)
+    ensure_user_layout(paths)
+    state = read_json(paths.state_file, {"last_run_id": None})
+    active_run = run_id or state.get("last_run_id")
+    if not active_run:
+        raise typer.BadParameter("no active run found; provide --run-id or create a run first")
+
+    session_info = write_provider_session(paths=paths, run_id=str(active_run), provider=provider, task=task, mode=mode)
+    session = build_provider_session_payload(
+        paths=paths,
+        run_id=str(active_run),
+        provider=provider,
+        task=task,
+        mode=mode,
+    )
+    adapter = resolve_provider_adapter(provider)
+    result = adapter.launch(
+        paths=paths,
+        session=session,
+        request=ProviderLaunchRequest(
+            provider=provider,
+            run_id=str(active_run),
+            session_file=session_info["session_file"],
+            sandbox_mode=sandbox_mode,
+            timeout_sec=timeout_sec,
+            model=model,
+            config_profile=config_profile,
+            extra_args=extra_arg,
+        ),
+    )
+    _emit(result.model_dump())
+
+
 @mcp_app.command("list")
 def mcp_list(
     scope: str = typer.Option("effective"),
@@ -388,14 +457,15 @@ def tools_guardrail_check(
     target: str | None = typer.Option(None),
     no_network: bool = typer.Option(True, "--no-network/--allow-network"),
 ) -> None:
-    _emit(
-        check_command_guardrail(
-            command=command,
-            target=target,
-            no_network=no_network,
-            metadata={"source": "tools.guardrail-check"},
-        )
+    decision = check_command_guardrail(
+        command=command,
+        target=target,
+        no_network=no_network,
+        metadata={"source": "tools.guardrail-check"},
     )
+    _emit(decision)
+    if not bool(decision.get("allowed", False)):
+        raise typer.Exit(code=1)
 
 
 @tools_app.command("feature-status-set")

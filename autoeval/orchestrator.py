@@ -7,6 +7,7 @@ from .config import RepoPaths, SCHEMA_VERSION, ensure_repo_layout, read_json, to
 from .connectors import resolve_runtime_profiles
 from .evals import EvalCheck, run_eval_suite
 from .harness_tools import decide_mode, tool_catalog_payload, write_tool_catalog
+from .provider_surface import write_provider_session
 from .rpi import init_rpi_artifacts, is_rpi_initialized
 from .security import guardrail_summary
 from .tracker import all_completed, completion_counts, load_feature_list
@@ -530,6 +531,13 @@ def run_task(
         eval_report=eval_report,
         autocheck_report=autocheck_report,
     )
+    provider_session = write_provider_session(
+        paths=paths,
+        run_id=active_run_id,
+        provider=provider,
+        task=task,
+        mode=selected_mode,
+    )
     return {
         "run_id": active_run_id,
         "provider": provider,
@@ -543,6 +551,8 @@ def run_task(
         "instant_context": instant_context if selected_mode == "instant" else None,
         "autocheck": autocheck_report,
         "eval": eval_report,
+        "provider_session_file": provider_session["session_file"],
+        "provider_session": provider_session,
     }
 
 

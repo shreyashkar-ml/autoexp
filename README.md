@@ -20,6 +20,13 @@ Verifier link config:
 Machine/runtime files under `.autoeval/runtime/`:
 - `tool_calls.json` (callable harness tool contract)
 
+Run-scoped provider integration files under `.autoeval/runs/<run_id>/provider/`:
+- `provider_session.json` (standardized provider-facing session envelope)
+- `<provider>_prompt.txt` (provider adapter launch prompt)
+- `<provider>_raw_trace.jsonl` (raw provider event/log stream)
+- `<provider>_normalized_trace.jsonl` (normalized provider events)
+- `<provider>_result.json` (provider launch/result summary)
+
 ## Harness loop
 
 1. Initialize artifacts and validate verifier links from `verifier.yaml`.
@@ -55,6 +62,16 @@ Available tool commands:
 - `autoeval tools append-lesson`
 - `autoeval tools append-review`
 
+## Provider integration surface
+
+`autoeval` now exposes a standardized provider-facing session surface for external coding agents:
+- run `autoeval provider session --repo .` to emit/update the current run's `provider_session.json`
+- run `autoeval provider launch --repo . --provider codex` to launch a concrete provider adapter against that session
+- use `scripts/provider_connector.py` as a standalone connector entrypoint for scripting and smoke runs
+
+The provider session surface sits between the harness contract and provider-specific adapters. It keeps the harness contract authoritative while allowing provider-specific launch and trace handling.
+For the current Codex proto smoke in this environment, use `--sandbox-mode danger-full-access`.
+
 ## Quickstart
 
 ```bash
@@ -70,6 +87,9 @@ uv run autoeval tools guardrail-check --command "pytest -q tests/test_api.py::te
 uv run autoeval tools autocheck --repo .
 uv run autoeval tools run-status --repo .
 uv run autoeval tools run-eval --repo .
+uv run autoeval provider session --repo .
+uv run autoeval provider launch --repo . --provider codex --sandbox-mode danger-full-access
+uv run python scripts/provider_connector.py --repo . --provider codex --run-id "$(jq -r '.last_run_id' .autoeval/state.json)" --sandbox-mode danger-full-access
 ```
 
 ## MCP lifecycle
