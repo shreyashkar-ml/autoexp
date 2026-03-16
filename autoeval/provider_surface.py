@@ -7,6 +7,7 @@ from pydantic import BaseModel, Field
 from .agent_contract import CONTRACT_VERSION, build_agent_contract
 from .config import RepoPaths, SCHEMA_VERSION, ensure_repo_layout, ensure_user_layout, read_json, utc_now_iso, write_json
 from .harness_tools import tool_catalog_payload, write_tool_catalog
+from .rpi import artifact_instruction_payload
 
 PROVIDER_SURFACE_VERSION = "1.0.0"
 
@@ -41,6 +42,14 @@ class ToolCatalogBinding(BaseModel):
     loop_steps: list[str] = Field(default_factory=list)
 
 
+class ArtifactInstructionBinding(BaseModel):
+    artifact_name: str
+    target_file: str
+    template_file: str
+    instructions: str
+    artifact_state: str
+
+
 class ProviderSessionEnvelope(BaseModel):
     schema_version: int = SCHEMA_VERSION
     contract_version: str = CONTRACT_VERSION
@@ -50,6 +59,7 @@ class ProviderSessionEnvelope(BaseModel):
     artifacts: dict[str, str]
     active_context: ActiveContextBinding
     tool_catalog: ToolCatalogBinding
+    artifact_generation: list[ArtifactInstructionBinding] = Field(default_factory=list)
     harness_contract: dict[str, Any]
     instructions: list[str] = Field(default_factory=list)
     metadata: dict[str, Any] = Field(default_factory=dict)
@@ -195,10 +205,14 @@ def build_provider_session_payload(
             tools=list(tool_catalog.get("tools", [])),
             loop_steps=[str(step) for step in tool_catalog.get("loop", {}).get("steps", [])],
         ),
+        artifact_generation=[
+            ArtifactInstructionBinding.model_validate(item) for item in artifact_instruction_payload(paths)
+        ],
         harness_contract=contract,
         instructions=[
             "Treat provider_session.json as the authoritative provider-facing harness contract.",
             "Read the active context file and tool catalog before taking action.",
+            "Load artifact creation instructions from the template-backed artifact_generation entries in this session.",
             "Use the autoeval CLI tool surface for harness actions rather than editing harness artifacts manually.",
             "Do not mutate immutable feature_list task metadata; only status updates may flow through harness tools.",
         ],

@@ -13,6 +13,8 @@ Under `.autoeval/instructions/`:
 - `review.md` (Lessons + final Review sections)
 - `feature_list.json`
 
+At bootstrap, the markdown files are target files for coding-agent authorship. Their creation instructions come from `autoeval/templates/*.md` through the provider session surface; bootstrap does not copy template prose into those files.
+
 Verifier link config:
 - `.autoeval/verifier.yaml` is developer/end-user authored from fixed template.
 - It links individual test files or entire test directories.
@@ -70,7 +72,58 @@ Available tool commands:
 - use `scripts/provider_connector.py` as a standalone connector entrypoint for scripting and smoke runs
 
 The provider session surface sits between the harness contract and provider-specific adapters. It keeps the harness contract authoritative while allowing provider-specific launch and trace handling.
+It also carries `artifact_generation` entries so the coding agent receives template-backed instructions for authoring the instruction artifacts.
 For the current Codex proto smoke in this environment, use `--sandbox-mode danger-full-access`.
+
+## Codex provider example
+
+Initialize a repo for Codex:
+
+```bash
+uv run autoeval init \
+  --repo . \
+  --provider codex \
+  --task "Implement feature set" \
+  --force
+```
+
+Available `autoeval init` options for Codex bootstrap:
+- `--repo <path>`: target repository root, required
+- `--provider codex`: provider name, defaults to `codex`
+- `--task "<text>"`: bootstrap task text written into run/bootstrap context, defaults to `Initialize target repository execution context`
+- `--force`: regenerate existing RPI artifacts
+
+After a run exists, launch the Codex adapter:
+
+```bash
+uv run autoeval provider launch \
+  --repo . \
+  --provider codex \
+  --run-id "$(jq -r '.last_run_id' .autoeval/state.json)" \
+  --sandbox-mode danger-full-access \
+  --timeout-sec 180
+```
+
+Available `autoeval provider launch` options for Codex:
+- `--repo <path>`: target repository root, required
+- `--provider codex`: provider name, defaults to `codex`
+- `--run-id <id>`: existing run id to attach the provider session to
+- `--task "<text>"`: override task text in the emitted provider session
+- `--mode planning|instant`: override mode in the emitted provider session
+- `--sandbox-mode <mode>`: provider sandbox mode, defaults to `workspace-write`
+- `--timeout-sec <seconds>`: launch timeout, defaults to `90`
+- `--model <name>`: optional provider model override
+- `--profile <name>`: optional Codex config profile
+- `--extra-arg <value>`: repeatable passthrough argument for the provider command
+
+If you only need the provider-facing session envelope without launching Codex:
+
+```bash
+uv run autoeval provider session \
+  --repo . \
+  --provider codex \
+  --run-id "$(jq -r '.last_run_id' .autoeval/state.json)"
+```
 
 ## Quickstart
 

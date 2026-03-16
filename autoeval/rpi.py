@@ -1,60 +1,65 @@
 from pathlib import Path
 from typing import Any, Callable
 
-from .config import RepoPaths, SCHEMA_VERSION, ensure_repo_layout, read_json, utc_now_iso, write_json
-from .harness_tools import DEFAULT_REVIEW_ARTIFACT, ensure_review_artifact, write_tool_catalog
-from .tracker import FEATURE_LIST_TEMPLATE_VERSION, load_feature_list as load_normalized_feature_list, normalize_feature_list_payload
+from .config import RepoPaths, SCHEMA_VERSION, ensure_repo_layout, utc_now_iso, write_json
+from .harness_tools import write_tool_catalog
+from .tracker import (
+    FEATURE_LIST_TEMPLATE_VERSION,
+    load_feature_list as load_normalized_feature_list,
+    normalize_feature_list_payload,
+)
 from .verifier import ensure_verifier_file, sync_autocheck_map_from_verifier
 
 TEMPLATE_VERSION = FEATURE_LIST_TEMPLATE_VERSION
 ARTIFACT_FILES = ("research.md", "implementation.md", "plan.md", "review.md", "feature_list.json")
 TEMPLATES_DIR = Path(__file__).resolve().parent / "templates"
+MARKDOWN_TEMPLATE_FILES = {
+    "research.md": "rpi_research.md",
+    "implementation.md": "rpi_implementation.md",
+    "plan.md": "rpi_plan.md",
+    "review.md": "rpi_review.md",
+}
+ARTIFACT_TEMPLATE_FILES = {**MARKDOWN_TEMPLATE_FILES, "feature_list.json": "rpi_feature_list.md"}
 
 
 def _load_template(name: str) -> str:
-    template_path = TEMPLATES_DIR / name
-    return template_path.read_text(encoding="utf-8").rstrip()
+    return (TEMPLATES_DIR / name).read_text(encoding="utf-8").rstrip() + "\n"
 
 
-def _render_markdown_artifact(name: str, context_lines: list[str]) -> str:
-    template_body = _load_template(name)
-    context_block = ["## Bootstrap Context", *context_lines]
-    return template_body + "\n\n" + "\n".join(context_block) + "\n"
+def _artifact_target_file(paths: RepoPaths, artifact_name: str) -> Path:
+    if artifact_name == "review.md":
+        return paths.review_file
+    return paths.rpi_dir / artifact_name
 
 
-def _research_artifact(task: str) -> str:
-    return _render_markdown_artifact(
-        "rpi_research.md",
-        [
-            f"- Requested task: {task}",
-            "- Generated during `autoeval init` for repository-level context seeding.",
-            "- Use this template to produce repository-specific research, not generic prose.",
-        ],
-    )
+def artifact_instruction_payload(paths: RepoPaths) -> list[dict[str, str]]:
+    payload: list[dict[str, str]] = []
+    for artifact_name in ARTIFACT_FILES:
+        target_file = _artifact_target_file(paths, artifact_name)
+        if not target_file.exists():
+            artifact_state = "missing"
+        elif target_file.stat().st_size == 0:
+            artifact_state = "empty"
+        else:
+            artifact_state = "present"
+        template_name = ARTIFACT_TEMPLATE_FILES[artifact_name]
+        payload.append(
+            {
+                "artifact_name": artifact_name,
+                "target_file": str(target_file),
+                "template_file": str(TEMPLATES_DIR / template_name),
+                "instructions": _load_template(template_name),
+                "artifact_state": artifact_state,
+            }
+        )
+    return payload
 
 
-def _implementation_artifact(task: str, provider_name: str) -> str:
-    init_file = "CLAUDE.md" if provider_name.strip().lower() in {"claude", "claude-code"} else "AGENTS.md"
-    return _render_markdown_artifact(
-        "rpi_implementation.md",
-        [
-            f"- Requested task: {task}",
-            f"- Provider: {provider_name}",
-            f"- Initialize repository guidance as `{init_file}`",
-            "- Express implementation work through typed `verifications`, not free-text criteria.",
-        ],
-    )
-
-
-def _plan_artifact(task: str) -> str:
-    return _render_markdown_artifact(
-        "rpi_plan.md",
-        [
-            f"- Requested task: {task}",
-            "- Reference concrete files/modules when known.",
-            "- Define validation per phase before implementation starts.",
-        ],
-    )
+def _bootstrap_markdown_artifact(paths: RepoPaths, artifact_name: str) -> str:
+    target = _artifact_target_file(paths, artifact_name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text("", encoding="utf-8")
+    return str(target)
 
 
 def _default_feature_list() -> dict[str, Any]:
@@ -64,6 +69,7 @@ def _default_feature_list() -> dict[str, Any]:
         "generated_at": utc_now_iso(),
         "sub_tasks": [],
     }
+
 
 def commit_rpi_artifacts(paths: RepoPaths, payload: dict[str, Any]) -> list[str]:
     ensure_repo_layout(paths)
@@ -102,7 +108,7 @@ def commit_rpi_artifacts(paths: RepoPaths, payload: dict[str, Any]) -> list[str]
 
 
 def needs_rpi_bootstrap(paths: RepoPaths) -> bool:
-    return not all((paths.rpi_dir / name).exists() for name in ARTIFACT_FILES)
+    return not all(_artifact_target_file(paths, name).exists() for name in ARTIFACT_FILES)
 
 
 def init_rpi_artifacts(
@@ -111,32 +117,20 @@ def init_rpi_artifacts(
     provider_name: str = "codex",
     force: bool = False,
 ) -> dict[str, Any]:
+    del task, provider_name
+
     ensure_repo_layout(paths)
     ensure_verifier_file(paths)
 
     created: list[str] = []
     skipped: list[str] = []
 
-    research_file = paths.rpi_dir / "research.md"
-    if force or not research_file.exists():
-        research_file.write_text(_research_artifact(task), encoding="utf-8")
-        created.append(str(research_file))
-    else:
-        skipped.append(str(research_file))
-
-    implementation_file = paths.rpi_dir / "implementation.md"
-    if force or not implementation_file.exists():
-        implementation_file.write_text(_implementation_artifact(task, provider_name), encoding="utf-8")
-        created.append(str(implementation_file))
-    else:
-        skipped.append(str(implementation_file))
-
-    plan_file = paths.rpi_dir / "plan.md"
-    if force or not plan_file.exists():
-        plan_file.write_text(_plan_artifact(task), encoding="utf-8")
-        created.append(str(plan_file))
-    else:
-        skipped.append(str(plan_file))
+    for artifact_name in MARKDOWN_TEMPLATE_FILES:
+        target = _artifact_target_file(paths, artifact_name)
+        if force or not target.exists():
+            created.append(_bootstrap_markdown_artifact(paths, artifact_name))
+        else:
+            skipped.append(str(target))
 
     feature_file = paths.rpi_dir / "feature_list.json"
     if force or not feature_file.exists():
@@ -145,20 +139,17 @@ def init_rpi_artifacts(
     else:
         skipped.append(str(feature_file))
 
-    review_file = paths.review_file
-    if force or not review_file.exists():
-        review_file.parent.mkdir(parents=True, exist_ok=True)
-        review_file.write_text(DEFAULT_REVIEW_ARTIFACT, encoding="utf-8")
-        created.append(str(review_file))
-    else:
-        ensure_review_artifact(paths)
-        skipped.append(str(review_file))
-
     tool_catalog = write_tool_catalog(paths)
     created.append(str(paths.tool_calls_file))
 
     sync_result = sync_autocheck_map_from_verifier(paths)
-    return {"created": created, "skipped": skipped, "sync": sync_result, "tool_catalog": tool_catalog}
+    return {
+        "created": created,
+        "skipped": skipped,
+        "sync": sync_result,
+        "tool_catalog": tool_catalog,
+        "artifact_instruction_payload": artifact_instruction_payload(paths),
+    }
 
 
 def bootstrap_rpi_with_provider(
@@ -185,11 +176,12 @@ def bootstrap_rpi_with_provider(
         "executor_mode": "external_agent",
         "artifacts_written": outputs.get("created", []),
         "sync": outputs.get("sync", {}),
+        "artifact_instruction_payload": outputs.get("artifact_instruction_payload", []),
     }
 
 
 def is_rpi_initialized(paths: RepoPaths) -> bool:
-    return all((paths.rpi_dir / name).exists() for name in ARTIFACT_FILES)
+    return all(_artifact_target_file(paths, name).exists() for name in ARTIFACT_FILES)
 
 
 def load_feature_list(paths: RepoPaths) -> dict[str, Any]:

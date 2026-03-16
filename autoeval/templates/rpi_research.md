@@ -4,9 +4,10 @@
 # Research Artifact Instruction
 
 Purpose:
-- Build repository familiarity context for a target repository when `autoeval` is initialized there for the first time.
+- Build a detailed technical documentaiton for the target repository when `autoeval` is initialized there for the first time.
 - This artifact is repository-level and not task-specific.
-- It should remain reusable across future tasks in the same target repository.
+- It is a detailed technical documentation meant for developers and contributors to get a detailed understanding of the entire repository.
+- Ignore directories/files mentioned inside `.gitignore`.
 
 ## Structure and Guidelines
 1. Cover whole-repository architecture and module/component relationships.
@@ -19,4 +20,4 @@ Purpose:
 
 ## Update Rules
 - Keep file references current and actionable.
-- When behavior changes, update only impacted sections with concrete deltas.
+- When `/autoeval/instructions/research.md` already exists, when behavior changes, update only impacted sections with concrete details of the current functionality of the codebase, don't maintain reference to old implementation, that's not needed at all.

@@ -182,6 +182,9 @@ class CodexProviderAdapter(ProviderAdapter):
 
     def _build_prompt(self, session: ProviderSessionEnvelope, *, session_file: str) -> str:
         task = session.run.task
+        artifact_targets = ", ".join(
+            f"{item.target_file} ({item.artifact_state})" for item in session.artifact_generation
+        )
         lines = [
             "You are running through the autoeval provider connector.",
             f"Repository root: {session.run.repo_root}",
@@ -190,9 +193,12 @@ class CodexProviderAdapter(ProviderAdapter):
             f"Authoritative provider session file: {session_file}",
             f"Authoritative active context file: {session.active_context.file}",
             f"Tool catalog file: {session.tool_catalog.file}",
+            f"Artifact instruction targets: {artifact_targets}",
             "",
             "Required behavior:",
             "- Read the provider session and active context files before acting.",
+            "- Read artifact_generation entries from provider_session.json and use their template instructions when creating or updating research/implementation/plan/review/feature_list artifacts.",
+            "- If an artifact target is missing or empty, author the real artifact content in that file before proceeding with other work.",
             "- Use the autoeval CLI tool surface for harness actions and status transitions.",
             "- Follow the loop steps from the provider session contract.",
             "- Do not edit harness-owned immutable task metadata directly.",
@@ -246,6 +252,7 @@ class CodexProviderAdapter(ProviderAdapter):
     def _build_proto_command(self, *, capabilities: dict[str, Any], request: ProviderLaunchRequest) -> list[str]:
         command = list(capabilities.get("command", self.pinned_proto_command))
         command.extend(["-c", f'sandbox_mode="{request.sandbox_mode}"'])
+        command.extend(["-c", 'model_reasoning_effort="high"'])
         if request.model:
             command.extend(["-c", f'model="{request.model}"'])
         if request.extra_args:
