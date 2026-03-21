@@ -26,14 +26,13 @@ from .harness_tools import (
 )
 from .migrations import run_migrations
 from .orchestrator import fork_run, intervene, resume_task, run_task, status
-from .provider_surface import ProviderLaunchRequest, build_provider_session_payload, write_provider_session
-from .providers import resolve_provider_adapter
-from .rpi import bootstrap_rpi_with_provider
+from .provider_launcher import launch_provider_run
+from .provider_surface import read_provider_files, read_provider_result, write_provider_session
 from .verifier import load_verifier_config, run_autocheck, sync_autocheck_map_from_verifier, verifier_template_text
 
 app = typer.Typer(help="Minimal autoeval harness CLI")
 mcp_app = typer.Typer(help="MCP lifecycle commands")
-provider_app = typer.Typer(help="Provider integration surface and adapter launch commands")
+provider_app = typer.Typer(help="Provider session surface and inspection commands")
 verifier_app = typer.Typer(help="Verifier mapping commands")
 tools_app = typer.Typer(help="Tool-call interfaces exposed by autoeval for coding-agent loops")
 app.add_typer(mcp_app, name="mcp")
@@ -51,37 +50,19 @@ def _emit(payload: dict) -> None:
 
 
 @app.command()
-def init(
-    repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
-    provider: str = typer.Option("codex"),
-    task: str = typer.Option("Initialize target repository execution context"),
-    force: bool = typer.Option(False, "--force", help="Regenerate existing RPI artifacts"),
-) -> None:
-    paths = _paths(repo)
-    ensure_repo_layout(paths)
-    ensure_user_layout(paths)
-    run_migrations(paths)
-    touch_state(paths, provider=provider)
-    bootstrap = bootstrap_rpi_with_provider(
-        paths=paths,
-        task=task,
-        provider_name=provider,
-        force=force,
-    )
-    write_tool_catalog(paths)
-    payload = {"ok": bool(bootstrap.get("ok", False)), "provider": provider, "bootstrap": bootstrap}
-    _emit(payload)
-    if not bool(bootstrap.get("ok", False)):
-        raise typer.Exit(code=1)
-
-
-@app.command()
 def run(
     repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
     task: str = typer.Option(...),
     provider: str = typer.Option("codex"),
     mode: str = typer.Option(..., help="planning or instant, selected from the inline workflow.decide_mode policy"),
     run_id: str | None = typer.Option(None),
+    force: bool = typer.Option(False, "--force", help="Rewrite instruction artifacts instead of preserving existing files"),
+    launch: bool = typer.Option(True, "--launch/--no-launch", help="Continue into provider execution after preparing the run"),
+    sandbox_mode: str = typer.Option("workspace-write"),
+    timeout_sec: int | None = typer.Option(None, help="Optional provider execution timeout in seconds; defaults to no timeout"),
+    model: str | None = typer.Option(None),
+    config_profile: str | None = typer.Option(None, "--profile"),
+    extra_arg: list[str] = typer.Option([], "--extra-arg"),
     context_threshold: float = typer.Option(0.6),
     eval_profile: str = typer.Option("default"),
     require_eval_pass: bool = typer.Option(True, "--require-eval-pass/--no-require-eval-pass"),
@@ -104,11 +85,39 @@ def run(
             require_eval_pass=require_eval_pass,
             run_autocheck_now=run_autocheck_now,
             autocheck_timeout_sec=autocheck_timeout_sec,
+            force=force,
         )
     except Exception as exc:
         _emit({"ok": False, "provider": provider, "error": str(exc)})
         raise typer.Exit(code=1) from exc
-    _emit(result)
+
+    if not launch:
+        payload = {**result, "ok": True, "provider_launch": None}
+        _emit(payload)
+        return
+
+    try:
+        provider_result = launch_provider_run(
+            paths=paths,
+            provider=provider,
+            run_id=str(result["run_id"]),
+            task=task,
+            mode=str(result["mode"]),
+            sandbox_mode=sandbox_mode,
+            timeout_sec=timeout_sec,
+            model=model,
+            config_profile=config_profile,
+            extra_args=extra_arg,
+            session_file=str(result["provider_session_file"]),
+        )
+    except Exception as exc:
+        _emit({**result, "ok": False, "error": str(exc)})
+        raise typer.Exit(code=1) from exc
+
+    payload = {**result, "ok": bool(provider_result.ok), "provider_launch": provider_result.model_dump()}
+    _emit(payload)
+    if not provider_result.ok:
+        raise typer.Exit(code=1)
 
 
 @app.command()
@@ -118,6 +127,7 @@ def resume(
     provider: str = typer.Option("codex"),
     mode: str | None = typer.Option(None, help="planning or instant; default keeps previous mode"),
     run_id: str | None = typer.Option(None),
+    force: bool = typer.Option(False, "--force", help="Rewrite instruction artifacts instead of preserving existing files"),
     context_threshold: float = typer.Option(0.6),
     eval_profile: str = typer.Option("default"),
     require_eval_pass: bool = typer.Option(True, "--require-eval-pass/--no-require-eval-pass"),
@@ -140,6 +150,7 @@ def resume(
             require_eval_pass=require_eval_pass,
             run_autocheck_now=run_autocheck_now,
             autocheck_timeout_sec=autocheck_timeout_sec,
+            force=force,
         )
     except Exception as exc:
         _emit({"ok": False, "provider": provider, "error": str(exc)})
@@ -257,6 +268,15 @@ def verifier_show_cmd(
     _emit(load_verifier_config(paths).model_dump())
 
 
+@verifier_app.command("path")
+def verifier_path_cmd(
+    repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+) -> None:
+    paths = _paths(repo)
+    verifier_file = paths.verifier_file
+    _emit({"path": str(verifier_file), "exists": verifier_file.exists()})
+
+
 @verifier_app.command("template")
 def verifier_template_cmd() -> None:
     typer.echo(verifier_template_text())
@@ -280,18 +300,11 @@ def provider_session_cmd(
     _emit(write_provider_session(paths=paths, run_id=str(active_run), provider=provider, task=task, mode=mode))
 
 
-@provider_app.command("launch")
-def provider_launch_cmd(
+@provider_app.command("result")
+def provider_result_cmd(
     repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
     provider: str = typer.Option("codex"),
     run_id: str | None = typer.Option(None),
-    task: str | None = typer.Option(None),
-    mode: str | None = typer.Option(None),
-    sandbox_mode: str = typer.Option("workspace-write"),
-    timeout_sec: int = typer.Option(90),
-    model: str | None = typer.Option(None),
-    config_profile: str | None = typer.Option(None, "--profile"),
-    extra_arg: list[str] = typer.Option([], "--extra-arg"),
 ) -> None:
     paths = _paths(repo)
     ensure_repo_layout(paths)
@@ -300,31 +313,31 @@ def provider_launch_cmd(
     active_run = run_id or state.get("last_run_id")
     if not active_run:
         raise typer.BadParameter("no active run found; provide --run-id or create a run first")
+    try:
+        payload = read_provider_result(paths=paths, run_id=str(active_run), provider=provider)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _emit(payload)
 
-    session_info = write_provider_session(paths=paths, run_id=str(active_run), provider=provider, task=task, mode=mode)
-    session = build_provider_session_payload(
-        paths=paths,
-        run_id=str(active_run),
-        provider=provider,
-        task=task,
-        mode=mode,
-    )
-    adapter = resolve_provider_adapter(provider)
-    result = adapter.launch(
-        paths=paths,
-        session=session,
-        request=ProviderLaunchRequest(
-            provider=provider,
-            run_id=str(active_run),
-            session_file=session_info["session_file"],
-            sandbox_mode=sandbox_mode,
-            timeout_sec=timeout_sec,
-            model=model,
-            config_profile=config_profile,
-            extra_args=extra_arg,
-        ),
-    )
-    _emit(result.model_dump())
+
+@provider_app.command("files")
+def provider_files_cmd(
+    repo: Path = typer.Option(..., exists=True, file_okay=False, dir_okay=True),
+    provider: str = typer.Option("codex"),
+    run_id: str | None = typer.Option(None),
+) -> None:
+    paths = _paths(repo)
+    ensure_repo_layout(paths)
+    ensure_user_layout(paths)
+    state = read_json(paths.state_file, {"last_run_id": None})
+    active_run = run_id or state.get("last_run_id")
+    if not active_run:
+        raise typer.BadParameter("no active run found; provide --run-id or create a run first")
+    try:
+        payload = read_provider_files(paths=paths, run_id=str(active_run), provider=provider)
+    except ValueError as exc:
+        raise typer.BadParameter(str(exc)) from exc
+    _emit(payload)
 
 
 @mcp_app.command("list")
@@ -453,10 +466,12 @@ def tools_decide_mode(
 
 @tools_app.command("guardrail-check")
 def tools_guardrail_check(
+    repo: Path | None = typer.Option(None, exists=True, file_okay=False, dir_okay=True),
     command: str = typer.Option(...),
     target: str | None = typer.Option(None),
     no_network: bool = typer.Option(True, "--no-network/--allow-network"),
 ) -> None:
+    del repo
     decision = check_command_guardrail(
         command=command,
         target=target,

@@ -70,7 +70,7 @@ class ProviderLaunchRequest(BaseModel):
     run_id: str
     session_file: str
     sandbox_mode: str = "workspace-write"
-    timeout_sec: int = 90
+    timeout_sec: int | None = None
     model: str | None = None
     config_profile: str | None = None
     extra_args: list[str] = Field(default_factory=list)
@@ -149,6 +149,56 @@ def provider_prompt_file(paths: RepoPaths, run_id: str, provider: str) -> Path:
 
 def provider_result_file(paths: RepoPaths, run_id: str, provider: str) -> Path:
     return provider_dir(paths, run_id) / f"{provider}_result.json"
+
+
+def _provider_name_from_session(session_payload: dict[str, Any], fallback: str) -> str:
+    raw_provider = session_payload.get("provider")
+    if isinstance(raw_provider, dict):
+        name = str(raw_provider.get("name", "")).strip()
+        if name:
+            return name
+    elif isinstance(raw_provider, str):
+        name = raw_provider.strip()
+        if name:
+            return name
+    return fallback
+
+
+def read_provider_files(paths: RepoPaths, *, run_id: str, provider: str) -> dict[str, Any]:
+    session_file = provider_session_file(paths, run_id)
+    if not session_file.exists():
+        raise ValueError(
+            f"no provider session found for run_id '{run_id}' and provider '{provider}'; prepare the run first"
+        )
+
+    session_payload = read_json(session_file, {})
+    effective_provider = provider
+    if isinstance(session_payload, dict):
+        effective_provider = _provider_name_from_session(session_payload, provider)
+
+    return {
+        "run_id": run_id,
+        "provider": effective_provider,
+        "session_file": str(session_file),
+        "prompt_file": str(provider_prompt_file(paths, run_id, effective_provider)),
+        "raw_trace_file": str(provider_raw_trace_file(paths, run_id, effective_provider)),
+        "normalized_trace_file": str(provider_normalized_trace_file(paths, run_id, effective_provider)),
+        "last_message_file": str(provider_last_message_file(paths, run_id, effective_provider)),
+        "result_file": str(provider_result_file(paths, run_id, effective_provider)),
+    }
+
+
+def read_provider_result(paths: RepoPaths, *, run_id: str, provider: str) -> dict[str, Any]:
+    result_file = provider_result_file(paths, run_id, provider)
+    if not result_file.exists():
+        raise ValueError(
+            f"no saved provider result found for run_id '{run_id}' and provider '{provider}'; launch the provider first"
+        )
+
+    payload = read_json(result_file, {})
+    if not isinstance(payload, dict):
+        raise ValueError(f"invalid provider result payload in '{result_file}'")
+    return payload
 
 
 def _load_active_context(paths: RepoPaths, run_id: str) -> tuple[str, Path, dict[str, Any]]:

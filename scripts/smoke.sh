@@ -4,10 +4,8 @@ set -euo pipefail
 REPO_PATH="${1:-.}"
 TASK_TEXT="${2:-demo multi-phase task}"
 
-uv run autoeval init --repo "${REPO_PATH}" --provider codex --task "${TASK_TEXT}"
+uv run autoeval run --repo "${REPO_PATH}" --provider codex --task "${TASK_TEXT}" --mode planning --no-launch --run-autocheck-now
 uv run autoeval verifier sync --repo "${REPO_PATH}"
-uv run autoeval tools decide-mode --repo "${REPO_PATH}" --request "${TASK_TEXT}" --mode planning
-uv run autoeval run --repo "${REPO_PATH}" --task "${TASK_TEXT}" --mode planning --run-autocheck-now
 uv run autoeval autocheck --repo "${REPO_PATH}"
 uv run autoeval status --repo "${REPO_PATH}"
 uv run autoeval tools list --repo "${REPO_PATH}"

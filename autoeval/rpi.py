@@ -1,5 +1,5 @@
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any
 
 from .config import RepoPaths, SCHEMA_VERSION, ensure_repo_layout, utc_now_iso, write_json
 from .harness_tools import write_tool_catalog
@@ -8,7 +8,7 @@ from .tracker import (
     load_feature_list as load_normalized_feature_list,
     normalize_feature_list_payload,
 )
-from .verifier import ensure_verifier_file, sync_autocheck_map_from_verifier
+from .verifier import sync_autocheck_map_from_verifier
 
 TEMPLATE_VERSION = FEATURE_LIST_TEMPLATE_VERSION
 ARTIFACT_FILES = ("research.md", "implementation.md", "plan.md", "review.md", "feature_list.json")
@@ -107,10 +107,6 @@ def commit_rpi_artifacts(paths: RepoPaths, payload: dict[str, Any]) -> list[str]
     return written
 
 
-def needs_rpi_bootstrap(paths: RepoPaths) -> bool:
-    return not all(_artifact_target_file(paths, name).exists() for name in ARTIFACT_FILES)
-
-
 def init_rpi_artifacts(
     paths: RepoPaths,
     task: str,
@@ -120,7 +116,7 @@ def init_rpi_artifacts(
     del task, provider_name
 
     ensure_repo_layout(paths)
-    ensure_verifier_file(paths)
+    sync_result = sync_autocheck_map_from_verifier(paths)
 
     created: list[str] = []
     skipped: list[str] = []
@@ -142,7 +138,6 @@ def init_rpi_artifacts(
     tool_catalog = write_tool_catalog(paths)
     created.append(str(paths.tool_calls_file))
 
-    sync_result = sync_autocheck_map_from_verifier(paths)
     return {
         "created": created,
         "skipped": skipped,
@@ -150,38 +145,6 @@ def init_rpi_artifacts(
         "tool_catalog": tool_catalog,
         "artifact_instruction_payload": artifact_instruction_payload(paths),
     }
-
-
-def bootstrap_rpi_with_provider(
-    paths: RepoPaths,
-    task: str,
-    provider_name: str = "codex",
-    force: bool = False,
-    status_callback: Callable[[str], None] | None = None,
-) -> dict[str, Any]:
-    def _status(message: str) -> None:
-        if status_callback is None:
-            return
-        status_callback(message)
-
-    _status("harness_bootstrap_requested")
-    outputs = init_rpi_artifacts(paths=paths, task=task, provider_name=provider_name, force=force)
-    _status("writing_rpi_artifacts")
-    _status("rpi_bootstrap_completed")
-    return {
-        "ok": True,
-        "provider": provider_name,
-        "connected": None,
-        "provider_connection_error": None,
-        "executor_mode": "external_agent",
-        "artifacts_written": outputs.get("created", []),
-        "sync": outputs.get("sync", {}),
-        "artifact_instruction_payload": outputs.get("artifact_instruction_payload", []),
-    }
-
-
-def is_rpi_initialized(paths: RepoPaths) -> bool:
-    return all(_artifact_target_file(paths, name).exists() for name in ARTIFACT_FILES)
 
 
 def load_feature_list(paths: RepoPaths) -> dict[str, Any]:

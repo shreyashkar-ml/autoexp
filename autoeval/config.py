@@ -52,7 +52,7 @@ class RepoPaths:
 
     @property
     def verifier_file(self) -> Path:
-        return self.autoeval_dir / "verifier.yaml"
+        return self.repo / "verifier.yaml"
 
     @property
     def review_file(self) -> Path:

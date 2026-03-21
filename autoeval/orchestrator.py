@@ -8,7 +8,7 @@ from .connectors import resolve_runtime_profiles
 from .evals import EvalCheck, run_eval_suite
 from .harness_tools import decide_mode, tool_catalog_payload, write_tool_catalog
 from .provider_surface import write_provider_session
-from .rpi import init_rpi_artifacts, is_rpi_initialized
+from .rpi import init_rpi_artifacts
 from .security import guardrail_summary
 from .tracker import all_completed, completion_counts, load_feature_list
 from .verifier import mapped_target_ids, run_autocheck
@@ -389,12 +389,12 @@ def run_task(
     eval_checks: list[EvalCheck] | None = None,
     run_autocheck_now: bool = True,
     autocheck_timeout_sec: int = 300,
+    force: bool = False,
 ) -> dict[str, Any]:
     del context_threshold, max_sessions, runtime_approver, structured_output
 
     ensure_repo_layout(paths)
-    if not is_rpi_initialized(paths):
-        init_rpi_artifacts(paths, task=task, provider_name=provider)
+    bootstrap = init_rpi_artifacts(paths, task=task, provider_name=provider, force=force)
 
     mode_input = mode.strip().lower()
     if mode_input == "auto":
@@ -543,6 +543,7 @@ def run_task(
         "provider": provider,
         "executor_mode": "external_agent",
         "mode": selected_mode,
+        "bootstrap": bootstrap,
         "mode_decision": mode_decision,
         "metrics": metrics,
         "loop_context_file": str(run_dir / "loop_context.json") if selected_mode == "planning" else None,
@@ -571,6 +572,7 @@ def resume_task(
     eval_checks: list[EvalCheck] | None = None,
     run_autocheck_now: bool = True,
     autocheck_timeout_sec: int = 300,
+    force: bool = False,
 ) -> dict[str, Any]:
     state = read_json(paths.state_file, {"last_run_id": None, "provider": provider, "mode": "planning"})
     active_run = run_id or state.get("last_run_id")
@@ -593,6 +595,7 @@ def resume_task(
         eval_checks=eval_checks,
         run_autocheck_now=run_autocheck_now,
         autocheck_timeout_sec=autocheck_timeout_sec,
+        force=force,
     )
 
 

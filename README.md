@@ -16,8 +16,10 @@ Under `.autoeval/instructions/`:
 At bootstrap, the markdown files are target files for coding-agent authorship. Their creation instructions come from `autoeval/templates/*.md` through the provider session surface; bootstrap does not copy template prose into those files.
 
 Verifier link config:
-- `.autoeval/verifier.yaml` is developer/end-user authored from fixed template.
+- `verifier.yaml` is developer/end-user authored from a fixed template.
+- by default it lives at the repository root (`./verifier.yaml`), outside `.autoeval`.
 - It links individual test files or entire test directories.
+- `autoeval verifier path --repo .` prints the resolved absolute verifier path and whether that file currently exists.
 
 Machine/runtime files under `.autoeval/runtime/`:
 - `tool_calls.json` (callable harness tool contract)
@@ -27,11 +29,12 @@ Run-scoped provider integration files under `.autoeval/runs/<run_id>/provider/`:
 - `<provider>_prompt.txt` (provider adapter launch prompt)
 - `<provider>_raw_trace.jsonl` (raw provider event/log stream)
 - `<provider>_normalized_trace.jsonl` (normalized provider events)
-- `<provider>_result.json` (provider launch/result summary)
+- `<provider>_last_message.txt` (provider-emitted last message text when available)
+- `<provider>_result.json` (provider execution result summary)
 
 ## Harness loop
 
-1. Initialize artifacts and validate verifier links from `verifier.yaml`.
+1. Initialize artifacts and validate verifier links from the user-owned `verifier.yaml`.
 2. Coding agent calls `tools decide-mode` first and selects an explicit mode from the inline policy embedded in `workflow.decide_mode`.
 3. If mode is `instant`, skip harness loop and execute directly.
 4. If mode is `planning`, continue harness loop:
@@ -66,83 +69,133 @@ Available tool commands:
 
 ## Provider integration surface
 
-`autoeval` now exposes a standardized provider-facing session surface for external coding agents:
-- run `autoeval provider session --repo .` to emit/update the current run's `provider_session.json`
-- run `autoeval provider launch --repo . --provider codex` to launch a concrete provider adapter against that session
-- use `scripts/provider_connector.py` as a standalone connector entrypoint for scripting and smoke runs
+`autoeval run` is the single execution entry point for external coding agents. It will:
+- ensure the `.autoeval` layout exists
+- require a developer-authored repository-root `verifier.yaml`
+- scan instruction artifacts and create only what is missing by default
+- rewrite instruction artifacts only when `--force` is set
+- create/update the run context and `provider_session.json`
+- launch the configured provider unless `--no-launch` is set
 
-The provider session surface sits between the harness contract and provider-specific adapters. It keeps the harness contract authoritative while allowing provider-specific launch and trace handling.
+The provider session surface sits between the harness contract and provider-specific adapters. It keeps the harness contract authoritative while exposing the current run's provider envelope, artifact instructions, and provider trace locations.
 It also carries `artifact_generation` entries so the coding agent receives template-backed instructions for authoring the instruction artifacts.
+`autoeval provider session --repo .` is an inspection command for the current run's provider envelope; provider execution still starts from `autoeval run`.
+`autoeval provider files --repo .` prints the canonical provider artifact paths for the active run (or for `--run-id` when supplied), using the run's recorded provider from `provider_session.json` and including session, prompt, raw trace, normalized trace, last message, and result entries even before optional provider outputs exist.
+`autoeval provider result --repo .` prints the saved provider execution result for the active run (or for `--run-id` when supplied) and fails clearly if the provider has not produced a saved result yet.
 For the current Codex proto smoke in this environment, use `--sandbox-mode danger-full-access`.
 
-## Codex provider example
+## Complete usage
 
-Initialize a repo for Codex:
+`autoeval run` is the only normal execution entry point. There is no separate `init` or `launch` step in the operator workflow.
 
-```bash
-uv run autoeval init \
-  --repo . \
-  --provider codex \
-  --task "Implement feature set" \
-  --force
-```
+### 1. Create the repository-root verifier file
 
-Available `autoeval init` options for Codex bootstrap:
-- `--repo <path>`: target repository root, required
-- `--provider codex`: provider name, defaults to `codex`
-- `--task "<text>"`: bootstrap task text written into run/bootstrap context, defaults to `Initialize target repository execution context`
-- `--force`: regenerate existing RPI artifacts
+`autoeval` reads verifier links from `./verifier.yaml` at the repository root. For a repo at `/path/to/project`, the default verifier path is `/path/to/project/verifier.yaml`.
 
-After a run exists, launch the Codex adapter:
+Use these commands to inspect the path and print the fixed template:
 
 ```bash
-uv run autoeval provider launch \
-  --repo . \
-  --provider codex \
-  --run-id "$(jq -r '.last_run_id' .autoeval/state.json)" \
-  --sandbox-mode danger-full-access \
-  --timeout-sec 180
-```
-
-Available `autoeval provider launch` options for Codex:
-- `--repo <path>`: target repository root, required
-- `--provider codex`: provider name, defaults to `codex`
-- `--run-id <id>`: existing run id to attach the provider session to
-- `--task "<text>"`: override task text in the emitted provider session
-- `--mode planning|instant`: override mode in the emitted provider session
-- `--sandbox-mode <mode>`: provider sandbox mode, defaults to `workspace-write`
-- `--timeout-sec <seconds>`: launch timeout, defaults to `90`
-- `--model <name>`: optional provider model override
-- `--profile <name>`: optional Codex config profile
-- `--extra-arg <value>`: repeatable passthrough argument for the provider command
-
-If you only need the provider-facing session envelope without launching Codex:
-
-```bash
-uv run autoeval provider session \
-  --repo . \
-  --provider codex \
-  --run-id "$(jq -r '.last_run_id' .autoeval/state.json)"
-```
-
-## Quickstart
-
-```bash
-uv run autoeval init --repo . --provider codex --task "Implement feature set"
+uv run autoeval verifier path --repo .
 uv run autoeval verifier template
-uv run autoeval verifier sync --repo .
-# edit .autoeval/verifier.yaml to link file/directory tests, then sync again
-uv run autoeval tools decide-mode --repo . --request "Implement feature set" --mode planning
-uv run autoeval run --repo . --task "Implement feature set" --mode planning
-uv run autoeval tools list --repo .
-uv run autoeval tools feature-list-generate --repo . --input-json '{"sub_tasks":[{"sub_task_description":"Implement feature set","verifications":[{"kind":"pytest","target":"tests/test_app.py::test_feature"}]}]}'
-uv run autoeval tools guardrail-check --command "pytest -q tests/test_api.py::test_ok"
-uv run autoeval tools autocheck --repo .
+```
+
+Example `verifier.yaml`:
+
+```yaml
+schema_version: 1
+tests:
+  - path: tests/test_run_cli.py
+    scope: file
+    framework: pytest
+    pattern: "test_*.py"
+    recursive: false
+    mcp_profiles: []
+prompts: []
+connections: []
+```
+
+`verifier.yaml` is user-owned. Keep it at the repository root outside `.autoeval`. The coding agent consumes it but should not author it.
+
+### 2. Start a run
+
+If `.autoeval` does not exist, `autoeval run` creates it during execution. If `.autoeval` already exists, the command preserves existing instruction artifacts by default and only creates or refreshes what is missing.
+
+Example:
+
+```bash
+uv run autoeval run \
+  --repo . \
+  --provider codex \
+  --task "Add a provider summary command, document it, and add regression tests" \
+  --mode planning \
+  --sandbox-mode danger-full-access
+```
+
+What `autoeval run` does:
+- validates the repository-root `verifier.yaml`
+- creates `.autoeval` when missing
+- syncs verifier-linked pytest targets into the runtime/autocheck map
+- creates run-scoped files such as `.autoeval/runs/<run_id>/provider/provider_session.json`
+- launches the configured provider unless `--no-launch` is used
+
+Use `--force` only when you intentionally want to rewrite the instruction artifacts under `.autoeval/instructions/`. Without `--force`, existing authored artifacts are preserved.
+
+### 3. Inspect the run
+
+After `autoeval run`, inspect the current run with:
+
+```bash
+uv run autoeval status --repo .
 uv run autoeval tools run-status --repo .
 uv run autoeval tools run-eval --repo .
 uv run autoeval provider session --repo .
-uv run autoeval provider launch --repo . --provider codex --sandbox-mode danger-full-access
-uv run python scripts/provider_connector.py --repo . --provider codex --run-id "$(jq -r '.last_run_id' .autoeval/state.json)" --sandbox-mode danger-full-access
+uv run autoeval provider files --repo .
+uv run autoeval provider result --repo .
+```
+
+Useful verifier inspection commands:
+
+```bash
+uv run autoeval verifier path --repo .
+uv run autoeval verifier show --repo .
+uv run autoeval verifier sync --repo .
+```
+
+### 4. Continue an existing run
+
+To continue the latest run:
+
+```bash
+uv run autoeval resume --repo .
+```
+
+Add `--force` only if you intentionally want `resume` to rewrite the instruction artifacts before continuing.
+
+Use `--run-id <id>` only when you deliberately want to target a specific past run. It is not part of the default flow.
+
+### 5. Command reference
+
+Common `autoeval run` options:
+- `--repo <path>`: target repository root, required
+- `--task "<text>"`: concrete task text for the run, required
+- `--provider codex`: provider name, defaults to `codex`
+- `--mode planning|instant`: execution mode selected from the inline policy
+- `--force`: rewrite instruction artifacts instead of preserving existing files
+- `--launch/--no-launch`: launch provider after preparing the run, defaults to `--launch`
+- `--sandbox-mode <mode>`: provider sandbox mode, defaults to `workspace-write`
+- `--timeout-sec <seconds>`: optional provider execution timeout; omitted means no timeout
+- `--model <name>`: optional provider model override
+- `--profile <name>`: optional Codex config profile
+- `--extra-arg <value>`: repeatable passthrough provider argument
+- `--run-autocheck-now/--no-run-autocheck-now`: run harness autocheck during setup, defaults to `--run-autocheck-now`
+- `--autocheck-timeout-sec <seconds>`: autocheck timeout, defaults to `300`
+
+Common harness inspection commands:
+
+```bash
+uv run autoeval tools list --repo .
+uv run autoeval tools autocheck --repo .
+uv run autoeval tools guardrail-check --command "pytest -q tests/test_api.py::test_ok"
 ```
 
 ## MCP lifecycle

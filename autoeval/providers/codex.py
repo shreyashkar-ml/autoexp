@@ -1,6 +1,7 @@
 import json
 import shutil
 import subprocess
+import threading
 from typing import Any
 
 from ..config import RepoPaths, utc_now_iso, write_json
@@ -27,10 +28,12 @@ class CodexProviderAdapter(ProviderAdapter):
         binary = shutil.which("codex")
         exec_help = self._safe_help(["codex", "exec", "--help"]) if binary else {"ok": False, "stdout": "", "stderr": ""}
         local_proto_help = self._safe_help(["codex", "proto", "--help"]) if binary else {"ok": False, "stdout": "", "stderr": ""}
-        pinned_proto_help = self._safe_help(self.pinned_proto_command + ["--help"])
 
         supports_exec_json = bool(binary) and exec_help["ok"] and "--json" in exec_help["stdout"]
         supports_local_proto = bool(binary) and local_proto_help["ok"] and "protocol" in local_proto_help["stdout"].lower()
+        pinned_proto_help = {"ok": False, "stdout": "", "stderr": ""}
+        if not supports_local_proto and not supports_exec_json:
+            pinned_proto_help = self._safe_help(self.pinned_proto_command + ["--help"])
         supports_pinned_proto = pinned_proto_help["ok"] and "protocol" in pinned_proto_help["stdout"].lower()
 
         if supports_local_proto:
@@ -96,30 +99,14 @@ class CodexProviderAdapter(ProviderAdapter):
             command = self._build_exec_json_command(paths, request)
             process_input = prompt_text
 
-        timed_out = False
-        try:
-            completed = subprocess.run(
-                command,
-                cwd=str(paths.repo),
-                input=process_input,
-                text=True,
-                capture_output=True,
-                timeout=request.timeout_sec,
-            )
-            stdout_text = completed.stdout or ""
-            stderr_text = completed.stderr or ""
-        except subprocess.TimeoutExpired as exc:
-            timed_out = True
-            stdout_text = self._coerce_text(exc.stdout)
-            stderr_text = self._coerce_text(exc.stderr)
-            completed = type("Completed", (), {"returncode": None})()
-
-        raw_output = stdout_text
-        if stderr_text:
-            raw_output = raw_output + stderr_text
-
         raw_trace = provider_raw_trace_file(paths, request.run_id, self.name)
-        raw_trace.write_text(raw_output, encoding="utf-8")
+        exit_code, raw_output, timed_out = self._run_command(
+            command=command,
+            cwd=str(paths.repo),
+            process_input=process_input,
+            timeout_sec=request.timeout_sec,
+            raw_trace=raw_trace,
+        )
 
         normalized_events = self._normalize_output(raw_output, transport=transport)
         completed_event_seen = any(
@@ -137,11 +124,11 @@ class CodexProviderAdapter(ProviderAdapter):
         error = None
         if timed_out and not completed_event_seen:
             error = f"codex provider launch timed out after {request.timeout_sec}s"
-        elif not timed_out and completed.returncode != 0:
-            error = self._extract_error(normalized_events) or f"codex exited with code {completed.returncode}"
+        elif not timed_out and exit_code != 0:
+            error = self._extract_error(normalized_events) or f"codex exited with code {exit_code}"
 
         result = ProviderExecutionResult(
-            ok=(completed.returncode == 0 and not timed_out) or (timed_out and completed_event_seen),
+            ok=(exit_code == 0 and not timed_out) or (timed_out and completed_event_seen),
             provider=self.name,
             transport=transport,
             command=command,
@@ -150,7 +137,7 @@ class CodexProviderAdapter(ProviderAdapter):
             raw_trace_file=str(raw_trace),
             normalized_trace_file=str(normalized_trace),
             last_message_file=str(last_message),
-            exit_code=completed.returncode,
+            exit_code=exit_code,
             final_output=final_output,
             error=error,
             event_count=len(normalized_events),
@@ -166,10 +153,72 @@ class CodexProviderAdapter(ProviderAdapter):
         write_json(provider_result_file(paths, request.run_id, self.name), result.model_dump())
         return result
 
+    def _run_command(
+        self,
+        *,
+        command: list[str],
+        cwd: str,
+        process_input: str,
+        timeout_sec: int | None,
+        raw_trace,
+    ) -> tuple[int | None, str, bool]:
+        output_chunks: list[str] = []
+        process = subprocess.Popen(
+            command,
+            cwd=cwd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            bufsize=1,
+        )
+
+        def _drain_stdout() -> None:
+            if process.stdout is None:
+                raw_trace.write_text("", encoding="utf-8")
+                return
+            with raw_trace.open("w", encoding="utf-8") as handle:
+                for chunk in process.stdout:
+                    output_chunks.append(chunk)
+                    handle.write(chunk)
+                    handle.flush()
+
+        reader = threading.Thread(target=_drain_stdout, daemon=True)
+        reader.start()
+
+        try:
+            if process.stdin is not None:
+                process.stdin.write(process_input)
+                process.stdin.close()
+        except BrokenPipeError:
+            pass
+
+        timed_out = False
+        try:
+            if timeout_sec is None:
+                process.wait()
+            else:
+                process.wait(timeout=timeout_sec)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            process.kill()
+            process.wait()
+
+        reader.join(timeout=5)
+        if process.stdout is not None:
+            remaining = process.stdout.read() or ""
+            if remaining:
+                output_chunks.append(remaining)
+                with raw_trace.open("a", encoding="utf-8") as handle:
+                    handle.write(remaining)
+
+        exit_code = None if timed_out else process.returncode
+        return exit_code, "".join(output_chunks), timed_out
+
     def _safe_help(self, command: list[str]) -> dict[str, Any]:
         try:
-            result = subprocess.run(command, text=True, capture_output=True)
-        except OSError as exc:
+            result = subprocess.run(command, text=True, capture_output=True, timeout=5)
+        except (OSError, subprocess.TimeoutExpired) as exc:
             return {"ok": False, "stdout": "", "stderr": str(exc)}
         return {"ok": result.returncode == 0, "stdout": result.stdout or "", "stderr": result.stderr or ""}
 
@@ -199,6 +248,7 @@ class CodexProviderAdapter(ProviderAdapter):
             "- Read the provider session and active context files before acting.",
             "- Read artifact_generation entries from provider_session.json and use their template instructions when creating or updating research/implementation/plan/review/feature_list artifacts.",
             "- If an artifact target is missing or empty, author the real artifact content in that file before proceeding with other work.",
+            "- Never create or modify verifier.yaml; it is user-owned and lives at the repository root outside .autoeval.",
             "- Use the autoeval CLI tool surface for harness actions and status transitions.",
             "- Follow the loop steps from the provider session contract.",
             "- Do not edit harness-owned immutable task metadata directly.",
@@ -230,6 +280,8 @@ class CodexProviderAdapter(ProviderAdapter):
         last_message = str(provider_last_message_file(paths, request.run_id, self.name))
         command = [
             "codex",
+            "--ask-for-approval",
+            "never",
             "exec",
             "--json",
             "--skip-git-repo-check",

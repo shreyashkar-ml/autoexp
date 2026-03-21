@@ -15,7 +15,8 @@ from .security import validate_pytest_target, validate_repo_relative_path, valid
 from .tracker import assert_status_only_mutation, load_feature_list
 
 VERIFIER_YAML_TEMPLATE = f"""# Autoeval verifier configuration
-# Fixed template: developer/end-user maintains this file.
+# Fixed template: developer/end-user maintains this file at the repository root.
+# Default location: ./verifier.yaml relative to the repository root.
 # Coding agent should not author verifier entries; it only consumes resolved outputs.
 schema_version: {SCHEMA_VERSION}
 tests:
@@ -94,15 +95,12 @@ def verifier_template_text() -> str:
     return VERIFIER_YAML_TEMPLATE
 
 
-def ensure_verifier_file(paths: RepoPaths) -> None:
-    if paths.verifier_file.exists():
-        return
-    paths.verifier_file.parent.mkdir(parents=True, exist_ok=True)
-    paths.verifier_file.write_text(verifier_template_text(), encoding="utf-8")
-
-
 def load_verifier_config(paths: RepoPaths) -> VerifierConfig:
-    ensure_verifier_file(paths)
+    if not paths.verifier_file.exists():
+        raise ValueError(
+            "missing verifier.yaml: expected a developer-authored verifier file at "
+            f"{paths.verifier_file}"
+        )
     raw_text = paths.verifier_file.read_text(encoding="utf-8")
     try:
         raw = yaml.safe_load(raw_text)

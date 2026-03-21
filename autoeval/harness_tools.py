@@ -74,7 +74,7 @@ def _tool_specifications() -> list[dict[str, Any]]:
         {
             "id": "guardrail.check_command",
             "description": "Validate a terminal command against security and policy guardrails.",
-            "cli": "autoeval tools guardrail-check --command <cmd> [--target <pytest_target>]",
+            "cli": "autoeval tools guardrail-check --repo . --command <cmd> [--target <pytest_target>]",
             "parameters": [
                 {"name": "command", "type": "string", "required": True},
                 {"name": "target", "type": "string", "required": False},
@@ -88,7 +88,7 @@ def _tool_specifications() -> list[dict[str, Any]]:
         },
         {
             "id": "verifier.sync",
-            "description": "Resolve linked pytest targets from verifier.yaml and return them without creating a stored artifact file.",
+            "description": "Resolve linked pytest targets from the user-owned verifier.yaml and return them without creating a stored artifact file.",
             "cli": "autoeval verifier sync --repo .",
             "parameters": [],
             "outputs": {
@@ -231,7 +231,7 @@ def tool_catalog_payload(paths: RepoPaths) -> dict[str, Any]:
                 "if mode=instant: skip harness loop and jump directly to coding execution",
                 "if mode=planning: continue harness loop",
                 "read artifacts + tool catalog",
-                "call verifier.sync when you need resolved linked pytest targets from verifier.yaml",
+                "call verifier.sync when you need resolved linked pytest targets from the user-owned verifier.yaml",
                 "check terminal commands with guardrail.check_command",
                 "implement changes with coding agent outside harness",
                 "run verifier.autocheck",
