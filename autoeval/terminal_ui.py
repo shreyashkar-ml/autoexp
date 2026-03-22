@@ -53,6 +53,14 @@ def _split_extra_args(raw: str) -> list[str]:
     return shlex.split(raw.strip()) if raw.strip() else []
 
 
+def _prompt_or_value(value: str | None, prompt: str, *, default: str | None = None) -> str:
+    if value is not None:
+        return value
+    if default is None:
+        return typer.prompt(prompt)
+    return typer.prompt(prompt, default=default)
+
+
 def launch_terminal_ui(
     *,
     repo: Path,
@@ -69,22 +77,30 @@ def launch_terminal_ui(
     console.print(Panel.fit("[bold blue]AUTOEVAL[/bold blue] rich terminal UI", border_style="blue"))
     console.print("Default path: [bold]/query[/bold]   Optional placeholder: [bold]/autoresearch[/bold]\n")
 
-    request = (task_input or typer.prompt("Type your request or command")).strip()
+    request = _prompt_or_value(task_input, "Type your request or command").strip()
     if not request:
         raise typer.BadParameter("request cannot be empty")
 
-    if request.startswith(AUTORESEARCH_PATH):
+    command, _, remainder = request.partition(" ")
+    if command == AUTORESEARCH_PATH:
         console.print("[yellow]/autoresearch is currently a placeholder path and is not implemented yet.[/yellow]")
         return {"ok": False, "reason": "placeholder_autoresearch", "path": AUTORESEARCH_PATH}
 
     selected_path = QUERY_PATH
-    normalized_task = request if not request.startswith("/") else request[len(QUERY_PATH) :].strip()
+    if request.startswith("/"):
+        if command != QUERY_PATH:
+            raise typer.BadParameter(
+                f"unsupported path '{command}'. choose from: {QUERY_PATH}, {AUTORESEARCH_PATH}"
+            )
+        normalized_task = remainder.strip()
+    else:
+        normalized_task = request
     if not normalized_task:
         raise typer.BadParameter("a non-empty task is required for /query")
 
     options = provider_options()
     provider_names = [item.name for item in options]
-    provider = (provider_input or typer.prompt("Provider", default="codex")).strip().lower()
+    provider = _prompt_or_value(provider_input, "Provider", default="codex").strip().lower()
     if provider not in provider_names:
         raise typer.BadParameter(f"unsupported provider '{provider}'. choose from: {', '.join(provider_names)}")
 
@@ -95,16 +111,18 @@ def launch_terminal_ui(
 
     model_options = codex_model_options(paths)
     model_default = model_options[0]
-    model = (model_input or typer.prompt("Model", default=model_default)).strip()
+    model = _prompt_or_value(model_input, "Model", default=model_default).strip()
     if model == "<provider-default>":
         model = ""
 
     sandbox_choices = sandbox_mode_options()
-    sandbox_mode = (sandbox_input or typer.prompt("Sandbox mode", default=sandbox_choices[0])).strip()
+    sandbox_mode = _prompt_or_value(sandbox_input, "Sandbox mode", default=sandbox_choices[0]).strip()
     if sandbox_mode not in sandbox_choices:
         raise typer.BadParameter(f"unsupported sandbox mode '{sandbox_mode}'. choose from: {', '.join(sandbox_choices)}")
 
-    extra_args = _split_extra_args(extra_args_input or typer.prompt("Extra provider args (space separated)", default=""))
+    extra_args = _split_extra_args(
+        _prompt_or_value(extra_args_input, "Extra provider args (space separated)", default="")
+    )
 
     preview = [
         "autoeval",

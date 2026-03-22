@@ -7,6 +7,7 @@ import autoeval.cli as cli_module
 from autoeval.config import RepoPaths, write_json
 from autoeval.provider_surface import ProviderExecutionResult
 from autoeval.provider_surface import provider_result_file
+from autoeval.terminal_ui import launch_terminal_ui
 
 
 runner = CliRunner()
@@ -404,3 +405,33 @@ def test_ui_non_codex_provider_is_placeholder(tmp_path, monkeypatch):
     assert payload["ok"] is False
     assert payload["reason"] == "placeholder_provider"
     assert payload["provider"] == "claude-code"
+
+
+def test_ui_rejects_unknown_slash_command(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("AUTOEVAL_HOME", str(tmp_path / "home"))
+
+    result = runner.invoke(cli_module.app, ["ui", "--repo", str(repo)], input="/foo demo\n")
+
+    assert result.exit_code != 0
+    assert "unsupported path '/foo'" in result.output
+
+
+def test_launch_terminal_ui_accepts_empty_extra_args_input_without_prompting(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("AUTOEVAL_HOME", str(tmp_path / "home"))
+
+    payload = launch_terminal_ui(
+        repo=repo,
+        execute=False,
+        task_input="add support",
+        provider_input="codex",
+        model_input="<provider-default>",
+        sandbox_input="workspace-write",
+        extra_args_input="",
+    )
+
+    assert payload["ok"] is True
+    assert payload["extra_args"] == []
