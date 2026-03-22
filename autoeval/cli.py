@@ -29,6 +29,7 @@ from .orchestrator import fork_run, intervene, resume_task, run_task, status
 from .provider_launcher import launch_provider_run
 from .provider_surface import read_provider_files, read_provider_result, write_provider_session
 from .verifier import load_verifier_config, run_autocheck, sync_autocheck_map_from_verifier, verifier_template_text
+from .terminal_ui import launch_terminal_ui
 
 app = typer.Typer(help="Minimal autoeval harness CLI")
 mcp_app = typer.Typer(help="MCP lifecycle commands")
@@ -47,6 +48,31 @@ def _paths(repo: Path) -> RepoPaths:
 
 def _emit(payload: dict) -> None:
     typer.echo(json.dumps(payload, indent=2, sort_keys=True))
+
+
+@app.callback(invoke_without_command=True)
+def main(
+    ctx: typer.Context,
+    repo: Path = typer.Option(Path("."), "--repo", exists=True, file_okay=False, dir_okay=True),
+    execute: bool = typer.Option(
+        False,
+        "--execute/--no-execute",
+        help="When enabled, attempt to execute after collecting UI inputs",
+    ),
+) -> None:
+    if ctx.invoked_subcommand is not None:
+        return
+    payload = launch_terminal_ui(repo=repo, execute=execute)
+    _emit(payload)
+
+
+@app.command("ui")
+def ui_cmd(
+    repo: Path = typer.Option(Path("."), exists=True, file_okay=False, dir_okay=True),
+    execute: bool = typer.Option(False, "--execute/--no-execute"),
+) -> None:
+    payload = launch_terminal_ui(repo=repo, execute=execute)
+    _emit(payload)
 
 
 @app.command()

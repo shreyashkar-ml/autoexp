@@ -12,6 +12,13 @@ from autoeval.provider_surface import provider_result_file
 runner = CliRunner()
 
 
+def _parse_last_json_payload(output: str) -> dict:
+    start = output.rfind("{\n")
+    if start == -1:
+        raise AssertionError(f"json payload missing in output: {output}")
+    return json.loads(output[start:])
+
+
 def _write_repo_verifier(repo: Path, text: str = "schema_version: 1\ntests: []\n") -> Path:
     verifier_file = repo / "verifier.yaml"
     verifier_file.write_text(text, encoding="utf-8")
@@ -347,3 +354,53 @@ def test_verifier_path_reports_existing_repo_root_verifier_file(tmp_path):
         "exists": True,
         "path": str(verifier_file),
     }
+
+
+def test_root_invocation_opens_rich_ui_and_returns_query_payload(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("AUTOEVAL_HOME", str(tmp_path / "home"))
+
+    result = runner.invoke(
+        cli_module.app,
+        ["--repo", str(repo)],
+        input="add pytorch conv support\ncodex\ngpt-5\nworkspace-write\n\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_last_json_payload(result.output)
+    assert payload["ok"] is True
+    assert payload["path"] == "/query"
+    assert payload["provider"] == "codex"
+    assert payload["model"] == "gpt-5"
+
+
+def test_ui_autoresearch_path_is_placeholder(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("AUTOEVAL_HOME", str(tmp_path / "home"))
+
+    result = runner.invoke(cli_module.app, ["ui", "--repo", str(repo)], input="/autoresearch investigate\n")
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_last_json_payload(result.output)
+    assert payload["ok"] is False
+    assert payload["reason"] == "placeholder_autoresearch"
+
+
+def test_ui_non_codex_provider_is_placeholder(tmp_path, monkeypatch):
+    repo = tmp_path / "repo"
+    repo.mkdir()
+    monkeypatch.setenv("AUTOEVAL_HOME", str(tmp_path / "home"))
+
+    result = runner.invoke(
+        cli_module.app,
+        ["ui", "--repo", str(repo)],
+        input="add support\nclaude-code\n",
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = _parse_last_json_payload(result.output)
+    assert payload["ok"] is False
+    assert payload["reason"] == "placeholder_provider"
+    assert payload["provider"] == "claude-code"
