@@ -4,7 +4,7 @@ version = "0.1.0"
 description = "Git-backed sandbox/versioning runtime for black-box executable workflows"
 readme = "README.md"
 requires-python = ">=3.11"
-license = "MIT"
+license = "Apache-2.0"
 authors = [
   { name = "Shreyashkar Sahu" }
 ]
@@ -30,8 +30,8 @@ test = [
 autoeval = "autoeval.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/shreyashkar-sahu/autoeval"
-Issues = "https://github.com/shreyashkar-sahu/autoeval/issues"
+Homepage = "https://github.com/shreyashkar-ml/autoeval"
+Issues = "https://github.com/shreyashkar-ml/autoeval/issues"
 
 [build-system]
 requires = ["setuptools>=68"]

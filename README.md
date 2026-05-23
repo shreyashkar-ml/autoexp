@@ -35,7 +35,7 @@ uv tool install .
 From GitHub:
 
 ```bash
-uv tool install git+https://github.com/shreyashkar-sahu/autoeval.git
+uv tool install git+https://github.com/shreyashkar-ml/autoeval.git
 ```
 
 After install:
