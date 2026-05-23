@@ -1,0 +1,43 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Run tests
+        run: uv run --extra test pytest
+
+      - name: Build package
+        run: uv build
+
+      - name: Install wheel smoke test
+        run: |
+          uv tool install dist/*.whl
+          autoeval --help
+
+  docker-smoke:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Run Autoeval Docker smoke test
+        run: |
+          repo="$GITHUB_WORKSPACE"
+          tmp="$(mktemp -d)"
+          uv run --project "$repo" python -m autoeval start "$tmp/demo_eval"
+          cd "$tmp/demo_eval"
+          uv run --project "$repo" python -m autoeval storage --label initial
+          uv run --project "$repo" python -m autoeval run
+          test -f runs/*/final_report.md
