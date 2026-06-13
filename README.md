@@ -1,150 +1,180 @@
 # Autoeval
 
-Autoeval is a small CLI for creating versioned, Docker-backed black-box
-workflow projects.
+Autoeval is a local-first workspace for black-box experiments. It gives each experiment a stable project layout, versioned script state, repeatable run artifacts, a browser UI, and agent-friendly context files.
 
-An Autoeval project is a visible directory with three executable stages:
-
-- `input/` collects or normalizes inputs.
-- `script/` performs the main computation.
-- `report/` renders the final report.
-
-Runs are recorded under `runs/`, while explicit stage versions are stored with
-`autoeval storage`.
-
-## Requirements
-
-- Python 3.11 or newer
-- Git
-- Docker Engine for `autoeval run`
-
-Docker must be installed and usable by your user:
-
-```bash
-docker run --rm hello-world
-```
+Use it when you want to iterate on scripts and outputs without manually organizing run folders, reports, logs, or agent instructions.
 
 ## Install
 
-From a local checkout:
-
 ```bash
-uv tool install .
+pip install autoeval
 ```
 
-From GitHub:
+or:
 
 ```bash
-uv tool install git+https://github.com/shreyashkar-ml/autoeval.git
+uv tool install autoeval
 ```
 
-After install:
+Docker is optional. Autoeval runs locally when Docker is unavailable. If Docker is installed and usable, the default runner uses it for sandboxed execution.
+
+## Create A Project
 
 ```bash
-autoeval --help
-```
-
-## Quick Start
-
-Create a project:
-
-```bash
-autoeval start demo_eval
+autoeval init demo_eval
 cd demo_eval
 ```
 
-Store the initial input/script/report versions:
+This creates:
 
-```bash
-autoeval storage --label initial
+```text
+demo_eval/
+  .autoeval/
+    git/
+  .gitignore
+  app.env
+  autoeval.json
+  autoeval.md
+  index.sqlite
+  script/
+    stage.json
+    params.json
+    params.schema.json
+    script.py
+  runs/
 ```
 
-Run the workflow:
+The project root can also contain your own normal `.git` repository. Autoeval stores its internal history separately under `.autoeval/git`.
+
+## Run An Experiment
 
 ```bash
 autoeval run
 ```
 
-Inspect runs:
+Autoeval copies the current script/config state into a new `runs/<run_id>/` directory, executes it, records logs and outputs, and prints the `run_id`.
+
+Each run directory contains:
+
+```text
+runs/<run_id>/
+  ctx.json
+  run.json
+  script/
+  output/
+  logs/
+  report/
+    report_bundle.json
+```
+
+Refresh an existing run in place:
+
+```bash
+autoeval run <run_id>
+```
+
+List recent runs:
 
 ```bash
 autoeval status
 ```
 
-Start the local API server for a future browser UI:
+## Script Inputs And Environment
 
-```bash
-autoeval serve
-```
+Put executable experiment logic in `script/`.
 
-## Project Layout
+Put non-secret configurable parameters in:
 
 ```text
-demo_eval/
-  autoeval.md
-  autoeval.json
-  input/
-    stage.json
-    params.schema.json
-    params.json
-    input.py
-  script/
-    stage.json
-    script.py
-  report/
-    stage.json
-    report.py
-  runs/
-  index.sqlite
-  .git/
+script/params.json
 ```
 
-`autoeval.json` contains project metadata and sandbox settings. By default,
-stages run in `python:3.12-slim` with Docker networking disabled.
-
-## Input Parameters
-
-User-editable inputs live in:
+Keep credentials, tokens, endpoints, and machine-local values in:
 
 ```text
-input/params.json
+app.env
 ```
 
-The future UI should render controls from:
+`app.env` is ignored by git and by Autoeval's private storage. Autoeval passes it to the selected runner during execution.
+
+## Browser UI
+
+Launch the local UI:
+
+```bash
+autoeval view
+```
+
+The UI shows registered Autoeval projects on the machine, recent runs, status, script files, output filenames, and generated reports. It also lets you edit a script snapshot without overwriting the original run.
+
+## Reports
+
+Autoeval does not generate reports automatically during `autoeval run`.
+
+For every run, Autoeval writes report context to:
 
 ```text
-input/params.schema.json
+runs/<run_id>/report/report_bundle.json
 ```
 
-Editing `input/params.json` changes the input hash without changing the script
-or report hashes.
+The bundle includes the run id, script name, script params, output artifacts, logs, report instructions, and `app.env` variable names only. It never includes secret values from `app.env`.
 
-## Storage vs Runs
+Generated reports should be written under:
 
-`autoeval storage` explicitly stores the current stage/config state as
-versioned assets.
-
-`autoeval run` executes the current state and records a run, but does not store
-new stage versions automatically.
-
-This keeps storage aligned with user intent.
-
-## Development
-
-Run syntax checks:
-
-```bash
-python3 -m compileall autoeval
+```text
+runs/<run_id>/report/
 ```
 
-Run tests:
+Use a project-specific report instruction file with:
 
 ```bash
-uv run --extra test pytest
+autoeval report-instruction path/to/report.md
 ```
 
-Build package artifacts:
+## Store A Run
+
+Runs start as local cache entries. Promote a run into Autoeval's private storage when you want to preserve it:
 
 ```bash
-uv build
+autoeval storage <run_id>
+```
+
+Store the current script/config state without promoting a run:
+
+```bash
+autoeval storage --label initial
+```
+
+## Agent Workflow
+
+Install thin adapter files for coding agents:
+
+```bash
+autoeval agent install --target all
+```
+
+This writes `AGENTS.md`, `CLAUDE.md`, and `.mcp.json` unless they already exist. These files point agents to `autoeval.md` and the local MCP server.
+
+Start the MCP server:
+
+```bash
+autoeval mcp
+```
+
+Agents should use Autoeval commands or MCP tools to inspect runs, edit scripts, execute experiments, read logs, and generate reports. They should not run files inside `script/` directly.
+
+## Useful Commands
+
+```bash
+autoeval init <project_name>
+autoeval run [run_id]
+autoeval status
+autoeval storage [run_id]
+autoeval restore <run_id>
+autoeval diff <run_a> <run_b>
+autoeval report-instruction [path]
+autoeval view
+autoeval doctor
+autoeval agent install --target all
+autoeval mcp
 ```
