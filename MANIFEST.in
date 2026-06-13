@@ -1,0 +1,13 @@
+prune tests
+prune node_modules
+prune frontend/node_modules
+prune build
+prune dist
+prune .agents
+prune .codex
+
+exclude intermediate.md
+exclude technical_overview.md
+
+global-exclude __pycache__/*
+global-exclude *.py[cod]

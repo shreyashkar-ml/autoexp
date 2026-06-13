@@ -1,125 +1,27 @@
 import json
+import mimetypes
 import os
 import signal
 import subprocess
 import sys
 import threading
+import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .cli import (
-    STAGES,
-    compute_hashes,
-    db,
-    ensure_autoeval_git_repo,
-    ensure_workspace,
-    ensure_workspace_contract,
-    git_commit_storage,
-    init_db,
-    now,
-    project_root,
-    read_json,
-    upsert_stage_versions,
-    write_json,
-)
+from .project import is_project_root, init_db, list_registered_projects, now, project_id, register_project, require_autoeval_git_repo, warn_docker_unavailable
+from .runtime import list_runs, read_script_params, report_instruction, run_report, run_source, save_script_file, workspace, write_script_params
 
 
-def clamp_limit(raw, default=20, maximum=200):
+UI_DIR = Path(__file__).with_name("ui")
+
+def clamp(raw, default=20, maximum=200):
     try:
-        value = int(raw)
+        return max(1, min(int(raw), maximum))
     except (TypeError, ValueError):
         return default
-
-    return max(1, min(value, maximum))
-
-
-def json_or_none(value):
-    if value is None:
-        return None
-
-    try:
-        return json.loads(value)
-    except json.JSONDecodeError:
-        return value
-
-
-def run_row(row):
-    return {
-        "run_id": row["run_id"],
-        "status": row["status"],
-        "capsule_hash": row["capsule_hash"],
-        "input_hash": row["input_hash"],
-        "script_hash": row["script_hash"],
-        "report_hash": row["report_hash"],
-        "git_commit": row["git_commit"],
-        "stage_status": json_or_none(row["stage_status"]),
-        "created_at": row["created_at"],
-    }
-
-
-def version_row(stage, row):
-    hash_key = f"{stage}_hash"
-
-    return {
-        "stage": stage,
-        "hash": row[hash_key],
-        "created_at": row["created_at"],
-        "git_commit": row["git_commit"],
-        "label": row["label"],
-        "metadata": json_or_none(row["metadata_json"]),
-    }
-
-
-def list_runs(limit=20, root=None):
-    conn = db(root)
-    rows = conn.execute(
-        """
-        select
-            run_id,
-            status,
-            capsule_hash,
-            input_hash,
-            script_hash,
-            report_hash,
-            git_commit,
-            stage_status,
-            created_at
-        from runs
-        order by created_at desc
-        limit ?
-        """,
-        (limit,),
-    ).fetchall()
-    conn.close()
-
-    return [run_row(row) for row in rows]
-
-
-def list_versions(limit=50, root=None):
-    conn = db(root)
-    data = {}
-
-    for stage in ("input", "script", "report"):
-        rows = conn.execute(
-            f"""
-            select
-                {stage}_hash,
-                created_at,
-                git_commit,
-                label,
-                metadata_json
-            from {stage}_versions
-            order by created_at desc
-            limit ?
-            """,
-            (limit,),
-        ).fetchall()
-        data[stage] = [version_row(stage, row) for row in rows]
-
-    conn.close()
-    return data
 
 
 class RunManager:
@@ -128,144 +30,117 @@ class RunManager:
         self.lock = threading.Lock()
         self.job = None
 
-    def _job_payload(self):
+    def _payload(self):
         if not self.job:
-            return {
-                "active": False,
-                "job": None,
-            }
+            return {"active": False, "job": None}
 
         proc = self.job["proc"]
         returncode = proc.poll()
-
-        if returncode is not None and self.job["status"] in {"running", "paused", "canceling"}:
-            if self.job["status"] == "canceling":
-                self.job["status"] = "canceled"
-            else:
-                self.job["status"] = "success" if returncode == 0 else "failed"
-
+        if returncode is not None and self.job["status"] in {"running", "canceling"}:
+            self.job["status"] = "canceled" if self.job["status"] == "canceling" else ("success" if returncode == 0 else "failed")
             self.job["returncode"] = returncode
-            self.job["ended_at"] = self._now()
+            self.job["ended_at"] = now()
 
         return {
-            "active": self.job["status"] in {"running", "paused", "canceling"},
+            "active": self.job["status"] in {"running", "canceling"},
             "job": {
-                "job_id": self.job["job_id"],
-                "pid": proc.pid,
-                "status": self.job["status"],
-                "started_at": self.job["started_at"],
-                "ended_at": self.job["ended_at"],
-                "returncode": self.job["returncode"],
-                "log_path": str(self.job["log_path"]),
+                key: self.job[key]
+                for key in ("job_id", "pid", "status", "started_at", "ended_at", "returncode", "log_path")
             },
         }
 
     def active(self):
         with self.lock:
-            return self._job_payload()
+            return self._payload()
 
-    def start(self, force=False):
+    def start(self, run_id=None):
         with self.lock:
-            current = self._job_payload()
-
+            current = self._payload()
             if current["active"]:
                 return False, current
 
             job_id = uuid.uuid4().hex
-            server_dir = self.workspace_root / "server" / "jobs"
-            server_dir.mkdir(parents=True, exist_ok=True)
-            log_path = server_dir / f"{job_id}.log"
+            job_dir = self.workspace_root / "server" / "jobs"
+            job_dir.mkdir(parents=True, exist_ok=True)
+            log_path = job_dir / f"{job_id}.log"
+            cmd = [sys.executable, "-m", "autoeval", "run", *([run_id] if run_id else [])]
             log = log_path.open("w")
-
-            cmd = [sys.executable, "-m", "autoeval", "run"]
-
-            if force:
-                cmd.append("--force")
-
-            proc = subprocess.Popen(
-                cmd,
-                cwd=self.workspace_root,
-                stdout=log,
-                stderr=subprocess.STDOUT,
-                start_new_session=True,
-            )
+            proc = subprocess.Popen(cmd, cwd=self.workspace_root, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             log.close()
-
             self.job = {
                 "job_id": job_id,
+                "pid": proc.pid,
                 "proc": proc,
                 "status": "running",
-                "started_at": self._now(),
+                "started_at": time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime()),
                 "ended_at": None,
                 "returncode": None,
-                "log_path": log_path,
+                "log_path": str(log_path),
             }
-
-            return True, self._job_payload()
-
-    def pause(self):
-        if not hasattr(signal, "SIGSTOP"):
-            return False, self.active()
-
-        return self._send_signal("paused", signal.SIGSTOP)
-
-    def resume(self):
-        if not hasattr(signal, "SIGCONT"):
-            return False, self.active()
-
-        return self._send_signal("running", signal.SIGCONT)
+            return True, self._payload()
 
     def kill(self, force=False):
-        sig = signal.SIGKILL if force else signal.SIGTERM
-        return self._send_signal("canceling", sig)
-
-    def log(self, tail_bytes=65536):
         with self.lock:
-            if not self.job:
-                return ""
-
-            path = self.job["log_path"]
-
-        if not path.exists():
-            return ""
-
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            size = handle.tell()
-            handle.seek(max(0, size - tail_bytes))
-            return handle.read().decode(errors="replace")
-
-    def _send_signal(self, next_status, sig):
-        with self.lock:
-            current = self._job_payload()
-
+            current = self._payload()
             if not current["active"]:
                 return False, current
 
-            proc = self.job["proc"]
-
             try:
+                sig = signal.SIGKILL if force else signal.SIGTERM
                 if hasattr(os, "killpg"):
-                    os.killpg(os.getpgid(proc.pid), sig)
+                    os.killpg(os.getpgid(self.job["pid"]), sig)
                 else:
-                    proc.send_signal(sig)
+                    self.job["proc"].send_signal(sig)
             except ProcessLookupError:
-                return False, self._job_payload()
+                return False, self._payload()
 
-            self.job["status"] = next_status
-            return True, self._job_payload()
+            self.job["status"] = "canceling"
+            return True, self._payload()
 
-    def _now(self):
-        return __import__("time").strftime("%Y-%m-%dT%H-%M-%SZ", __import__("time").gmtime())
+    def log(self, tail_bytes=65536):
+        with self.lock:
+            path = Path(self.job["log_path"]) if self.job else None
+        if not path or not path.exists():
+            return ""
+        with path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            handle.seek(max(0, handle.tell() - tail_bytes))
+            return handle.read().decode(errors="replace")
 
 
 class AutoevalHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, server_address, handler_class, manager, allow_origins=None):
+    def __init__(self, server_address, handler_class, default_project=None, allow_origins=None):
         super().__init__(server_address, handler_class)
-        self.manager = manager
+        self.default_project = default_project
+        self.managers = {}
         self.allow_origins = set(allow_origins or [])
+
+    def project_root(self, raw=None):
+        projects = list_registered_projects()
+        if not projects:
+            raise ValueError("no autoeval projects registered; run `autoeval init <project_name>` first")
+
+        selected = raw or self.default_project or next((item["project_id"] for item in projects if item["exists"]), None)
+        for item in projects:
+            if item["project_id"] == selected:
+                if not item["exists"]:
+                    raise ValueError(f"registered project is missing or invalid: {item['path']}")
+                root = Path(item["path"])
+                register_project(root)
+                return root
+
+        raise ValueError(f"unknown autoeval project: {selected}")
+
+    def selected_project_id(self, raw=None):
+        return project_id(self.project_root(raw))
+
+    def manager(self, root):
+        key = project_id(root)
+        if key not in self.managers:
+            self.managers[key] = RunManager(root)
+        return self.managers[key]
 
 
 class AutoevalHandler(BaseHTTPRequestHandler):
@@ -273,166 +148,136 @@ class AutoevalHandler(BaseHTTPRequestHandler):
 
     def do_OPTIONS(self):
         self.send_response(204)
-        self._send_common_headers()
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+        self._headers()
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
     def do_GET(self):
-        try:
-            self._handle_get()
-        except Exception as exc:
-            self._json({"error": str(exc)}, status=500)
+        self._dispatch(self._get)
 
     def do_POST(self):
-        if not self._origin_allowed():
-            self._json({"error": "origin not allowed"}, status=403)
-            return
-
-        try:
-            self._handle_post()
-        except Exception as exc:
-            self._json({"error": str(exc)}, status=500)
+        self._dispatch(self._post, check_origin=True)
 
     def do_PUT(self):
-        if not self._origin_allowed():
-            self._json({"error": "origin not allowed"}, status=403)
+        self._dispatch(self._put, check_origin=True)
+
+    def do_PATCH(self):
+        self._dispatch(self._patch, check_origin=True)
+
+    def _dispatch(self, handler, check_origin=False):
+        if check_origin and not self._origin_allowed():
+            self._json({"error": "origin not allowed"}, 403)
             return
-
         try:
-            self._handle_put()
+            handler()
         except Exception as exc:
-            self._json({"error": str(exc)}, status=500)
+            self._json({"error": str(exc)}, 500)
 
-    def _handle_get(self):
+    def _get(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
+        path = parsed.path
+        if path == "/api/health":
+            return self._json({"ok": True})
+        if path == "/api/projects":
+            raw = query.get("project_id", [""])[0] or None
+            projects = list_registered_projects()
+            selected = self.server.selected_project_id(raw) if any(item["exists"] for item in projects) else None
+            return self._json({
+                "projects": projects,
+                "selected_project_id": selected,
+            })
+        if not path.startswith("/api/"):
+            return self._static(path)
 
-        if parsed.path == "/api/health":
-            self._json({"ok": True})
-            return
+        root = self._project_root(query)
+        manager = self.server.manager(root)
 
-        if parsed.path == "/api/workspace":
-            root = project_root()
-            self._json(
-                {
-                    "root": str(root),
-                }
-            )
-            return
+        if path == "/api/workspace":
+            return self._json(workspace(root))
+        if path == "/api/runs":
+            return self._json({"runs": list_runs(clamp(query.get("limit", [20])[0]), root)})
+        if path == "/api/status":
+            return self._json({
+                "run": manager.active(),
+                "runs": list_runs(clamp(query.get("limit", [20])[0]), root),
+            })
+        if path == "/api/script/params":
+            return self._json(read_script_params(root))
+        if path == "/api/report/instruction":
+            return self._json(report_instruction(root))
+        if path == "/api/run/source":
+            run_id = query.get("run_id", [""])[0]
+            if not run_id:
+                return self._json({"error": "run_id is required"}, 400)
+            return self._json(run_source(run_id, root))
+        if path == "/api/run/report":
+            run_id = query.get("run_id", [""])[0]
+            if not run_id:
+                return self._json({"error": "run_id is required"}, 400)
+            return self._json(run_report(run_id, root))
+        if path == "/api/run/log":
+            return self._json({"log": manager.log(clamp(query.get("tail_bytes", [65536])[0], default=65536, maximum=1048576))})
+        self._static(path)
 
-        if parsed.path == "/api/runs":
-            limit = clamp_limit(query.get("limit", [20])[0])
-            self._json({"runs": list_runs(limit, root=project_root())})
-            return
+    def _post(self):
+        path = urlparse(self.path).path
+        body = self._body({})
 
-        if parsed.path == "/api/status":
-            limit = clamp_limit(query.get("limit", [20])[0])
-            self._json(
-                {
-                    "run": self.server.manager.active(),
-                    "runs": list_runs(limit, root=project_root()),
-                }
-            )
-            return
+        if path == "/api/run/start":
+            root = self._project_root(body)
+            run_id = body.get("run_id")
+            if run_id is not None and not isinstance(run_id, str):
+                return self._json({"error": "run_id must be a string"}, 400)
+            ok, payload = self.server.manager(root).start(run_id)
+            return self._json(payload, 202 if ok else 409)
+        if path == "/api/run/kill":
+            root = self._project_root(body)
+            ok, payload = self.server.manager(root).kill(bool(body.get("force")))
+            return self._json(payload, 202 if ok else 409)
+        self._json({"error": "not found"}, 404)
 
-        if parsed.path == "/api/versions":
-            limit = clamp_limit(query.get("limit", [50])[0], default=50)
-            self._json({"versions": list_versions(limit, root=project_root())})
-            return
+    def _patch(self):
+        if urlparse(self.path).path != "/api/script/file":
+            return self._json({"error": "not found"}, 404)
 
-        if parsed.path == "/api/input/params":
-            self._json(read_input_params())
-            return
+        body = self._body({})
+        rel = body.get("path")
+        text = body.get("text")
+        if not isinstance(rel, str) or not rel:
+            return self._json({"error": "path is required"}, 400)
+        if not isinstance(text, str):
+            return self._json({"error": "text must be a string"}, 400)
 
-        if parsed.path == "/api/run/active":
-            self._json(self.server.manager.active())
-            return
+        run_id = body.get("run_id")
+        if run_id is not None and not isinstance(run_id, str):
+            return self._json({"error": "run_id must be a string"}, 400)
+        save_as = body.get("save_as")
+        if save_as is not None and not isinstance(save_as, str):
+            return self._json({"error": "save_as must be a string"}, 400)
 
-        if parsed.path == "/api/run/log":
-            tail = clamp_limit(query.get("tail_bytes", [65536])[0], default=65536, maximum=1048576)
-            self._json({"log": self.server.manager.log(tail)})
-            return
+        self._json(save_script_file(rel, text, self._project_root(body), run_id, save_as))
 
-        self._json({"error": "not found"}, status=404)
+    def _put(self):
+        if urlparse(self.path).path != "/api/script/params":
+            return self._json({"error": "not found"}, 404)
 
-    def _handle_post(self):
-        parsed = urlparse(self.path)
-        body = self._read_json_body(default={})
+        body = self._body()
+        params = body.get("params") if isinstance(body, dict) and "params" in body else body
+        if not isinstance(params, dict):
+            return self._json({"error": "params must be a JSON object"}, 400)
 
-        if parsed.path == "/api/run/start":
-            started, payload = self.server.manager.start(force=bool(body.get("force")))
-            self._json(payload, status=202 if started else 409)
-            return
+        self._json(write_script_params(params, self._project_root(body if isinstance(body, dict) else {})))
 
-        if parsed.path == "/api/run/pause":
-            ok, payload = self.server.manager.pause()
-            self._json(payload, status=202 if ok else 409)
-            return
+    def _project_root(self, data):
+        raw = data.get("project_id", [""])[0] if isinstance(data, dict) and isinstance(data.get("project_id"), list) else data.get("project_id") if isinstance(data, dict) else None
+        return self.server.project_root(raw or None)
 
-        if parsed.path == "/api/run/resume":
-            ok, payload = self.server.manager.resume()
-            self._json(payload, status=202 if ok else 409)
-            return
-
-        if parsed.path == "/api/run/kill":
-            ok, payload = self.server.manager.kill(force=bool(body.get("force")))
-            self._json(payload, status=202 if ok else 409)
-            return
-
-        if parsed.path == "/api/storage":
-            label = body.get("label")
-            message = body.get("message") or "autoeval storage"
-            root = project_root()
-            hashes = compute_hashes(root)
-            created_at = now()
-            commit, committed = git_commit_storage(message, root=root)
-            inserted = upsert_stage_versions(hashes, commit, created_at, label=label, root=root)
-
-            self._json(
-                {
-                    "storage_commit": commit,
-                    "committed": committed,
-                    "hashes": hashes,
-                    "versions": {
-                        stage: "stored" if inserted[stage] else "existing"
-                        for stage in STAGES
-                    },
-                },
-                status=201 if committed else 200,
-            )
-            return
-
-        self._json({"error": "not found"}, status=404)
-
-    def _handle_put(self):
-        parsed = urlparse(self.path)
-
-        if parsed.path == "/api/input/params":
-            body = self._read_json_body()
-
-            if not isinstance(body, dict):
-                self._json({"error": "request body must be a JSON object"}, status=400)
-                return
-
-            params = body.get("params") if set(body) == {"params"} else body
-
-            if not isinstance(params, dict):
-                self._json({"error": "params must be a JSON object"}, status=400)
-                return
-
-            write_json(project_root() / "input" / "params.json", params)
-            self._json(read_input_params())
-            return
-
-        self._json({"error": "not found"}, status=404)
-
-    def _read_json_body(self, default=None):
+    def _body(self, default=None):
         length = int(self.headers.get("Content-Length", "0"))
-
         if length == 0:
             return default
-
         try:
             return json.loads(self.rfile.read(length).decode())
         except json.JSONDecodeError as exc:
@@ -440,63 +285,71 @@ class AutoevalHandler(BaseHTTPRequestHandler):
 
     def _origin_allowed(self):
         origin = self.headers.get("Origin")
-
-        if not origin:
-            return True
-
         host = self.headers.get("Host")
-        same_origin = host and origin == f"http://{host}"
-
-        return same_origin or origin in self.server.allow_origins
+        return not origin or (host and origin == f"http://{host}") or origin in self.server.allow_origins
 
     def _json(self, payload, status=200):
         body = json.dumps(payload, indent=2).encode()
         self.send_response(status)
-        self._send_common_headers()
+        self._headers()
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
 
-    def _send_common_headers(self):
+    def _headers(self):
         self.send_header("Cache-Control", "no-store")
-
         origin = self.headers.get("Origin")
-
-        if origin and (origin in self.server.allow_origins or self._origin_allowed()):
+        if origin and self._origin_allowed():
             self.send_header("Access-Control-Allow-Origin", origin)
             self.send_header("Vary", "Origin")
+
+    def _static(self, path):
+        rel = "index.html" if path in {"", "/"} else path.lstrip("/")
+        target = (UI_DIR / rel).resolve()
+
+        if not str(target).startswith(str(UI_DIR.resolve())) or not target.is_file():
+            target = UI_DIR / "index.html"
+
+        if not target.is_file():
+            return self._json({"error": "not found"}, 404)
+
+        body = target.read_bytes()
+        content_type = "text/javascript" if target.suffix == ".jsx" else (mimetypes.guess_type(target.name)[0] or "application/octet-stream")
+        self.send_response(200)
+        self._headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def log_message(self, fmt, *args):
         print(f"{self.address_string()} - {fmt % args}", file=sys.stderr)
 
 
-def read_input_params():
-    root = project_root()
-    schema_path = root / "input" / "params.schema.json"
-    params_path = root / "input" / "params.json"
+def view(host, port, allow_origins=None, project=None):
+    warn_docker_unavailable()
+    default_project = None
+    if project:
+        root = Path(project).expanduser()
+        if is_project_root(root):
+            default_project = register_project(root)["project_id"]
+        else:
+            default_project = project
 
-    return {
-        "schema": read_json(schema_path) if schema_path.exists() else None,
-        "params": read_json(params_path) if params_path.exists() else None,
-    }
+    for item in list_registered_projects():
+        if item["exists"]:
+            root = Path(item["path"])
+            require_autoeval_git_repo(root)
+            init_db(root)
 
-
-def serve(host, port, allow_origins=None):
-    root = ensure_workspace()
-    ensure_workspace_contract(root)
-    ensure_autoeval_git_repo(root)
-    init_db(root)
-
-    manager = RunManager(root)
     server = AutoevalHTTPServer(
         (host, port),
         AutoevalHandler,
-        manager=manager,
+        default_project=default_project,
         allow_origins=allow_origins,
     )
-
-    print(f"serving Autoeval API on http://{host}:{server.server_port}")
+    print(f"serving Autoeval view on http://{host}:{server.server_port}")
 
     try:
         server.serve_forever()

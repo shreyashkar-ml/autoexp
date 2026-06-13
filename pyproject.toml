@@ -33,6 +33,14 @@ autoeval = "autoeval.cli:main"
 Homepage = "https://github.com/shreyashkar-ml/autoeval"
 Issues = "https://github.com/shreyashkar-ml/autoeval/issues"
 
+[tool.setuptools]
+packages = ["autoeval", "autoeval.ui", "autoeval.ui.assets"]
+
+[tool.setuptools.package-data]
+autoeval = ["instruction.txt", "report.txt"]
+"autoeval.ui" = ["index.html"]
+"autoeval.ui.assets" = ["*.css", "*.js"]
+
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"

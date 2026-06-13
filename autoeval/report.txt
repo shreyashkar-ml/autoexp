@@ -1,0 +1,9 @@
+Generate a detailed scientific report for experimentation, include analytical observations, first principles explanation of phenomenon and observations.
+Give a detailed technical report on-par with scientific review literature, include section-wise topics for detailed breakdowns, include mathematical details derived from first principles wherever needed.
+Give a concluding perspective on the experimentation.
+
+Use `runs/<run_id>/report/report_bundle.json` as the source of truth for report context. The bundle contains the run id, script name, non-secret script params, available `app.env` variable names, run metadata, output artifacts, logs, and the expected report directory.
+
+Write generated report files under `runs/<run_id>/report/`. Prefer `runs/<run_id>/report/report.md` for the main report unless the user asks for a different filename or format.
+
+Do not assume access to secret values. The bundle intentionally includes environment variable names only. Base the report only on the bundled artifacts and the user's request.
