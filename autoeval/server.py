@@ -11,8 +11,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .project import is_project_root, init_db, list_registered_projects, now, project_id, register_project, require_autoeval_git_repo, warn_docker_unavailable
-from .runtime import list_runs, read_script_params, report_instruction, run_report, run_source, save_script_file, workspace, write_script_params
+from .project import is_project_root, init_db, list_registered_projects, now, project_id, register_project, report_instruction, require_autoeval_git_repo, resolve_registered_project, warn_docker_unavailable, write_report_instruction
+from .runtime import list_runs, read_script_params, run_report, run_source, save_script_file, workspace, write_script_params
 
 
 UI_DIR = Path(__file__).with_name("ui")
@@ -118,20 +118,7 @@ class AutoevalHTTPServer(ThreadingHTTPServer):
         self.allow_origins = set(allow_origins or [])
 
     def project_root(self, raw=None):
-        projects = list_registered_projects()
-        if not projects:
-            raise ValueError("no autoeval projects registered; run `autoeval init <project_name>` first")
-
-        selected = raw or self.default_project or next((item["project_id"] for item in projects if item["exists"]), None)
-        for item in projects:
-            if item["project_id"] == selected:
-                if not item["exists"]:
-                    raise ValueError(f"registered project is missing or invalid: {item['path']}")
-                root = Path(item["path"])
-                register_project(root)
-                return root
-
-        raise ValueError(f"unknown autoeval project: {selected}")
+        return resolve_registered_project(raw or self.default_project)
 
     def selected_project_id(self, raw=None):
         return project_id(self.project_root(raw))
@@ -260,7 +247,16 @@ class AutoevalHandler(BaseHTTPRequestHandler):
         self._json(save_script_file(rel, text, self._project_root(body), run_id, save_as))
 
     def _put(self):
-        if urlparse(self.path).path != "/api/script/params":
+        path = urlparse(self.path).path
+
+        if path == "/api/report/instruction":
+            body = self._body({})
+            text = body.get("text") if isinstance(body, dict) else None
+            if not isinstance(text, str):
+                return self._json({"error": "text must be a string"}, 400)
+            return self._json(write_report_instruction(text, self._project_root(body)))
+
+        if path != "/api/script/params":
             return self._json({"error": "not found"}, 404)
 
         body = self._body()

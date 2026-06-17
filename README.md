@@ -35,6 +35,7 @@ demo_eval/
   app.env
   autoeval.json
   autoeval.md
+  report.txt
   index.sqlite
   script/
     stage.json
@@ -125,7 +126,15 @@ Generated reports should be written under:
 runs/<run_id>/report/
 ```
 
-Use a project-specific report instruction file with:
+Each project starts with an editable report instruction file:
+
+```text
+report.txt
+```
+
+Edit this file from your editor or from the UI when the domain, audience, report structure, or evaluation criteria changes. Generated report output can contain more than one file, including markdown, images, tables, or other assets.
+
+Point Autoeval to a different project-local report instruction file with:
 
 ```bash
 autoeval report-instruction path/to/report.md
@@ -153,7 +162,7 @@ Install thin adapter files for coding agents:
 autoeval agent install --target all
 ```
 
-This writes `AGENTS.md`, `CLAUDE.md`, and `.mcp.json` unless they already exist. These files point agents to `autoeval.md` and the local MCP server.
+This writes `AGENTS.md` and `.mcp.json` unless they already exist. `AGENTS.md` is the generic adapter used by coding agents that read that convention. Use `--target claude` when you specifically want `CLAUDE.md`.
 
 Start the MCP server:
 
@@ -175,6 +184,6 @@ autoeval diff <run_a> <run_b>
 autoeval report-instruction [path]
 autoeval view
 autoeval doctor
-autoeval agent install --target all
+autoeval agent install [--target claude|all]
 autoeval mcp
 ```

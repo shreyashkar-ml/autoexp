@@ -14,6 +14,7 @@ from pathlib import Path
 
 PROJECT_CONFIG = "autoeval.json"
 PROJECT_INSTRUCTIONS = "autoeval.md"
+PROJECT_REPORT_INSTRUCTIONS = "report.txt"
 APP_ENV = "app.env"
 BUILTIN_REPORT_INSTRUCTIONS = Path(__file__).with_name("report.txt")
 AUTOEVAL_GIT_DIR = ".autoeval/git"
@@ -206,6 +207,22 @@ def ignored(rel, patterns):
     return False
 
 
+def storage_paths(root=None):
+    root = project_root() if root is None else Path(root)
+    paths = list(STORAGE_PATHS)
+    config_path = root / PROJECT_CONFIG
+    configured = PROJECT_REPORT_INSTRUCTIONS
+
+    if config_path.is_file():
+        configured = read_json(config_path).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
+
+    report_path = Path(configured)
+    if not report_path.is_absolute() and ".." not in report_path.parts and report_path.name:
+        paths.insert(-1, report_path.as_posix())
+
+    return tuple(paths)
+
+
 def hash_dir(path):
     h = hashlib.sha256()
     root = path.parent
@@ -321,13 +338,16 @@ def app_env_keys(root=None):
 
 def report_instruction(root=None):
     root = project_root() if root is None else Path(root)
-    configured = read_json(root / PROJECT_CONFIG).get("report_instruction_file")
+    configured = read_json(root / PROJECT_CONFIG).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
+    configured_path = Path(configured)
+    if configured_path.is_absolute() or ".." in configured_path.parts or not configured_path.name:
+        raise ValueError("report instruction file must stay inside the autoeval project")
 
-    if configured:
-        path = root / configured
-        return {"source": str(path.relative_to(root)), "text": path.read_text()}
+    path = root / configured_path
+    if not path.is_file():
+        raise FileNotFoundError(f"missing report instruction file: {configured}")
 
-    return {"source": "builtin:report.txt", "text": BUILTIN_REPORT_INSTRUCTIONS.read_text()}
+    return {"source": str(path.relative_to(root)), "text": path.read_text()}
 
 
 def set_report_instruction(path, root=None):
@@ -339,6 +359,8 @@ def set_report_instruction(path, root=None):
             path = path.relative_to(root)
         except ValueError:
             die("report instruction file must live inside the autoeval project")
+    if ".." in path.parts or not path.name:
+        die("report instruction file must live inside the autoeval project")
 
     if not (root / path).is_file():
         die(f"missing report instruction file: {path}")
@@ -347,6 +369,26 @@ def set_report_instruction(path, root=None):
     cfg["report_instruction_file"] = path.as_posix()
     write_json(root / PROJECT_CONFIG, cfg)
     return path.as_posix()
+
+
+def write_report_instruction(text, root=None):
+    if not isinstance(text, str):
+        raise ValueError("text must be a string")
+
+    root = project_root() if root is None else Path(root)
+    cfg = read_json(root / PROJECT_CONFIG)
+    path = Path(cfg.get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS)
+
+    if path.is_absolute() or ".." in path.parts or not path.name:
+        raise ValueError("report instruction file must stay inside the autoeval project")
+
+    target = root / path
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(text)
+    if cfg.get("report_instruction_file") != path.as_posix():
+        cfg["report_instruction_file"] = path.as_posix()
+        write_json(root / PROJECT_CONFIG, cfg)
+    return report_instruction(root)
 
 
 def artifact_files(base):
@@ -578,8 +620,10 @@ def copy_run_source(src_root, run_root):
     if script_target.exists():
         shutil.rmtree(script_target)
     shutil.copytree(Path(src_root) / "script", script_target)
-    for path in STORAGE_PATHS[1:]:
-        shutil.copy2(Path(src_root) / path, run_root / path)
+    for path in storage_paths(src_root)[1:]:
+        target = run_root / path
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(Path(src_root) / path, target)
 
 
 def source_root_for_run(run, root=None):
@@ -810,12 +854,13 @@ def git_status(paths, root=None):
 
 
 def git_commit_storage(message, root=None):
-    autoeval_git(["add", *STORAGE_PATHS], root=root)
+    paths = storage_paths(root)
+    autoeval_git(["add", *paths], root=root)
 
-    if not autoeval_git(["diff", "--cached", "--name-only", "--", *STORAGE_PATHS], root=root, capture=True):
+    if not autoeval_git(["diff", "--cached", "--name-only", "--", *paths], root=root, capture=True):
         return current_autoeval_commit(root), False
 
-    autoeval_git(["commit", "-m", message, "--", *STORAGE_PATHS], root=root)
+    autoeval_git(["commit", "-m", message, "--", *paths], root=root)
     return current_autoeval_commit(root), True
 
 
@@ -838,19 +883,16 @@ def restore_run_state(run_id, root=None):
     root = project_root() if root is None else Path(root)
     require_autoeval_git_repo(root)
 
-    if git_status(STORAGE_PATHS, root=root):
+    if git_status(storage_paths(root), root=root):
         die("refusing to restore run state over unstored script/config changes")
 
     run = get_run(run_id, root)
     source_root = source_root_for_run(run, root)
 
     if source_root != root:
-        shutil.rmtree(root / "script")
-        shutil.copytree(source_root / "script", root / "script")
-        for path in STORAGE_PATHS[1:]:
-            shutil.copy2(source_root / path, root / path)
+        copy_run_source(source_root, root)
     else:
-        autoeval_git(["checkout", run_stage_commit(run), "--", *STORAGE_PATHS], root=root)
+        autoeval_git(["checkout", run_stage_commit(run), "--", *storage_paths(root)], root=root)
 
     if run.get("unstored_stage_changes"):
         print("note: restored a run that used unstored script/config changes.", file=sys.stderr)
@@ -883,7 +925,7 @@ def write_default_project(root, title):
 
     write_json(
         root / PROJECT_CONFIG,
-        {"title": title, "description": "", "runner": "auto", "sandbox": {"image": "python:3.12-slim", "network": "none", "cpus": "1", "memory": "512m"}, "runtime": {}, "report_instruction_file": None},
+        {"title": title, "description": "", "runner": "auto", "sandbox": {"image": "python:3.12-slim", "network": "none", "cpus": "1", "memory": "512m"}, "runtime": {}, "report_instruction_file": PROJECT_REPORT_INSTRUCTIONS},
     )
     write_json(root / "script" / "stage.json", {"name": "script", "command": "python script.py --ctx ${CTX}", "working_dir": "script", "interface_version": "1"})
     write_json(root / "script" / "params.json", {"message": "hello from script params"})
@@ -893,6 +935,7 @@ def write_default_project(root, title):
     )
     (root / "script" / "script.py").write_text(DEFAULT_SCRIPT)
     (root / PROJECT_INSTRUCTIONS).write_text(INSTRUCTION_FILE.read_text())
+    (root / PROJECT_REPORT_INSTRUCTIONS).write_text(BUILTIN_REPORT_INSTRUCTIONS.read_text())
     (root / APP_ENV).write_text(
         "# Project-local environment for Autoeval runs.\n# Values here are passed to the runner and are not stored by Autoeval.\nAUTOEVAL_MESSAGE=hello from app.env\n"
     )
@@ -917,7 +960,7 @@ def create_project(root, title):
         autoeval_git(["config", "user.email", "autoeval@local"], root=root)
 
     init_db(root)
-    autoeval_git(["add", *STORAGE_PATHS], root=root)
+    autoeval_git(["add", *storage_paths(root)], root=root)
     autoeval_git(["commit", "-m", "autoeval init"], root=root)
     return root
 

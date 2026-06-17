@@ -1,5 +1,4 @@
 import json
-import shutil
 import subprocess
 import sys
 import uuid
@@ -10,7 +9,6 @@ from .project import (
     PROJECT_CONFIG,
     PROJECT_INSTRUCTIONS,
     RUN_CONTEXT,
-    STORAGE_PATHS,
     artifact_files,
     autoeval_git,
     compute_hashes,
@@ -33,13 +31,10 @@ from .project import (
     require_autoeval_git_repo,
     docker_ready,
     restore_run_state,
-    run_script,
     run_stage_commit,
     script_manifest,
-    script_name,
-    set_report_instruction,
     source_root_for_run,
-    update_run,
+    storage_paths,
     upsert_stage_versions,
     write_json,
     write_report_bundle,
@@ -326,7 +321,7 @@ def diff_runs(run_a, run_b, root=None):
     root = project_root() if root is None else Path(root)
     a = get_run(run_a, root)
     b = get_run(run_b, root)
-    return autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *STORAGE_PATHS], root=root, capture=True, check=False)
+    return autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *storage_paths(root)], root=root, capture=True, check=False)
 
 
 def run_autoeval(run_id=None, root=None):

@@ -17,6 +17,17 @@ type Panel =
 
 type JobState = { active: boolean; job: { status?: string } | null };
 
+const EDITOR_OPTIONS = {
+  automaticLayout: true,
+  minimap: { enabled: false },
+  scrollBeyondLastLine: false,
+  wordWrap: "on",
+  fontSize: 13,
+  lineNumbersMinChars: 3,
+  overviewRulerBorder: false,
+  renderLineHighlight: "none",
+} as const;
+
 function statusLabel(status: string) {
   return status === "success" ? "completed" : status || "unknown";
 }
@@ -141,35 +152,16 @@ export default function App() {
     return () => window.clearInterval(timer);
   }, [selectedProjectId]);
 
-  async function startRun() {
+  async function startRun(run?: Run) {
     if (!selectedProjectId) return;
-    setLoading("start");
+    if (run) setSelectedRun(run.run_id);
+    setLoading(run ? `trigger:${run.run_id}` : "start");
     setError("");
     try {
       const data = await api<JobState>("/api/run/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: selectedProjectId }),
-      });
-      setActiveJob(data);
-      await loadRuns();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading("");
-    }
-  }
-
-  async function triggerRun(run: Run) {
-    if (!selectedProjectId) return;
-    setSelectedRun(run.run_id);
-    setLoading(`trigger:${run.run_id}`);
-    setError("");
-    try {
-      const data = await api<JobState>("/api/run/start", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: selectedProjectId, run_id: run.run_id }),
+        body: JSON.stringify({ project_id: selectedProjectId, ...(run ? { run_id: run.run_id } : {}) }),
       });
       setActiveJob(data);
       await loadRuns();
@@ -251,6 +243,16 @@ export default function App() {
     return result;
   }
 
+  async function saveInstruction(text: string) {
+    const data = await api<InstructionPayload>("/api/report/instruction", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: selectedProjectId, text }),
+    });
+    setPanel({ kind: "instruction", data });
+    return data;
+  }
+
   const filteredRuns = runs.filter((run) => {
     const haystack = `${run.run_id} ${run.status} ${run.script_name || ""} ${run.report_path || ""} ${(run.output_files || []).join(" ")}`.toLowerCase();
     return haystack.includes(query.toLowerCase());
@@ -320,7 +322,7 @@ export default function App() {
                   Stop
                 </Button>
               ) : (
-                <Button onClick={startRun} disabled={loading === "start" || !selectedProject.exists}>
+                <Button onClick={() => startRun()} disabled={loading === "start" || !selectedProject.exists}>
                   <Play className="h-4 w-4" />
                   Run
                 </Button>
@@ -375,11 +377,11 @@ export default function App() {
               onSelect={setSelectedRun}
               onScript={openScript}
               onReport={openReport}
-              onTrigger={triggerRun}
+              onTrigger={startRun}
             />
           </div>
           {panel ? <SplitHandle value={split} onChange={setSplit} /> : null}
-          {panel ? <Viewer panel={panel} theme={theme} onSaveScript={saveScriptFile} onClose={() => setPanel(null)} /> : null}
+          {panel ? <Viewer panel={panel} theme={theme} onSaveScript={saveScriptFile} onSaveInstruction={saveInstruction} onClose={() => setPanel(null)} /> : null}
         </section>
       </div>
     </main>
@@ -536,7 +538,7 @@ function RunsTable({
           ))}
           {!runs.length ? (
             <TableRow>
-              <TableCell colSpan={5} className="h-16 text-left text-muted-foreground">
+              <TableCell colSpan={6} className="h-16 text-left text-muted-foreground">
                 No runs yet.
               </TableCell>
             </TableRow>
@@ -551,11 +553,13 @@ function Viewer({
   panel,
   theme,
   onSaveScript,
+  onSaveInstruction,
   onClose,
 }: {
   panel: Panel;
   theme: "light" | "dark";
   onSaveScript: (runId: string, path: string, text: string, saveAs: string) => Promise<{ path: string; run: Run }>;
+  onSaveInstruction: (text: string) => Promise<InstructionPayload>;
   onClose: () => void;
 }) {
   const title =
@@ -584,9 +588,71 @@ function Viewer({
           />
         ) : null}
         {panel.kind === "report" ? <MarkdownViewer path={panel.data.path} text={panel.data.text} /> : null}
-        {panel.kind === "instruction" ? <MarkdownViewer path={panel.data.source} text={panel.data.text} /> : null}
+        {panel.kind === "instruction" ? <InstructionEditor data={panel.data} theme={theme} onSave={onSaveInstruction} /> : null}
       </div>
     </aside>
+  );
+}
+
+function InstructionEditor({
+  data,
+  theme,
+  onSave,
+}: {
+  data: InstructionPayload;
+  theme: "light" | "dark";
+  onSave: (text: string) => Promise<InstructionPayload>;
+}) {
+  const [draft, setDraft] = useState(data.text);
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+
+  useEffect(() => {
+    setDraft(data.text);
+    setEditing(false);
+    setSaving(false);
+  }, [data]);
+
+  const changed = draft !== data.text;
+
+  async function save() {
+    if (!changed) return;
+    setSaving(true);
+    try {
+      await onSave(draft);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="flex h-full min-h-[520px] flex-col">
+      <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
+        <div className="mono min-w-0 flex-1 truncate text-sm text-muted-foreground">{data.source}</div>
+        <div className="ml-auto flex items-center gap-2">
+          <Button variant="outline" size="icon" onClick={() => setEditing(true)} disabled={editing} aria-label="Edit report instruction">
+            <Edit3 className="h-4 w-4" />
+          </Button>
+          {changed ? (
+            <Button size="icon" onClick={save} disabled={saving} aria-label="Save report instruction">
+              <Save className="h-4 w-4" />
+            </Button>
+          ) : null}
+        </div>
+      </div>
+      <Editor
+        height="100%"
+        language="markdown"
+        theme={theme === "dark" ? "vs-dark" : "light"}
+        value={draft}
+        onChange={(value) => setDraft(value || "")}
+        options={{
+          ...EDITOR_OPTIONS,
+          readOnly: !editing,
+        }}
+      />
+    </div>
   );
 }
 
@@ -634,7 +700,7 @@ function SourceViewer({
     if (!changed) return;
     setSaving(true);
     try {
-    const result = await onSave(file.path, draft, saveAs || nextScriptPath(file.path, files));
+      const result = await onSave(file.path, draft, saveAs || nextScriptPath(file.path, files));
       setFiles((current) =>
         current.some((item) => item.path === result.path)
           ? current.map((item) => item.path === result.path ? { ...item, text: draft } : item)
@@ -693,15 +759,8 @@ function SourceViewer({
         value={draft}
         onChange={(value) => setDraft(value || "")}
         options={{
-          automaticLayout: true,
-          minimap: { enabled: false },
+          ...EDITOR_OPTIONS,
           readOnly: !editing,
-          scrollBeyondLastLine: false,
-          wordWrap: "on",
-          fontSize: 13,
-          lineNumbersMinChars: 3,
-          overviewRulerBorder: false,
-          renderLineHighlight: "none",
         }}
       />
     </div>

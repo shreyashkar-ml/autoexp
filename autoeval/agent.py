@@ -39,13 +39,13 @@ def write_if_allowed(path, text, force=False):
 
 def install_agent_files(target="all", force=False, root=None):
     root = project_root() if root is None else Path(root)
-    if target not in {"codex", "claude", "all"}:
-        raise ValueError("target must be codex, claude, or all")
+    if target not in {"claude", "all"}:
+        raise ValueError("target must be claude or all")
 
     written = []
-    if target in {"codex", "all"}:
+    if target == "all":
         written.append(write_if_allowed(root / "AGENTS.md", AGENTS_TEXT, force))
-    if target in {"claude", "all"}:
+    if target == "claude":
         written.append(write_if_allowed(root / "CLAUDE.md", CLAUDE_TEXT, force))
     written.append(write_if_allowed(root / ".mcp.json", json.dumps(mcp_config(), indent=2) + "\n", force))
     return {"target": target, "written": written}

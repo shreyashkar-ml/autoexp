@@ -7,7 +7,6 @@ from pathlib import Path
 from .agent import install_agent_files
 from .project import (
     RUN_CONTEXT,
-    STORAGE_PATHS,
     autoeval_git,
     compute_hashes,
     copy_run_source,
@@ -17,15 +16,12 @@ from .project import (
     die,
     find_duplicate_output_run,
     get_run,
-    git_commit_run,
-    git_commit_storage,
     git_status,
     hash_run_output,
     init_db,
     insert_run,
     is_project_root,
     new_run_id,
-    now,
     project_root,
     register_project,
     require_autoeval_git_repo,
@@ -39,13 +35,13 @@ from .project import (
     script_name,
     set_report_instruction,
     source_root_for_run,
+    storage_paths,
     update_run,
     warn_docker_unavailable,
-    upsert_stage_versions,
     write_report_bundle,
     write_json,
 )
-from .runtime import doctor
+from .runtime import doctor, storage as store
 
 
 def init_cmd(args):
@@ -82,7 +78,7 @@ def run_cmd(args):
 
     stage_commit = run_stage_commit(source_run) if source_run else current_autoeval_commit(root)
     unstored = bool(source_run and source_run.get("unstored_stage_changes"))
-    if not source_run and git_status(STORAGE_PATHS, root=root):
+    if not source_run and git_status(storage_paths(root), root=root):
         unstored = True
         print("note: executing unstored script/config changes; run `autoeval storage` to store them.", file=sys.stderr)
 
@@ -212,55 +208,20 @@ def hash_cmd(args):
 
 
 def storage_cmd(args):
-    root = project_root()
-    require_autoeval_git_repo(root)
-    init_db(root)
-    created_at = now()
-
+    result = store(args.run_id, args.label, args.message)
     if args.run_id:
-        run = get_run(args.run_id, root)
-        run_dir = root / (run.get("run_dir") or f"runs/{args.run_id}")
-        if not run_dir.exists():
-            die(f"missing run directory: {run_dir.relative_to(root)}")
-
-        run["output_hash"] = run.get("output_hash") or hash_run_output(run_dir)
-        run.update({"stored": True, "stored_at": created_at, "storage_label": args.label})
-        write_json(run_dir / "run.json", run)
-
-        conn = db(root)
-        exists = conn.execute("select 1 from runs where run_id = ?", (run["run_id"],)).fetchone()
-        conn.close()
-        if not exists:
-            insert_run(run, root=root)
-
-        commit, committed = git_commit_run(args.run_id, root=root)
-        conn = db(root)
-        conn.execute(
-            "update runs set stored = 1, stored_at = ?, storage_label = ?, git_commit = ?, output_hash = ? where run_id = ?",
-            (created_at, args.label, commit, run["output_hash"], args.run_id),
-        )
-        conn.commit()
-        conn.close()
-        write_report_bundle(args.run_id, root)
-        inserted = upsert_stage_versions(run, commit, created_at, label=args.label, root=root, metadata_root=source_root_for_run(run, root))
         print(f"run_id: {args.run_id}")
-    else:
-        hashes = compute_hashes(root)
-        commit, committed = git_commit_storage(args.message or "autoeval storage", root)
-        inserted = upsert_stage_versions(hashes, commit, created_at, label=args.label, root=root)
-        run = hashes
-
-    print(f"storage_commit: {commit}")
-    print(f"committed: {'yes' if committed else 'no'}")
-    print(f"script_hash: {run['script_hash']}")
-    print(f"capsule_hash: {run['capsule_hash']}")
-    print(f"script_version: {'stored' if inserted['script'] else 'existing'}")
+    print(f"storage_commit: {result['storage_commit']}")
+    print(f"committed: {'yes' if result['committed'] else 'no'}")
+    print(f"script_hash: {result['script_hash']}")
+    print(f"capsule_hash: {result['capsule_hash']}")
+    print(f"script_version: {result['script_version']}")
 
 
 def diff_cmd(args):
     a = get_run(args.run_a)
     b = get_run(args.run_b)
-    autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *STORAGE_PATHS], check=False)
+    autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *storage_paths()], check=False)
 
 
 def restore_cmd(args):
@@ -361,7 +322,7 @@ def build_parser():
     agent = sub.add_parser("agent")
     agent_sub = agent.add_subparsers(required=True)
     install = agent_sub.add_parser("install")
-    install.add_argument("--target", choices=("codex", "claude", "all"), default="all")
+    install.add_argument("--target", choices=("claude", "all"), default="all")
     install.add_argument("--force", action="store_true")
     install.set_defaults(fn=agent_install_cmd)
 

@@ -1,8 +1,7 @@
 import json
 import sys
-from pathlib import Path
 
-from .project import get_run, project_root, read_json, report_instruction as read_report_instruction, script_manifest, set_report_instruction as set_project_report_instruction
+from .project import get_run, project_root, read_json, report_instruction as read_report_instruction, script_manifest, set_report_instruction as set_project_report_instruction, write_report_instruction as write_project_report_instruction
 from .runtime import (
     diff_runs,
     list_runs,
@@ -61,6 +60,7 @@ TOOLS = {
     "read_report_bundle": {"description": "Read report_bundle.json for a run.", "schema": tool_schema({"run_id": {"type": "string"}}, ["run_id"])},
     "read_logs": {"description": "Read run logs.", "schema": tool_schema({"run_id": {"type": "string"}}, ["run_id"])},
     "report_instruction": {"description": "Read active report instruction.", "schema": tool_schema()},
+    "write_report_instruction": {"description": "Write active project report instruction text.", "schema": tool_schema({"text": {"type": "string"}}, ["text"])},
     "write_script_file": {
         "description": "Create a versioned run snapshot with edited script content.",
         "schema": tool_schema(
@@ -88,7 +88,7 @@ TOOLS = {
 PROMPTS = {
     "autoeval/improve-script": "Read autoeval.md, inspect recent runs and the selected run source, improve script behavior, save a versioned script snapshot, run Autoeval, then summarize run_id, status, output files, logs, and report path.",
     "autoeval/debug-failed-run": "Read autoeval.md, inspect the failed run metadata, logs, source, and report bundle. Identify the likely failure cause and propose or create a versioned script fix.",
-    "autoeval/write-report": "Read autoeval.md and report instructions. Use runs/{run_id}/report/report_bundle.json to write a report under that run's report directory.",
+    "autoeval/write-report": "Read autoeval.md and the active project report instruction. Use runs/{run_id}/report/report_bundle.json to write report artifacts under that run's report directory.",
 }
 
 
@@ -167,6 +167,8 @@ def call_tool(name, args):
         return read_logs(args["run_id"], root)
     if name == "report_instruction":
         return read_report_instruction(root)
+    if name == "write_report_instruction":
+        return write_project_report_instruction(args["text"], root)
     if name == "write_script_file":
         return save_script_file(args["path"], args["content"], root=root, source_run_id=args.get("run_id"), save_as=args.get("save_as"))
     if name == "write_script_params":
