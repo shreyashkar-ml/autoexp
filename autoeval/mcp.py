@@ -1,7 +1,9 @@
 import json
 import sys
 
-from .project import get_run, project_root, read_json, report_instruction as read_report_instruction, script_manifest, set_report_instruction as set_project_report_instruction, write_report_instruction as write_project_report_instruction
+from .reports import report_instruction as read_report_instruction, set_report_instruction as set_project_report_instruction, write_report_instruction as write_project_report_instruction
+from .runs import get_run
+from .workspace import project_root, read_json, script_manifest
 from .runtime import (
     diff_runs,
     list_runs,
@@ -14,7 +16,6 @@ from .runtime import (
     run_report,
     run_source,
     save_script_file,
-    storage,
     workspace,
     write_script_params,
 )
@@ -75,10 +76,6 @@ TOOLS = {
     },
     "write_script_params": {"description": "Write script/params.json.", "schema": tool_schema({"params": {"type": "object"}}, ["params"])},
     "set_report_instruction": {"description": "Configure project report instruction file.", "schema": tool_schema({"path": {"type": "string"}}, ["path"])},
-    "storage": {
-        "description": "Promote source or a run into Autoeval storage.",
-        "schema": tool_schema({"run_id": {"type": "string"}, "label": {"type": "string"}, "message": {"type": "string"}}),
-    },
     "run": {"description": "Run Autoeval through the same runtime path as the CLI.", "schema": tool_schema({"run_id": {"type": "string"}})},
     "diff_runs": {"description": "Diff source/config between two runs.", "schema": tool_schema({"run_a": {"type": "string"}, "run_b": {"type": "string"}}, ["run_a", "run_b"])},
     "restore_run": {"description": "Restore script/config from a run.", "schema": tool_schema({"run_id": {"type": "string"}}, ["run_id"])},
@@ -175,8 +172,6 @@ def call_tool(name, args):
         return write_script_params(args["params"], root)
     if name == "set_report_instruction":
         return {"path": set_project_report_instruction(args["path"], root)}
-    if name == "storage":
-        return storage(args.get("run_id"), args.get("label"), args.get("message"), root)
     if name == "run":
         return run_autoeval(args.get("run_id"), root)
     if name == "diff_runs":

@@ -4,41 +4,18 @@ import sys
 import uuid
 from pathlib import Path
 
-from .project import (
-    APP_ENV,
-    PROJECT_CONFIG,
-    PROJECT_INSTRUCTIONS,
-    RUN_CONTEXT,
-    artifact_files,
+from .reports import artifact_files, report_instruction, write_report_bundle
+from .runner import RUN_CONTEXT, compute_hashes, docker_ready, hash_run_output
+from .runs import copy_run_source, get_run, new_run_id, restore_run_state, run_stage_commit, source_root_for_run
+from .store import (
     autoeval_git,
-    compute_hashes,
-    copy_run_source,
     current_autoeval_commit,
     db,
-    get_run,
-    git_commit_run,
-    git_commit_storage,
-    hash_run_output,
     init_db,
     insert_run,
-    is_project_root,
-    new_run_id,
-    now,
-    project_entry,
-    project_root,
-    read_json,
-    report_instruction,
     require_autoeval_git_repo,
-    docker_ready,
-    restore_run_state,
-    run_stage_commit,
-    script_manifest,
-    source_root_for_run,
-    storage_paths,
-    upsert_stage_versions,
-    write_json,
-    write_report_bundle,
 )
+from .workspace import APP_ENV, PROJECT_CONFIG, PROJECT_INSTRUCTIONS, is_project_root, now, project_entry, project_root, read_json, script_manifest, source_paths, write_json
 
 
 def json_value(value):
@@ -81,8 +58,6 @@ def output_files_for_run(run, root):
 
 def run_row(row, root):
     run = dict(row)
-    run["stored"] = bool(run["stored"])
-    run["unstored_stage_changes"] = bool(run["unstored_stage_changes"])
     run["stage_status"] = json_value(run["stage_status"])
     run["report_path"] = report_path_for_run(run, root)
     run["output_files"] = output_files_for_run(run, root)
@@ -126,15 +101,16 @@ def run_source(run_id, root=None):
     files = []
 
     for item in sorted(base.rglob("*")):
-        if item.is_file():
+        rel = item.relative_to(base).as_posix()
+        if item.is_file() and rel not in {"stage.json", "params.json", "params.schema.json"}:
             files.append({
-                "path": item.relative_to(base).as_posix(),
+                "path": rel,
                 "text": item.read_text(errors="replace"),
             })
 
     selected = next((item["path"] for item in files if item["path"] == (run.get("script_name") or "")), "")
     if not selected:
-        selected = next((item["path"] for item in files if item["path"] not in {"stage.json", "params.json", "params.schema.json"}), files[0]["path"] if files else "")
+        selected = files[0]["path"] if files else ""
     return {"run_id": run_id, "script": run.get("script_name"), "selected": selected, "files": files}
 
 
@@ -250,11 +226,6 @@ def save_script_file(path, text, root=None, source_run_id=None, save_as=None):
         "script_name": saved_rel.as_posix(),
         **hashes,
         "stage_commit": current_autoeval_commit(root),
-        "unstored_stage_changes": True,
-        "git_commit": "",
-        "stored": False,
-        "stored_at": None,
-        "storage_label": None,
         "status": "edited",
         "stage_status": {"script": "edited"},
         "created_at": now(),
@@ -271,46 +242,6 @@ def workspace(root=None):
     return {"root": str(root), "project": project_entry(root)}
 
 
-def storage(run_id=None, label=None, message=None, root=None):
-    root = project_root() if root is None else Path(root)
-    require_autoeval_git_repo(root)
-    init_db(root)
-    created_at = now()
-
-    if run_id:
-        run = get_run(run_id, root)
-        run_dir = root / (run.get("run_dir") or f"runs/{run_id}")
-        if not run_dir.exists():
-            raise ValueError(f"missing run directory: {run_dir.relative_to(root)}")
-
-        run["output_hash"] = run.get("output_hash") or hash_run_output(run_dir)
-        run.update({"stored": True, "stored_at": created_at, "storage_label": label})
-        write_json(run_dir / "run.json", run)
-
-        conn = db(root)
-        exists = conn.execute("select 1 from runs where run_id = ?", (run["run_id"],)).fetchone()
-        conn.close()
-        if not exists:
-            insert_run(run, root=root)
-
-        commit, committed = git_commit_run(run_id, root=root)
-        conn = db(root)
-        conn.execute(
-            "update runs set stored = 1, stored_at = ?, storage_label = ?, git_commit = ?, output_hash = ? where run_id = ?",
-            (created_at, label, commit, run["output_hash"], run_id),
-        )
-        conn.commit()
-        conn.close()
-        write_report_bundle(run_id, root)
-        inserted = upsert_stage_versions(run, commit, created_at, label=label, root=root, metadata_root=source_root_for_run(run, root))
-        return {"run_id": run_id, "storage_commit": commit, "committed": committed, "script_hash": run["script_hash"], "capsule_hash": run["capsule_hash"], "script_version": "stored" if inserted["script"] else "existing"}
-
-    hashes = compute_hashes(root)
-    commit, committed = git_commit_storage(message or "autoeval storage", root)
-    inserted = upsert_stage_versions(hashes, commit, created_at, label=label, root=root)
-    return {"storage_commit": commit, "committed": committed, "script_hash": hashes["script_hash"], "capsule_hash": hashes["capsule_hash"], "script_version": "stored" if inserted["script"] else "existing"}
-
-
 def restore(run_id, root=None):
     root = project_root() if root is None else Path(root)
     run, commit = restore_run_state(run_id, root)
@@ -321,7 +252,7 @@ def diff_runs(run_a, run_b, root=None):
     root = project_root() if root is None else Path(root)
     a = get_run(run_a, root)
     b = get_run(run_b, root)
-    return autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *storage_paths(root)], root=root, capture=True, check=False)
+    return autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *source_paths(root)], root=root, capture=True, check=False)
 
 
 def run_autoeval(run_id=None, root=None):
@@ -346,10 +277,10 @@ def doctor(root=None):
     add("project_root", is_project_root(root), str(root))
     add("autoeval.md", (root / PROJECT_INSTRUCTIONS).is_file())
     add("script/stage.json", (root / "script" / "stage.json").is_file())
-    runner = "auto"
+    runner = "local"
     try:
-        runner = read_json(root / PROJECT_CONFIG).get("runner", "auto")
-        add("runner", runner in {"auto", "docker", "local"}, runner)
+        runner = read_json(root / PROJECT_CONFIG).get("runner", "local")
+        add("runner", runner in {"docker", "local"}, runner)
     except Exception as exc:
         add("runner", False, str(exc))
     try:

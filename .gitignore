@@ -11,6 +11,9 @@ dist/
 .venv/
 venv/
 .env
+node_modules/
+tests/
+technical_overview.md
 
 # Generated Autoeval projects used during local testing
 tmp/

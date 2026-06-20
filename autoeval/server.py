@@ -11,7 +11,9 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
-from .project import is_project_root, init_db, list_registered_projects, now, project_id, register_project, report_instruction, require_autoeval_git_repo, resolve_registered_project, warn_docker_unavailable, write_report_instruction
+from .reports import report_instruction, write_report_instruction
+from .store import init_db, require_autoeval_git_repo
+from .workspace import is_project_root, list_registered_projects, now, project_id, register_project, resolve_registered_project
 from .runtime import list_runs, read_script_params, run_report, run_source, save_script_file, workspace, write_script_params
 
 
@@ -324,7 +326,6 @@ class AutoevalHandler(BaseHTTPRequestHandler):
 
 
 def view(host, port, allow_origins=None, project=None):
-    warn_docker_unavailable()
     default_project = None
     if project:
         root = Path(project).expanduser()

@@ -4,51 +4,41 @@ import sys
 import uuid
 from pathlib import Path
 
-from .agent import install_agent_files
-from .project import (
+from .reports import report_instruction, set_report_instruction, write_report_bundle
+from .runner import (
     RUN_CONTEXT,
-    autoeval_git,
     compute_hashes,
-    copy_run_source,
-    create_project,
-    current_autoeval_commit,
-    db,
-    die,
+    docker_ready,
     find_duplicate_output_run,
-    get_run,
-    git_status,
     hash_run_output,
-    init_db,
-    insert_run,
-    is_project_root,
-    new_run_id,
-    project_root,
-    register_project,
-    require_autoeval_git_repo,
-    report_instruction,
-    restore_run_state,
     local_run_context,
     run_script,
     run_script_local,
-    run_stage_commit,
     runner_type,
-    script_name,
-    set_report_instruction,
-    source_root_for_run,
-    storage_paths,
-    update_run,
-    warn_docker_unavailable,
-    write_report_bundle,
-    write_json,
 )
-from .runtime import doctor, storage as store
+from .runs import copy_run_source, get_run, new_run_id, restore_run_state, run_stage_commit, script_name, source_root_for_run
+from .store import (
+    autoeval_git,
+    db,
+    git_commit_source,
+    init_db,
+    insert_run,
+    require_autoeval_git_repo,
+    update_run,
+)
+from .workspace import create_project, die, is_project_root, project_root, register_project, source_paths, write_json
+from .runtime import doctor
 
 
 def init_cmd(args):
-    root = create_project(Path(args.project_name).expanduser(), args.title or Path(args.project_name).name)
+    docker, _ = docker_ready()
+    runner = "docker" if docker else "local"
+    root = create_project(Path(args.project_name).expanduser(), args.title or Path(args.project_name).name, runner)
     register_project(root)
-    warn_docker_unavailable()
     print(f"initialized autoeval project: {root}")
+    print(f"runner: {runner}")
+    if not docker:
+        print('sandboxing: install Docker, then set "runner": "docker" in autoeval.json', file=sys.stderr)
 
 
 def print_run(run, duplicate=False):
@@ -59,8 +49,6 @@ def print_run(run, duplicate=False):
     print(f"capsule_hash: {run['capsule_hash']}")
     print(f"output_hash: {run['output_hash']}")
     print(f"created: {'no' if duplicate else 'yes'}")
-    if not duplicate:
-        print(f"stored: {'yes' if run.get('stored') else 'no'}")
     print(f"run_dir: {run['run_dir']}")
     if run.get("report_path"):
         print(f"report: {run['report_path']}")
@@ -76,11 +64,7 @@ def run_cmd(args):
     if source_run:
         print(f"refreshing run artifacts for {args.run_id}")
 
-    stage_commit = run_stage_commit(source_run) if source_run else current_autoeval_commit(root)
-    unstored = bool(source_run and source_run.get("unstored_stage_changes"))
-    if not source_run and git_status(storage_paths(root), root=root):
-        unstored = True
-        print("note: executing unstored script/config changes; run `autoeval storage` to store them.", file=sys.stderr)
+    stage_commit = run_stage_commit(source_run) if source_run else git_commit_source("autoeval source snapshot", root)[0]
 
     if source_run:
         run_id = args.run_id
@@ -118,11 +102,6 @@ def run_cmd(args):
             **hashes,
             "script_name": script_name(run_id, run_dir),
             "stage_commit": stage_commit,
-            "unstored_stage_changes": unstored,
-            "git_commit": "",
-            "stored": False,
-            "stored_at": None,
-            "storage_label": None,
             "status": "running",
             "stage_status": {"script": "running"},
             "created_at": created_at,
@@ -188,7 +167,7 @@ def status_cmd(args):
     init_db()
     conn = db()
     rows = conn.execute(
-        "select run_id, status, stored, capsule_hash, git_commit, created_at from runs order by created_at desc limit ?",
+        "select run_id, status, capsule_hash, created_at from runs order by created_at desc limit ?",
         (args.limit,),
     ).fetchall()
     conn.close()
@@ -198,8 +177,7 @@ def status_cmd(args):
         return
 
     for row in rows:
-        storage = "stored" if row["stored"] else "cache"
-        print(f"{row['created_at']}  {row['status']:<7}  {storage:<6}  {row['run_id']}  {row['capsule_hash'][:12]}  {row['git_commit'][:12]}")
+        print(f"{row['created_at']}  {row['status']:<7}  {row['run_id']}  {row['capsule_hash'][:12]}")
 
 
 def hash_cmd(args):
@@ -207,21 +185,10 @@ def hash_cmd(args):
         print(f"{key}: {value}")
 
 
-def storage_cmd(args):
-    result = store(args.run_id, args.label, args.message)
-    if args.run_id:
-        print(f"run_id: {args.run_id}")
-    print(f"storage_commit: {result['storage_commit']}")
-    print(f"committed: {'yes' if result['committed'] else 'no'}")
-    print(f"script_hash: {result['script_hash']}")
-    print(f"capsule_hash: {result['capsule_hash']}")
-    print(f"script_version: {result['script_version']}")
-
-
 def diff_cmd(args):
     a = get_run(args.run_a)
     b = get_run(args.run_b)
-    autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *storage_paths()], check=False)
+    autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *source_paths()], check=False)
 
 
 def restore_cmd(args):
@@ -257,13 +224,6 @@ def doctor_cmd(args):
     print(f"overall: {'ok' if result['ok'] else 'failed'}")
 
 
-def agent_install_cmd(args):
-    result = install_agent_files(args.target, args.force)
-    print(f"agent_target: {result['target']}")
-    for path in result["written"]:
-        print(f"created: {path}")
-
-
 def mcp_cmd(args):
     from .mcp import serve
 
@@ -290,12 +250,6 @@ def build_parser():
     hashes = sub.add_parser("hash")
     hashes.set_defaults(fn=hash_cmd)
 
-    storage = sub.add_parser("storage")
-    storage.add_argument("run_id", nargs="?")
-    storage.add_argument("--label")
-    storage.add_argument("--message")
-    storage.set_defaults(fn=storage_cmd)
-
     diff = sub.add_parser("diff")
     diff.add_argument("run_a")
     diff.add_argument("run_b")
@@ -318,13 +272,6 @@ def build_parser():
 
     doctor_parser = sub.add_parser("doctor")
     doctor_parser.set_defaults(fn=doctor_cmd)
-
-    agent = sub.add_parser("agent")
-    agent_sub = agent.add_subparsers(required=True)
-    install = agent_sub.add_parser("install")
-    install.add_argument("--target", choices=("claude", "all"), default="all")
-    install.add_argument("--force", action="store_true")
-    install.set_defaults(fn=agent_install_cmd)
 
     mcp_parser = sub.add_parser("mcp")
     mcp_parser.set_defaults(fn=mcp_cmd)
