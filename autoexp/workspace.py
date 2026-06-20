@@ -8,19 +8,19 @@ import time
 from pathlib import Path
 
 
-PROJECT_CONFIG = "autoeval.json"
-PROJECT_INSTRUCTIONS = "autoeval.md"
+PROJECT_CONFIG = "autoexp.json"
+PROJECT_INSTRUCTIONS = "autoexp.md"
 PROJECT_REPORT_INSTRUCTIONS = "report.txt"
 APP_ENV = "app.env"
 SOURCE_PATHS = ("script", PROJECT_CONFIG, PROJECT_INSTRUCTIONS, ".gitignore")
 INSTRUCTION_FILE = Path(__file__).with_name("instruction.txt")
 BUILTIN_REPORT_INSTRUCTIONS = Path(__file__).with_name("report.txt")
-AGENTS_TEXT = """# Autoeval Workspace
+AGENTS_TEXT = """# Autoexp Workspace
 
-This repository is an Autoeval workspace.
+This repository is an Autoexp workspace.
 
-- Read `autoeval.md` before changing experiment behavior.
-- Use `autoeval run` and Autoeval MCP tools for runs and artifact inspection.
+- Read `autoexp.md` before changing experiment behavior.
+- Use `autoexp run` and Autoexp MCP tools for runs and artifact inspection.
 - Keep experiment source in `script/`.
 - Do not create ad-hoc experiment folders.
 - Do not hand-edit `runs/<run_id>/output/` or `runs/<run_id>/logs/`.
@@ -36,8 +36,8 @@ parser.add_argument("--ctx", required=True)
 ctx = json.loads(Path(parser.parse_args().ctx).read_text())
 params = json.loads(Path(ctx["script_params_path"]).read_text())
 result = {
-    "message": os.environ.get("AUTOEVAL_MESSAGE", params["message"]),
-    "source": "app.env" if "AUTOEVAL_MESSAGE" in os.environ else "script params",
+    "message": os.environ.get("AUTOEXP_MESSAGE", params["message"]),
+    "source": "app.env" if "AUTOEXP_MESSAGE" in os.environ else "script params",
 }
 
 Path(ctx["output_dir"]).mkdir(parents=True, exist_ok=True)
@@ -63,16 +63,16 @@ def write_json(path, data):
 
 
 def user_data_dir():
-    override = os.environ.get("AUTOEVAL_HOME")
+    override = os.environ.get("AUTOEXP_HOME")
     if override:
         return Path(override).expanduser()
     if sys.platform == "darwin":
-        return Path.home() / "Library" / "Application Support" / "autoeval"
+        return Path.home() / "Library" / "Application Support" / "autoexp"
     if os.name == "nt":
         base = os.environ.get("LOCALAPPDATA") or os.environ.get("APPDATA")
-        return Path(base) / "autoeval" if base else Path.home() / ".autoeval"
+        return Path(base) / "autoexp" if base else Path.home() / ".autoexp"
     base = os.environ.get("XDG_DATA_HOME")
-    return (Path(base) if base else Path.home() / ".local" / "share") / "autoeval"
+    return (Path(base) if base else Path.home() / ".local" / "share") / "autoexp"
 
 
 def registry_path():
@@ -114,7 +114,7 @@ def project_root():
     for path in (Path.cwd(), *Path.cwd().parents):
         if is_project_root(path):
             return path
-    die("not an autoeval project; run `autoeval init <project_name>` first")
+    die("not an autoexp project; run `autoexp init <project_name>` first")
 
 
 def project_entry(root):
@@ -125,7 +125,7 @@ def project_entry(root):
 def register_project(root):
     root = Path(root).resolve()
     if not is_project_root(root):
-        die(f"{root} is not an autoeval project")
+        die(f"{root} is not an autoexp project")
     timestamp = now()
     conn = registry_db()
     conn.execute(
@@ -159,7 +159,7 @@ def list_registered_projects():
 def resolve_registered_project(project=None):
     projects = list_registered_projects()
     if not projects:
-        die("no autoeval projects registered; run `autoeval init <project_name>` first")
+        die("no autoexp projects registered; run `autoexp init <project_name>` first")
     selected = project or next((item["project_id"] for item in projects if item["exists"]), None)
     for item in projects:
         if item["project_id"] == selected:
@@ -167,7 +167,7 @@ def resolve_registered_project(project=None):
                 die(f"registered project is missing or invalid: {item['path']}")
             register_project(item["path"])
             return Path(item["path"])
-    die(f"unknown autoeval project: {selected}")
+    die(f"unknown autoexp project: {selected}")
 
 
 def gitignore_patterns(root):
@@ -211,7 +211,7 @@ def script_manifest(root=None):
 
 
 def write_default_project(root, title, runner):
-    for name in ("script", "runs", ".autoeval"):
+    for name in ("script", "runs", ".autoexp"):
         (root / name).mkdir(parents=True)
     write_json(root / PROJECT_CONFIG, {"title": title, "description": "", "runner": runner, "sandbox": {"image": "python:3.12-slim", "network": "none", "cpus": "1", "memory": "512m"}, "runtime": {}, "report_instruction_file": PROJECT_REPORT_INSTRUCTIONS})
     write_json(root / "script" / "stage.json", {"name": "script", "command": "python script.py --ctx ${CTX}", "working_dir": "script", "interface_version": "1"})
@@ -221,27 +221,27 @@ def write_default_project(root, title, runner):
     (root / PROJECT_INSTRUCTIONS).write_text(INSTRUCTION_FILE.read_text())
     (root / PROJECT_REPORT_INSTRUCTIONS).write_text(BUILTIN_REPORT_INSTRUCTIONS.read_text())
     (root / "AGENTS.md").write_text(AGENTS_TEXT)
-    write_json(root / ".mcp.json", {"mcpServers": {"autoeval": {"command": "autoeval", "args": ["mcp"]}}})
-    (root / APP_ENV).write_text("# Project-local environment for Autoeval runs.\n# Values here are passed to the runner and remain outside Autoeval history.\nAUTOEVAL_MESSAGE=hello from app.env\n")
-    (root / ".gitignore").write_text("/.autoeval/\n/app.env\n/index.sqlite\n/runs/\n/server/\n__pycache__/\n*.pyc\n")
+    write_json(root / ".mcp.json", {"mcpServers": {"autoexp": {"command": "autoexp", "args": ["mcp"]}}})
+    (root / APP_ENV).write_text("# Project-local environment for Autoexp runs.\n# Values here are passed to the runner and remain outside Autoexp history.\nAUTOEXP_MESSAGE=hello from app.env\n")
+    (root / ".gitignore").write_text("/.autoexp/\n/app.env\n/index.sqlite\n/runs/\n/server/\n__pycache__/\n*.pyc\n")
 
 
 def create_project(root, title, runner="local"):
-    from .store import AUTOEVAL_GIT_DIR, autoeval_git, init_db, require_autoeval_git_repo
+    from .store import AUTOEXP_GIT_DIR, autoexp_git, init_db, require_autoexp_git_repo
 
     root = Path(root)
     if root.exists() and any(root.iterdir()):
         die(f"{root} already exists and is not empty")
     root.mkdir(parents=True, exist_ok=True)
     write_default_project(root, title, runner)
-    autoeval_git(["init", "-b", "main"], root=root)
-    require_autoeval_git_repo(root)
-    (root / AUTOEVAL_GIT_DIR / "info" / "exclude").write_text("/.mcp.json\n/AGENTS.md\n")
-    if not autoeval_git(["config", "user.name"], root=root, capture=True, check=False):
-        autoeval_git(["config", "user.name", "Autoeval"], root=root)
-    if not autoeval_git(["config", "user.email"], root=root, capture=True, check=False):
-        autoeval_git(["config", "user.email", "autoeval@local"], root=root)
+    autoexp_git(["init", "-b", "main"], root=root)
+    require_autoexp_git_repo(root)
+    (root / AUTOEXP_GIT_DIR / "info" / "exclude").write_text("/.mcp.json\n/AGENTS.md\n")
+    if not autoexp_git(["config", "user.name"], root=root, capture=True, check=False):
+        autoexp_git(["config", "user.name", "Autoexp"], root=root)
+    if not autoexp_git(["config", "user.email"], root=root, capture=True, check=False):
+        autoexp_git(["config", "user.email", "autoexp@local"], root=root)
     init_db(root)
-    autoeval_git(["add", *source_paths(root)], root=root)
-    autoeval_git(["commit", "-m", "autoeval init"], root=root)
+    autoexp_git(["add", *source_paths(root)], root=root)
+    autoexp_git(["commit", "-m", "autoexp init"], root=root)
     return root

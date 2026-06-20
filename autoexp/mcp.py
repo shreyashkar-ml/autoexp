@@ -12,7 +12,7 @@ from .runtime import (
     read_report_bundle,
     read_script_params,
     restore,
-    run_autoeval,
+    run_autoexp,
     run_report,
     run_source,
     save_script_file,
@@ -49,11 +49,11 @@ def tool_schema(properties=None, required=None):
 
 
 TOOLS = {
-    "workspace": {"description": "Read Autoeval workspace metadata.", "schema": tool_schema()},
-    "contract": {"description": "Read the Autoeval workspace contract.", "schema": tool_schema()},
+    "workspace": {"description": "Read Autoexp workspace metadata.", "schema": tool_schema()},
+    "contract": {"description": "Read the Autoexp workspace contract.", "schema": tool_schema()},
     "script_manifest": {"description": "Read script/stage.json.", "schema": tool_schema()},
     "script_params": {"description": "Read script params and schema.", "schema": tool_schema()},
-    "list_runs": {"description": "List recent Autoeval runs.", "schema": tool_schema({"limit": {"type": "integer", "default": 20}})},
+    "list_runs": {"description": "List recent Autoexp runs.", "schema": tool_schema({"limit": {"type": "integer", "default": 20}})},
     "read_run": {"description": "Read a run metadata row.", "schema": tool_schema({"run_id": {"type": "string"}}, ["run_id"])},
     "read_run_source": {"description": "Read copied source files for a run.", "schema": tool_schema({"run_id": {"type": "string"}}, ["run_id"])},
     "read_output_files": {"description": "Read output artifacts for a run.", "schema": tool_schema({"run_id": {"type": "string"}}, ["run_id"])},
@@ -76,49 +76,49 @@ TOOLS = {
     },
     "write_script_params": {"description": "Write script/params.json.", "schema": tool_schema({"params": {"type": "object"}}, ["params"])},
     "set_report_instruction": {"description": "Configure project report instruction file.", "schema": tool_schema({"path": {"type": "string"}}, ["path"])},
-    "run": {"description": "Run Autoeval through the same runtime path as the CLI.", "schema": tool_schema({"run_id": {"type": "string"}})},
+    "run": {"description": "Run Autoexp through the same runtime path as the CLI.", "schema": tool_schema({"run_id": {"type": "string"}})},
     "diff_runs": {"description": "Diff source/config between two runs.", "schema": tool_schema({"run_a": {"type": "string"}, "run_b": {"type": "string"}}, ["run_a", "run_b"])},
     "restore_run": {"description": "Restore script/config from a run.", "schema": tool_schema({"run_id": {"type": "string"}}, ["run_id"])},
 }
 
 
 PROMPTS = {
-    "autoeval/improve-script": "Read autoeval.md, inspect recent runs and the selected run source, improve script behavior, save a versioned script snapshot, run Autoeval, then summarize run_id, status, output files, logs, and report path.",
-    "autoeval/debug-failed-run": "Read autoeval.md, inspect the failed run metadata, logs, source, and report bundle. Identify the likely failure cause and propose or create a versioned script fix.",
-    "autoeval/write-report": "Read autoeval.md and the active project report instruction. Use runs/{run_id}/report/report_bundle.json to write report artifacts under that run's report directory.",
+    "autoexp/improve-script": "Read autoexp.md, inspect recent runs and the selected run source, improve script behavior, save a versioned script snapshot, run Autoexp, then summarize run_id, status, output files, logs, and report path.",
+    "autoexp/debug-failed-run": "Read autoexp.md, inspect the failed run metadata, logs, source, and report bundle. Identify the likely failure cause and propose or create a versioned script fix.",
+    "autoexp/write-report": "Read autoexp.md and the active project report instruction. Use runs/{run_id}/report/report_bundle.json to write report artifacts under that run's report directory.",
 }
 
 
 def resource_list():
     return [
-        {"uri": "autoeval://workspace", "name": "workspace", "mimeType": "application/json"},
-        {"uri": "autoeval://contract", "name": "contract", "mimeType": "text/markdown"},
-        {"uri": "autoeval://config", "name": "config", "mimeType": "application/json"},
-        {"uri": "autoeval://script/manifest", "name": "script manifest", "mimeType": "application/json"},
-        {"uri": "autoeval://script/params", "name": "script params", "mimeType": "application/json"},
-        {"uri": "autoeval://runs/latest", "name": "latest runs", "mimeType": "application/json"},
-        {"uri": "autoeval://report-instruction", "name": "report instruction", "mimeType": "application/json"},
+        {"uri": "autoexp://workspace", "name": "workspace", "mimeType": "application/json"},
+        {"uri": "autoexp://contract", "name": "contract", "mimeType": "text/markdown"},
+        {"uri": "autoexp://config", "name": "config", "mimeType": "application/json"},
+        {"uri": "autoexp://script/manifest", "name": "script manifest", "mimeType": "application/json"},
+        {"uri": "autoexp://script/params", "name": "script params", "mimeType": "application/json"},
+        {"uri": "autoexp://runs/latest", "name": "latest runs", "mimeType": "application/json"},
+        {"uri": "autoexp://report-instruction", "name": "report instruction", "mimeType": "application/json"},
     ]
 
 
 def read_resource(uri):
     root = project_root()
-    if uri == "autoeval://workspace":
+    if uri == "autoexp://workspace":
         return "application/json", json_text(workspace(root))
-    if uri == "autoeval://contract":
-        return "text/markdown", (root / "autoeval.md").read_text()
-    if uri == "autoeval://config":
-        return "application/json", json_text(read_json(root / "autoeval.json"))
-    if uri == "autoeval://script/manifest":
+    if uri == "autoexp://contract":
+        return "text/markdown", (root / "autoexp.md").read_text()
+    if uri == "autoexp://config":
+        return "application/json", json_text(read_json(root / "autoexp.json"))
+    if uri == "autoexp://script/manifest":
         return "application/json", json_text(script_manifest(root))
-    if uri == "autoeval://script/params":
+    if uri == "autoexp://script/params":
         return "application/json", json_text(read_script_params(root))
-    if uri == "autoeval://runs/latest":
+    if uri == "autoexp://runs/latest":
         return "application/json", json_text({"runs": list_runs(root=root)})
-    if uri == "autoeval://report-instruction":
+    if uri == "autoexp://report-instruction":
         return "application/json", json_text(read_report_instruction(root))
 
-    prefix = "autoeval://runs/"
+    prefix = "autoexp://runs/"
     if uri.startswith(prefix):
         parts = uri[len(prefix):].split("/")
         run_id = parts[0]
@@ -143,7 +143,7 @@ def call_tool(name, args):
     if name == "workspace":
         return workspace(root)
     if name == "contract":
-        return {"text": (root / "autoeval.md").read_text()}
+        return {"text": (root / "autoexp.md").read_text()}
     if name == "script_manifest":
         return script_manifest(root)
     if name == "script_params":
@@ -173,7 +173,7 @@ def call_tool(name, args):
     if name == "set_report_instruction":
         return {"path": set_project_report_instruction(args["path"], root)}
     if name == "run":
-        return run_autoeval(args.get("run_id"), root)
+        return run_autoexp(args.get("run_id"), root)
     if name == "diff_runs":
         return {"diff": diff_runs(args["run_a"], args["run_b"], root)}
     if name == "restore_run":
@@ -187,7 +187,7 @@ def handle(message):
     if method == "initialize":
         return {
             "protocolVersion": PROTOCOL_VERSION,
-            "serverInfo": {"name": "autoeval", "version": "0.1.0"},
+            "serverInfo": {"name": "autoexp", "version": "0.1.0"},
             "capabilities": {"resources": {}, "tools": {}, "prompts": {}},
         }
     if method in {"notifications/initialized", "notifications/cancelled"}:

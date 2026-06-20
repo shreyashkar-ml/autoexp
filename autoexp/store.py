@@ -6,12 +6,12 @@ from pathlib import Path
 from .workspace import die, project_root, source_paths
 
 
-AUTOEVAL_GIT_DIR = ".autoeval/git"
+AUTOEXP_GIT_DIR = ".autoexp/git"
 
 
-def autoeval_git(args, root=None, capture=False, check=True):
+def autoexp_git(args, root=None, capture=False, check=True):
     root = project_root() if root is None else Path(root)
-    cmd = ["git", "--git-dir", str(root / AUTOEVAL_GIT_DIR), "--work-tree", str(root), *args]
+    cmd = ["git", "--git-dir", str(root / AUTOEXP_GIT_DIR), "--work-tree", str(root), *args]
     try:
         proc = subprocess.run(
             cmd, check=check, stdout=subprocess.PIPE if capture else None,
@@ -22,13 +22,13 @@ def autoeval_git(args, root=None, capture=False, check=True):
     return proc.stdout.strip() if capture else None
 
 
-def require_autoeval_git_repo(root=None):
+def require_autoexp_git_repo(root=None):
     root = project_root() if root is None else Path(root)
-    if not (root / AUTOEVAL_GIT_DIR).is_dir():
-        die(f"{root} is missing its Autoeval git repository")
-    top = autoeval_git(["rev-parse", "--show-toplevel"], root=root, capture=True)
+    if not (root / AUTOEXP_GIT_DIR).is_dir():
+        die(f"{root} is missing its Autoexp git repository")
+    top = autoexp_git(["rev-parse", "--show-toplevel"], root=root, capture=True)
     if Path(top).resolve() != root.resolve():
-        die("refusing to run git outside the autoeval project")
+        die("refusing to run git outside the autoexp project")
 
 
 def db(root=None):
@@ -98,18 +98,18 @@ def update_run(meta, root=None):
     conn.close()
 
 
-def current_autoeval_commit(root=None):
-    return autoeval_git(["rev-parse", "HEAD"], root=root, capture=True)
+def current_autoexp_commit(root=None):
+    return autoexp_git(["rev-parse", "HEAD"], root=root, capture=True)
 
 
 def git_status(paths, root=None):
-    return autoeval_git(["status", "--porcelain", "--", *paths], root=root, capture=True)
+    return autoexp_git(["status", "--porcelain", "--", *paths], root=root, capture=True)
 
 
 def git_commit_source(message, root=None):
     paths = source_paths(root)
-    autoeval_git(["add", *paths], root=root)
-    if not autoeval_git(["diff", "--cached", "--name-only", "--", *paths], root=root, capture=True):
-        return current_autoeval_commit(root), False
-    autoeval_git(["commit", "-m", message, "--", *paths], root=root)
-    return current_autoeval_commit(root), True
+    autoexp_git(["add", *paths], root=root)
+    if not autoexp_git(["diff", "--cached", "--name-only", "--", *paths], root=root, capture=True):
+        return current_autoexp_commit(root), False
+    autoexp_git(["commit", "-m", message, "--", *paths], root=root)
+    return current_autoexp_commit(root), True

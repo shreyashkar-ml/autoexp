@@ -3,7 +3,7 @@ import shutil
 import uuid
 from pathlib import Path
 
-from .store import autoeval_git, db, git_status, require_autoeval_git_repo
+from .store import autoexp_git, db, git_status, require_autoexp_git_repo
 from .workspace import PROJECT_CONFIG, die, now, project_root, read_json, script_manifest, source_paths
 
 
@@ -56,7 +56,7 @@ def source_root_for_run(run, root=None):
 
 def restore_run_state(run_id, root=None):
     root = project_root() if root is None else Path(root)
-    require_autoeval_git_repo(root)
+    require_autoexp_git_repo(root)
     if git_status(source_paths(root), root=root):
         die("refusing to restore run state over uncommitted script/config changes")
     run = get_run(run_id, root)
@@ -64,7 +64,7 @@ def restore_run_state(run_id, root=None):
     if source_root != root:
         copy_run_source(source_root, root)
     else:
-        autoeval_git(["checkout", run_stage_commit(run), "--", *source_paths(root)], root=root)
+        autoexp_git(["checkout", run_stage_commit(run), "--", *source_paths(root)], root=root)
     return run, run_stage_commit(run)
 
 

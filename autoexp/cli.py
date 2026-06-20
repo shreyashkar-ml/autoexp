@@ -18,12 +18,12 @@ from .runner import (
 )
 from .runs import copy_run_source, get_run, new_run_id, restore_run_state, run_stage_commit, script_name, source_root_for_run
 from .store import (
-    autoeval_git,
+    autoexp_git,
     db,
     git_commit_source,
     init_db,
     insert_run,
-    require_autoeval_git_repo,
+    require_autoexp_git_repo,
     update_run,
 )
 from .workspace import create_project, die, is_project_root, project_root, register_project, source_paths, write_json
@@ -35,10 +35,10 @@ def init_cmd(args):
     runner = "docker" if docker else "local"
     root = create_project(Path(args.project_name).expanduser(), args.title or Path(args.project_name).name, runner)
     register_project(root)
-    print(f"initialized autoeval project: {root}")
+    print(f"initialized autoexp project: {root}")
     print(f"runner: {runner}")
     if not docker:
-        print('sandboxing: install Docker, then set "runner": "docker" in autoeval.json', file=sys.stderr)
+        print('sandboxing: install Docker, then set "runner": "docker" in autoexp.json', file=sys.stderr)
 
 
 def print_run(run, duplicate=False):
@@ -56,7 +56,7 @@ def print_run(run, duplicate=False):
 
 def run_cmd(args):
     root = project_root()
-    require_autoeval_git_repo(root)
+    require_autoexp_git_repo(root)
     init_db(root)
 
     source_run = get_run(args.run_id, root) if args.run_id else None
@@ -64,7 +64,7 @@ def run_cmd(args):
     if source_run:
         print(f"refreshing run artifacts for {args.run_id}")
 
-    stage_commit = run_stage_commit(source_run) if source_run else git_commit_source("autoeval source snapshot", root)[0]
+    stage_commit = run_stage_commit(source_run) if source_run else git_commit_source("autoexp source snapshot", root)[0]
 
     if source_run:
         run_id = args.run_id
@@ -188,7 +188,7 @@ def hash_cmd(args):
 def diff_cmd(args):
     a = get_run(args.run_a)
     b = get_run(args.run_b)
-    autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *source_paths()], check=False)
+    autoexp_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *source_paths()], check=False)
 
 
 def restore_cmd(args):
@@ -231,7 +231,7 @@ def mcp_cmd(args):
 
 
 def build_parser():
-    parser = argparse.ArgumentParser(prog="autoeval")
+    parser = argparse.ArgumentParser(prog="autoexp")
     sub = parser.add_subparsers(required=True)
 
     init = sub.add_parser("init")

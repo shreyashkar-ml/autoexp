@@ -10,7 +10,7 @@ export default defineConfig({
     },
   },
   build: {
-    outDir: "../autoeval/ui",
+    outDir: "../autoexp/ui",
     emptyOutDir: true,
   },
 });

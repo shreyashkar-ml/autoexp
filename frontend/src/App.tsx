@@ -86,7 +86,7 @@ export default function App() {
   const [activeJob, setActiveJob] = useState<JobState>({ active: false, job: null });
   const [theme, setTheme] = useState<"light" | "dark">(() => {
     if (typeof window === "undefined") return "light";
-    return window.localStorage.getItem("autoeval-theme") === "dark" ? "dark" : "light";
+    return window.localStorage.getItem("autoexp-theme") === "dark" ? "dark" : "light";
   });
 
   const selectedProject = projects.find((project) => project.project_id === selectedProjectId) || null;
@@ -138,7 +138,7 @@ export default function App() {
 
   useEffect(() => {
     document.documentElement.classList.toggle("dark", theme === "dark");
-    window.localStorage.setItem("autoeval-theme", theme);
+    window.localStorage.setItem("autoexp-theme", theme);
   }, [theme]);
 
   useEffect(() => {
@@ -270,7 +270,7 @@ export default function App() {
       <div className="page">
         <header className="global-header">
           <div className="min-w-0">
-            <h1 className="text-xl font-semibold tracking-normal text-foreground">autoeval</h1>
+            <h1 className="text-xl font-semibold tracking-normal text-foreground">autoexp</h1>
           </div>
 
           <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
@@ -356,7 +356,7 @@ export default function App() {
             <div className="flex flex-col gap-3 border-b p-4 md:flex-row md:items-center md:justify-between">
               <div>
                 <h2 className="text-base font-semibold">Recent runs</h2>
-                <p className="text-sm text-muted-foreground">{selectedProject ? "Project artifacts and reports" : "Create or register an Autoeval project to begin"}</p>
+                <p className="text-sm text-muted-foreground">{selectedProject ? "Project artifacts and reports" : "Create or register an Autoexp project to begin"}</p>
               </div>
               <label className="relative w-full md:w-72">
                 <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />

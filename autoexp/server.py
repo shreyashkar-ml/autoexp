@@ -12,7 +12,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .reports import report_instruction, write_report_instruction
-from .store import init_db, require_autoeval_git_repo
+from .store import init_db, require_autoexp_git_repo
 from .workspace import is_project_root, list_registered_projects, now, project_id, register_project, resolve_registered_project
 from .runtime import list_runs, read_script_params, run_report, run_source, save_script_file, workspace, write_script_params
 
@@ -65,7 +65,7 @@ class RunManager:
             job_dir = self.workspace_root / "server" / "jobs"
             job_dir.mkdir(parents=True, exist_ok=True)
             log_path = job_dir / f"{job_id}.log"
-            cmd = [sys.executable, "-m", "autoeval", "run", *([run_id] if run_id else [])]
+            cmd = [sys.executable, "-m", "autoexp", "run", *([run_id] if run_id else [])]
             log = log_path.open("w")
             proc = subprocess.Popen(cmd, cwd=self.workspace_root, stdout=log, stderr=subprocess.STDOUT, start_new_session=True)
             log.close()
@@ -110,7 +110,7 @@ class RunManager:
             return handle.read().decode(errors="replace")
 
 
-class AutoevalHTTPServer(ThreadingHTTPServer):
+class AutoexpHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
     def __init__(self, server_address, handler_class, default_project=None, allow_origins=None):
@@ -132,8 +132,8 @@ class AutoevalHTTPServer(ThreadingHTTPServer):
         return self.managers[key]
 
 
-class AutoevalHandler(BaseHTTPRequestHandler):
-    server_version = "AutoevalHTTP/0.1"
+class AutoexpHandler(BaseHTTPRequestHandler):
+    server_version = "AutoexpHTTP/0.1"
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -337,16 +337,16 @@ def view(host, port, allow_origins=None, project=None):
     for item in list_registered_projects():
         if item["exists"]:
             root = Path(item["path"])
-            require_autoeval_git_repo(root)
+            require_autoexp_git_repo(root)
             init_db(root)
 
-    server = AutoevalHTTPServer(
+    server = AutoexpHTTPServer(
         (host, port),
-        AutoevalHandler,
+        AutoexpHandler,
         default_project=default_project,
         allow_origins=allow_origins,
     )
-    print(f"serving Autoeval view on http://{host}:{server.server_port}")
+    print(f"serving Autoexp view on http://{host}:{server.server_port}")
 
     try:
         server.serve_forever()

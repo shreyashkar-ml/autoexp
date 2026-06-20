@@ -1,4 +1,4 @@
-"""Compatibility exports for the split Autoeval core."""
+"""Compatibility exports for the split Autoexp core."""
 
 from .reports import (
     app_env_keys,
@@ -36,15 +36,15 @@ from .runs import (
     source_root_for_run,
 )
 from .store import (
-    AUTOEVAL_GIT_DIR,
-    autoeval_git,
-    current_autoeval_commit,
+    AUTOEXP_GIT_DIR,
+    autoexp_git,
+    current_autoexp_commit,
     db,
     git_commit_source,
     git_status,
     init_db,
     insert_run,
-    require_autoeval_git_repo,
+    require_autoexp_git_repo,
     update_run,
 )
 from .workspace import (

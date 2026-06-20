@@ -1,5 +1,5 @@
 [project]
-name = "autoeval"
+name = "autoexp"
 version = "0.1.0"
 description = "Git-backed sandbox/versioning runtime for black-box executable workflows"
 readme = "README.md"
@@ -27,19 +27,19 @@ test = [
 ]
 
 [project.scripts]
-autoeval = "autoeval.cli:main"
+autoexp = "autoexp.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/shreyashkar-ml/autoeval"
-Issues = "https://github.com/shreyashkar-ml/autoeval/issues"
+Homepage = "https://github.com/shreyashkar-ml/autoexp"
+Issues = "https://github.com/shreyashkar-ml/autoexp/issues"
 
 [tool.setuptools]
-packages = ["autoeval", "autoeval.ui", "autoeval.ui.assets"]
+packages = ["autoexp", "autoexp.ui", "autoexp.ui.assets"]
 
 [tool.setuptools.package-data]
-autoeval = ["instruction.txt", "report.txt"]
-"autoeval.ui" = ["index.html"]
-"autoeval.ui.assets" = ["*.css", "*.js"]
+autoexp = ["instruction.txt", "report.txt"]
+"autoexp.ui" = ["index.html"]
+"autoexp.ui.assets" = ["*.css", "*.js"]
 
 [build-system]
 requires = ["setuptools>=68"]

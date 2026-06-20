@@ -8,12 +8,12 @@ from .reports import artifact_files, report_instruction, write_report_bundle
 from .runner import RUN_CONTEXT, compute_hashes, docker_ready, hash_run_output
 from .runs import copy_run_source, get_run, new_run_id, restore_run_state, run_stage_commit, source_root_for_run
 from .store import (
-    autoeval_git,
-    current_autoeval_commit,
+    autoexp_git,
+    current_autoexp_commit,
     db,
     init_db,
     insert_run,
-    require_autoeval_git_repo,
+    require_autoexp_git_repo,
 )
 from .workspace import APP_ENV, PROJECT_CONFIG, PROJECT_INSTRUCTIONS, is_project_root, now, project_entry, project_root, read_json, script_manifest, source_paths, write_json
 
@@ -225,7 +225,7 @@ def save_script_file(path, text, root=None, source_run_id=None, save_as=None):
         "output_hash": hash_run_output(run_dir),
         "script_name": saved_rel.as_posix(),
         **hashes,
-        "stage_commit": current_autoeval_commit(root),
+        "stage_commit": current_autoexp_commit(root),
         "status": "edited",
         "stage_status": {"script": "edited"},
         "created_at": now(),
@@ -252,13 +252,13 @@ def diff_runs(run_a, run_b, root=None):
     root = project_root() if root is None else Path(root)
     a = get_run(run_a, root)
     b = get_run(run_b, root)
-    return autoeval_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *source_paths(root)], root=root, capture=True, check=False)
+    return autoexp_git(["diff", run_stage_commit(a), run_stage_commit(b), "--", *source_paths(root)], root=root, capture=True, check=False)
 
 
-def run_autoeval(run_id=None, root=None):
+def run_autoexp(run_id=None, root=None):
     root = project_root() if root is None else Path(root)
     proc = subprocess.run(
-        [sys.executable, "-m", "autoeval", "run", *([run_id] if run_id else [])],
+        [sys.executable, "-m", "autoexp", "run", *([run_id] if run_id else [])],
         cwd=root,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -275,7 +275,7 @@ def doctor(root=None):
         checks.append({"name": name, "ok": bool(ok), "detail": detail, "required": bool(required)})
 
     add("project_root", is_project_root(root), str(root))
-    add("autoeval.md", (root / PROJECT_INSTRUCTIONS).is_file())
+    add("autoexp.md", (root / PROJECT_INSTRUCTIONS).is_file())
     add("script/stage.json", (root / "script" / "stage.json").is_file())
     runner = "local"
     try:
@@ -287,17 +287,17 @@ def doctor(root=None):
         manifest = script_manifest(root)
         missing = [key for key in ("name", "command", "working_dir", "interface_version") if key not in manifest]
         add("stage_manifest_keys", not missing, ", ".join(missing))
-        detail = "" if "${CTX}" in manifest.get("command", "") else "command does not use ${CTX}; scripts can still use AUTOEVAL_OUTPUT_DIR"
+        detail = "" if "${CTX}" in manifest.get("command", "") else "command does not use ${CTX}; scripts can still use AUTOEXP_OUTPUT_DIR"
         add("stage_command_context", True, detail)
     except SystemExit as exc:
         add("stage_manifest_keys", False, str(exc))
 
     init_db(root)
     add("index.sqlite", (root / "index.sqlite").is_file())
-    add("private_git", (root / ".autoeval" / "git").is_dir())
+    add("private_git", (root / ".autoexp" / "git").is_dir())
     add("app.env_ignored", APP_ENV in (root / ".gitignore").read_text() if (root / ".gitignore").is_file() else False)
     try:
-        require_autoeval_git_repo(root)
+        require_autoexp_git_repo(root)
         add("private_git_root", True)
     except SystemExit as exc:
         add("private_git_root", False, str(exc))

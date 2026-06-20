@@ -21,7 +21,7 @@ def report_instruction(root=None):
     configured = read_json(root / PROJECT_CONFIG).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
     path = Path(configured)
     if path.is_absolute() or ".." in path.parts or not path.name:
-        raise ValueError("report instruction file must stay inside the autoeval project")
+        raise ValueError("report instruction file must stay inside the autoexp project")
     target = root / path
     if not target.is_file():
         raise FileNotFoundError(f"missing report instruction file: {configured}")
@@ -34,9 +34,9 @@ def set_report_instruction(path, root=None):
         try:
             path = path.relative_to(root)
         except ValueError:
-            die("report instruction file must live inside the autoeval project")
+            die("report instruction file must live inside the autoexp project")
     if ".." in path.parts or not path.name:
-        die("report instruction file must live inside the autoeval project")
+        die("report instruction file must live inside the autoexp project")
     if not (root / path).is_file():
         die(f"missing report instruction file: {path}")
     cfg = read_json(root / PROJECT_CONFIG)
@@ -52,7 +52,7 @@ def write_report_instruction(text, root=None):
     cfg = read_json(root / PROJECT_CONFIG)
     path = Path(cfg.get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS)
     if path.is_absolute() or ".." in path.parts or not path.name:
-        raise ValueError("report instruction file must stay inside the autoeval project")
+        raise ValueError("report instruction file must stay inside the autoexp project")
     target = root / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text)

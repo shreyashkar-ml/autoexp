@@ -111,7 +111,7 @@ def run_script(run_dir, root=None, source_root=None):
     if app_env_path.exists():
         cmd += ["--env-file", str(app_env_path.resolve()), "-v", f"{app_env_path.resolve()}:/workspace/app.env:ro"]
     cmd += [
-        "-e", "AUTOEVAL_OUTPUT_DIR=/workspace/run/output",
+        "-e", "AUTOEXP_OUTPUT_DIR=/workspace/run/output",
         "-v", f"{(source_root / 'script').resolve()}:/workspace/script:ro",
         "-v", f"{Path(run_dir).resolve()}:/workspace/run:rw", "-w", workdir,
         manifest.get("image", cfg["sandbox"]["image"]), "sh", "-lc",
@@ -174,7 +174,7 @@ def run_script_local(run_dir, root=None, source_root=None):
         command = f"{shlex.quote(sys.executable)} {command.removeprefix('python3 ')}"
     env = os.environ.copy()
     env.update(app_env(root))
-    env.update({"AUTOEVAL_RUN_DIR": str(Path(run_dir).resolve()), "AUTOEVAL_SCRIPT_DIR": str((source_root / "script").resolve()), "AUTOEVAL_OUTPUT_DIR": str((Path(run_dir) / "output").resolve())})
+    env.update({"AUTOEXP_RUN_DIR": str(Path(run_dir).resolve()), "AUTOEXP_SCRIPT_DIR": str((source_root / "script").resolve()), "AUTOEXP_OUTPUT_DIR": str((Path(run_dir) / "output").resolve())})
     logs = Path(run_dir) / "logs"
     with (logs / "script.stdout.log").open("w") as stdout, (logs / "script.stderr.log").open("w") as stderr:
         return subprocess.run(command, cwd=local_workdir(manifest, run_dir, source_root), env=env, shell=True, stdout=stdout, stderr=stderr).returncode
@@ -183,7 +183,7 @@ def run_script_local(run_dir, root=None, source_root=None):
 def runner_type(root):
     requested = read_json(Path(root) / PROJECT_CONFIG).get("runner", "local")
     if requested not in {"docker", "local"}:
-        die("autoeval.json runner must be one of: docker, local")
+        die("autoexp.json runner must be one of: docker, local")
     if requested == "local":
         return "local"
     ok, message = docker_ready()
