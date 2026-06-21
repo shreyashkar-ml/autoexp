@@ -1,10 +1,14 @@
-# Autoexp
+<p align="center">
+  <img src="assets/autoexp-readme.png" alt="Autoexp - Local Autonomous Experimentation" width="480">
+</p>
+
+# autoexp
 
 Local-first experiment workspaces for scripts, runs, reports, and coding agents.
 
-Autoexp turns black-box experiments into traceable workspaces. Each run connects its script and configuration snapshot with outputs, logs, report context, and a stable run ID. The package includes a CLI, local browser UI, private experiment history, and project-scoped MCP tools.
+`autoexp` turns black-box experiments into traceable workspaces. Each run connects its script and configuration snapshot with outputs, logs, report context, and a stable run ID. The package includes a CLI, local browser UI, private experiment history, and project-scoped MCP tools.
 
-## Why Autoexp
+## Why `autoexp`
 
 When experiments are just scripts and folders, the boring parts become fragile:
 
@@ -14,14 +18,14 @@ When experiments are just scripts and folders, the boring parts become fragile:
 - What should the report include?
 - How should an agent inspect or rerun this reliably?
 
-Autoexp gives every experiment a small workspace with repeatable runs, stable run IDs, local artifacts, and agent-readable context.
+**autoexp** gives every experiment a small workspace with repeatable runs, stable run IDs, local artifacts, and agent-readable context.
 
 ## Features
 
 - **CLI workflow**: initialize projects, run experiments, list runs, restore old state, and diff runs.
 - **Local browser UI**: inspect runs, scripts, outputs, logs, reports, and edit script snapshots.
 - **Run snapshots**: every run keeps the script/config state that produced it.
-- **Private Autoexp history**: each execution records its source and configuration in isolated, project-local history.
+- **Private autoexp history**: each execution records its source and configuration in isolated, project-local history.
 - **Report bundles**: every run gets project-relative pointers to its params, outputs, logs, and reporting instructions.
 - **MCP server**: coding agents can inspect runs, edit scripts, run experiments, and write reports through structured tools.
 - **Flexible execution**: run Python, JavaScript, shell, or other commands through Docker isolation or the local host environment.

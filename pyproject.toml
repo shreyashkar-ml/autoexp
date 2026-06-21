@@ -38,7 +38,7 @@ packages = ["autoexp", "autoexp.ui", "autoexp.ui.assets"]
 
 [tool.setuptools.package-data]
 autoexp = ["instruction.txt", "report.txt"]
-"autoexp.ui" = ["index.html"]
+"autoexp.ui" = ["index.html", "*.png"]
 "autoexp.ui.assets" = ["*.css", "*.js"]
 
 [build-system]

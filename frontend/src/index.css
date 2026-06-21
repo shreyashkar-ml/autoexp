@@ -69,6 +69,15 @@
     box-shadow: 0 16px 42px hsl(var(--primary) / 0.055), inset 0 1px 0 hsl(var(--accent) / 0.18);
   }
 
+  .brand-logo {
+    @apply h-[54px] w-[180px] shrink-0 overflow-hidden;
+  }
+
+  .brand-logo img {
+    @apply block h-[180px] w-[180px] max-w-none;
+    transform: translateY(-61px);
+  }
+
   .project-band {
     @apply flex flex-col gap-3 rounded-lg border bg-card/80 px-4 py-3 shadow-sm lg:flex-row lg:items-center lg:justify-between;
   }

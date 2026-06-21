@@ -269,8 +269,8 @@ export default function App() {
     <main className="app-shell">
       <div className="page">
         <header className="global-header">
-          <div className="min-w-0">
-            <h1 className="text-xl font-semibold tracking-normal text-foreground">autoexp</h1>
+          <div className="brand-logo">
+            <img src="/autoexp.png" alt="Autoexp - Local Autonomous Experimentation" />
           </div>
 
           <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
