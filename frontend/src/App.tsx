@@ -1,53 +1,63 @@
-import { Edit3, FileCode2, FileText, FolderOpen, Moon, Play, RefreshCw, Save, Search, Square, Sun, X } from "lucide-react";
-import React, { useEffect, useMemo, useState } from "react";
+import {
+  AlertTriangle,
+  Check,
+  ChevronDown,
+  Clipboard,
+  Code2,
+  FileText,
+  FolderOpen,
+  Moon,
+  Pencil,
+  Play,
+  RefreshCw,
+  Save,
+  Search,
+  SlidersHorizontal,
+  Square,
+  Sun,
+  Terminal,
+  X,
+} from "lucide-react";
+import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
-import Editor from "@monaco-editor/react";
 import remarkGfm from "remark-gfm";
 
 import { api } from "@/api";
-import { Badge } from "@/components/ui/badge";
-import { Button } from "@/components/ui/button";
-import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table";
-import type { InstructionPayload, Project, ReportPayload, Run, SourcePayload } from "@/types";
+import type {
+  InstructionPayload,
+  ParamsPayload,
+  Project,
+  ReportPayload,
+  Run,
+  SourcePayload,
+} from "@/types";
 
+type Theme = "light" | "dark";
 type Panel =
   | { kind: "script"; run: Run; data: SourcePayload }
   | { kind: "report"; run: Run; data: ReportPayload }
-  | { kind: "instruction"; data: InstructionPayload };
-
+  | { kind: "instruction"; data: InstructionPayload }
+  | { kind: "params"; data: ParamsPayload }
+  | { kind: "log" };
 type JobState = { active: boolean; job: { status?: string } | null };
-
-const EDITOR_OPTIONS = {
-  automaticLayout: true,
-  minimap: { enabled: false },
-  scrollBeyondLastLine: false,
-  wordWrap: "on",
-  fontSize: 13,
-  lineNumbersMinChars: 3,
-  overviewRulerBorder: false,
-  renderLineHighlight: "none",
-} as const;
+type Toast = { id: number; message: string; kind?: "ok" | "bad" };
 
 function statusLabel(status: string) {
   return status === "success" ? "completed" : status || "unknown";
 }
 
-function editorLanguage(path: string) {
-  const ext = path.split(".").pop();
-  return {
-    css: "css",
-    html: "html",
-    js: "javascript",
-    jsx: "javascript",
-    json: "json",
-    md: "markdown",
-    py: "python",
-    sh: "shell",
-    ts: "typescript",
-    tsx: "typescript",
-    yaml: "yaml",
-    yml: "yaml",
-  }[ext || ""] || "text";
+function relativeTime(value?: string) {
+  if (!value) return "";
+  const normalized = value.replace(
+    /T(\d{2})-(\d{2})-(\d{2})Z$/,
+    "T$1:$2:$3Z",
+  );
+  const seconds = (Date.now() - new Date(normalized).getTime()) / 1000;
+  if (!Number.isFinite(seconds)) return value;
+  if (seconds < 60) return "just now";
+  if (seconds < 3600) return `${Math.floor(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.floor(seconds / 3600)}h ago`;
+  return `${Math.floor(seconds / 86400)}d ago`;
 }
 
 function nextScriptPath(path: string, files: { path: string }[]) {
@@ -58,6 +68,7 @@ function nextScriptPath(path: string, files: { path: string }[]) {
   const suffix = dot > 0 ? name.slice(dot) : "";
   const base = stem.replace(/_v\d+$/, "");
   let highest = 1;
+  const escaped = base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 
   for (const file of files) {
     const fileName = file.path.split("/").pop() || "";
@@ -65,75 +76,87 @@ function nextScriptPath(path: string, files: { path: string }[]) {
     const fileStem = fileDot > 0 ? fileName.slice(0, fileDot) : fileName;
     const fileSuffix = fileDot > 0 ? fileName.slice(fileDot) : "";
     if (fileSuffix !== suffix) continue;
-    if (fileStem === base) highest = Math.max(highest, 1);
-    const match = fileStem.match(new RegExp(`^${base.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}_v(\\d+)$`));
+    const match = fileStem.match(new RegExp(`^${escaped}_v(\\d+)$`));
     if (match) highest = Math.max(highest, Number(match[1]));
   }
-
   return [...parts, `${base}_v${highest + 1}${suffix}`].filter(Boolean).join("/");
 }
 
 export default function App() {
+  const [theme, setTheme] = useState<Theme>(() =>
+    window.localStorage.getItem("autoexp-theme") === "dark" ? "dark" : "light",
+  );
   const [projects, setProjects] = useState<Project[]>([]);
-  const [selectedProjectId, setSelectedProjectId] = useState("");
+  const [projectId, setProjectId] = useState("");
   const [runs, setRuns] = useState<Run[]>([]);
-  const [panel, setPanel] = useState<Panel | null>(null);
-  const [split, setSplit] = useState(50);
+  const [job, setJob] = useState<JobState>({ active: false, job: null });
+  const [query, setQuery] = useState("");
   const [selectedRun, setSelectedRun] = useState("");
+  const [panel, setPanel] = useState<Panel | null>(null);
+  const [leftColumn, setLeftColumn] = useState(52);
   const [loading, setLoading] = useState("");
   const [error, setError] = useState("");
-  const [query, setQuery] = useState("");
-  const [activeJob, setActiveJob] = useState<JobState>({ active: false, job: null });
-  const [theme, setTheme] = useState<"light" | "dark">(() => {
-    if (typeof window === "undefined") return "light";
-    return window.localStorage.getItem("autoexp-theme") === "dark" ? "dark" : "light";
-  });
+  const [toasts, setToasts] = useState<Toast[]>([]);
+  const searchRef = useRef<HTMLInputElement>(null);
 
-  const selectedProject = projects.find((project) => project.project_id === selectedProjectId) || null;
+  const project = projects.find((item) => item.project_id === projectId) || null;
 
-  function projectPath(path: string) {
+  const toast = useCallback((message: string, kind?: Toast["kind"]) => {
+    const id = Date.now() + Math.random();
+    setToasts((current) => [...current, { id, message, kind }]);
+    window.setTimeout(
+      () => setToasts((current) => current.filter((item) => item.id !== id)),
+      2800,
+    );
+  }, []);
+
+  function projectPath(path: string, id = projectId) {
     const joiner = path.includes("?") ? "&" : "?";
-    return `${path}${joiner}project_id=${encodeURIComponent(selectedProjectId)}`;
+    return `${path}${joiner}project_id=${encodeURIComponent(id)}`;
   }
 
-  async function loadProjects(preferredId = selectedProjectId) {
-    const suffix = preferredId ? `?project_id=${encodeURIComponent(preferredId)}` : "";
-    const data = await api<{ projects: Project[]; selected_project_id: string | null }>(`/api/projects${suffix}`);
+  async function loadProjects(preferred = projectId) {
+    const suffix = preferred ? `?project_id=${encodeURIComponent(preferred)}` : "";
+    const data = await api<{ projects: Project[]; selected_project_id: string | null }>(
+      `/api/projects${suffix}`,
+    );
     setProjects(data.projects || []);
-    const next = data.selected_project_id || data.projects.find((project) => project.exists)?.project_id || "";
-    setSelectedProjectId((current) => preferredId || current || next);
-    return preferredId || next;
+    const next =
+      data.selected_project_id ||
+      data.projects.find((item) => item.exists)?.project_id ||
+      "";
+    setProjectId((current) => preferred || current || next);
+    return preferred || next;
   }
 
-  async function loadRuns() {
-    if (!selectedProjectId) return;
-    const data = await api<{ runs: Run[] }>(projectPath("/api/runs?limit=100"));
-    setRuns(data.runs || []);
-  }
-
-  async function loadStatus() {
-    if (!selectedProjectId) {
-      setActiveJob({ active: false, job: null });
+  async function loadStatus(id = projectId) {
+    if (!id) {
+      setJob({ active: false, job: null });
       setRuns([]);
       return;
     }
-    const data = await api<{ run: JobState; runs: Run[] }>(projectPath("/api/status?limit=100"));
-    setActiveJob(data.run);
+    const data = await api<{ run: JobState; runs: Run[] }>(
+      projectPath("/api/status?limit=100", id),
+    );
+    setJob(data.run);
     setRuns(data.runs || []);
   }
 
   async function refresh() {
     setError("");
     try {
-      await loadProjects(selectedProjectId);
-      await loadStatus();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      const id = await loadProjects(projectId);
+      await loadStatus(id);
+      toast("Refreshed");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     }
   }
 
   useEffect(() => {
-    loadProjects().catch((err) => setError(err instanceof Error ? err.message : String(err)));
+    loadProjects().catch((caught) =>
+      setError(caught instanceof Error ? caught.message : String(caught)),
+    );
   }, []);
 
   useEffect(() => {
@@ -145,15 +168,33 @@ export default function App() {
     setPanel(null);
     setSelectedRun("");
     setQuery("");
-    loadStatus().catch((err) => setError(err instanceof Error ? err.message : String(err)));
+    loadStatus(projectId).catch((caught) =>
+      setError(caught instanceof Error ? caught.message : String(caught)),
+    );
     const timer = window.setInterval(() => {
-      loadStatus().catch((err) => setError(err instanceof Error ? err.message : String(err)));
-    }, 2500);
+      loadStatus(projectId).catch(() => undefined);
+    }, 1400);
     return () => window.clearInterval(timer);
-  }, [selectedProjectId]);
+  }, [projectId]);
+
+  useEffect(() => {
+    function shortcut(event: KeyboardEvent) {
+      if (event.key === "/" && document.activeElement !== searchRef.current) {
+        event.preventDefault();
+        searchRef.current?.focus();
+      } else if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
+        event.preventDefault();
+        if (project?.exists && !job.active) void startRun();
+      } else if (event.key === "Escape" && panel) {
+        setPanel(null);
+      }
+    }
+    window.addEventListener("keydown", shortcut);
+    return () => window.removeEventListener("keydown", shortcut);
+  }, [project, job.active, panel]);
 
   async function startRun(run?: Run) {
-    if (!selectedProjectId) return;
+    if (!projectId) return;
     if (run) setSelectedRun(run.run_id);
     setLoading(run ? `trigger:${run.run_id}` : "start");
     setError("");
@@ -161,30 +202,38 @@ export default function App() {
       const data = await api<JobState>("/api/run/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: selectedProjectId, ...(run ? { run_id: run.run_id } : {}) }),
+        body: JSON.stringify({
+          project_id: projectId,
+          ...(run ? { run_id: run.run_id } : {}),
+        }),
       });
-      setActiveJob(data);
-      await loadRuns();
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setJob(data);
+      await loadStatus(projectId);
+      toast(run ? `Re-running ${run.run_id}` : "Run started");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      setError(message);
+      toast("Couldn't start the run", "bad");
     } finally {
       setLoading("");
     }
   }
 
   async function stopRun() {
-    if (!selectedProjectId) return;
+    if (!projectId) return;
     setLoading("stop");
     setError("");
     try {
-      const data = await api<JobState>("/api/run/kill", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: selectedProjectId }),
-      });
-      setActiveJob(data);
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+      setJob(
+        await api<JobState>("/api/run/kill", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ project_id: projectId }),
+        }),
+      );
+      toast("Run stopped");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setLoading("");
     }
@@ -195,10 +244,12 @@ export default function App() {
     setLoading(`script:${run.run_id}`);
     setError("");
     try {
-      const data = await api<SourcePayload>(projectPath(`/api/run/source?run_id=${encodeURIComponent(run.run_id)}`));
+      const data = await api<SourcePayload>(
+        projectPath(`/api/run/source?run_id=${encodeURIComponent(run.run_id)}`),
+      );
       setPanel({ kind: "script", run, data });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setLoading("");
     }
@@ -209,37 +260,67 @@ export default function App() {
     setLoading(`report:${run.run_id}`);
     setError("");
     try {
-      const data = await api<ReportPayload>(projectPath(`/api/run/report?run_id=${encodeURIComponent(run.run_id)}`));
+      const data = await api<ReportPayload>(
+        projectPath(`/api/run/report?run_id=${encodeURIComponent(run.run_id)}`),
+      );
       setPanel({ kind: "report", run, data });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setLoading("");
     }
   }
 
   async function openInstruction() {
-    if (!selectedProjectId) return;
+    if (!projectId) return;
     setLoading("instruction");
     setError("");
     try {
-      const data = await api<InstructionPayload>(projectPath("/api/report/instruction"));
+      const data = await api<InstructionPayload>(
+        projectPath("/api/report/instruction"),
+      );
       setPanel({ kind: "instruction", data });
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
       setLoading("");
     }
   }
 
-  async function saveScriptFile(runId: string, path: string, text: string, saveAs: string) {
+  async function openParams() {
+    if (!projectId) return;
+    setLoading("params");
+    setError("");
+    try {
+      const data = await api<ParamsPayload>(projectPath("/api/script/params"));
+      setPanel({ kind: "params", data });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function saveScript(
+    runId: string,
+    path: string,
+    text: string,
+    saveAs: string,
+  ) {
     const result = await api<{ path: string; run: Run }>("/api/script/file", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: selectedProjectId, run_id: runId, path, text, save_as: saveAs }),
+      body: JSON.stringify({
+        project_id: projectId,
+        run_id: runId,
+        path,
+        text,
+        save_as: saveAs,
+      }),
     });
     setSelectedRun(result.run.run_id);
-    await loadStatus();
+    await loadStatus(projectId);
+    toast(`Saved ${saveAs}`, "ok");
     return result;
   }
 
@@ -247,17 +328,29 @@ export default function App() {
     const data = await api<InstructionPayload>("/api/report/instruction", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: selectedProjectId, text }),
+      body: JSON.stringify({ project_id: projectId, text }),
     });
     setPanel({ kind: "instruction", data });
+    toast("Instruction saved", "ok");
+    return data;
+  }
+
+  async function saveParams(params: Record<string, unknown>) {
+    const data = await api<ParamsPayload>("/api/script/params", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, params }),
+    });
+    setPanel({ kind: "params", data });
+    toast("Params saved", "ok");
     return data;
   }
 
   const filteredRuns = runs.filter((run) => {
-    const haystack = `${run.run_id} ${run.status} ${run.script_name || ""} ${run.report_path || ""} ${(run.output_files || []).join(" ")}`.toLowerCase();
-    return haystack.includes(query.toLowerCase());
+    const text =
+      `${run.run_id} ${run.status} ${run.script_name || ""} ${run.report_path || ""} ${(run.output_files || []).join(" ")}`.toLowerCase();
+    return text.includes(query.toLowerCase());
   });
-
   const metrics = {
     total: runs.length,
     completed: runs.filter((run) => run.status === "success").length,
@@ -266,285 +359,407 @@ export default function App() {
   };
 
   return (
-    <main className="app-shell">
-      <div className="page">
-        <header className="global-header">
-          <div className="brand-logo">
-            <img src="/autoexp.png" alt="Autoexp - Local Autonomous Experimentation" />
+    <>
+      <div className="shell">
+        <header className="topbar">
+          <div className="wordmark">
+            <b>auto<i>exp</i></b>
+            <span className="tag">local autonomous experimentation</span>
           </div>
-
-          <div className="flex min-w-0 flex-1 flex-wrap items-center justify-end gap-2">
-            <label className="project-picker">
-              <FolderOpen className="h-4 w-4 text-muted-foreground" />
-              <span className="text-xs font-medium uppercase text-muted-foreground">Project</span>
+          <div className="bar-spacer" />
+          <div className="bar-tools">
+            <label className="picker">
+              <FolderOpen size={15} />
+              <span className="lbl">project</span>
               <select
-                className="project-select"
-                value={selectedProjectId}
-                onChange={(event) => setSelectedProjectId(event.target.value)}
+                value={projectId}
+                onChange={(event) => setProjectId(event.target.value)}
                 disabled={!projects.length}
               >
                 {!projects.length ? <option value="">No projects</option> : null}
-                {projects.map((project) => (
-                  <option key={project.project_id} value={project.project_id} disabled={!project.exists}>
-                    {project.title}
+                {projects.map((item) => (
+                  <option
+                    key={item.project_id}
+                    value={item.project_id}
+                    disabled={!item.exists}
+                  >
+                    {item.title}{item.exists ? "" : " · missing"}
                   </option>
                 ))}
               </select>
+              <ChevronDown className="chev" size={15} />
             </label>
-
-            <Badge className={activeJob.active ? "border-primary bg-primary/10 text-primary" : "text-muted-foreground"}>
-              {activeJob.active ? `run ${activeJob.job?.status || "running"}` : "idle"}
-            </Badge>
-            <Button variant="outline" size="icon" onClick={refresh} disabled={loading === "start" || loading === "stop"} aria-label="Refresh">
-              <RefreshCw className="h-4 w-4" />
-            </Button>
-            <Button
-              variant="outline"
-              size="icon"
+            <span className={`lamp${job.active ? " live" : ""}`}>
+              <span className="dot" />
+              {job.active ? `run ${job.job?.status || "running"}` : "idle"}
+            </span>
+            <button className="icon-btn" onClick={refresh} title="Refresh" aria-label="Refresh">
+              <RefreshCw size={16} />
+            </button>
+            <button
+              className="icon-btn"
               onClick={() => setTheme(theme === "dark" ? "light" : "dark")}
-              aria-label={theme === "dark" ? "Use light mode" : "Use dark mode"}
+              title="Toggle theme"
+              aria-label="Toggle theme"
             >
-              {theme === "dark" ? <Sun className="h-4 w-4" /> : <Moon className="h-4 w-4" />}
-            </Button>
+              {theme === "dark" ? <Sun size={16} /> : <Moon size={16} />}
+            </button>
           </div>
         </header>
 
-        {selectedProject ? (
-          <section className="project-band">
-            <div className="min-w-0">
-              <div className="text-sm font-semibold text-foreground">{selectedProject.title}</div>
-              <div className="mono mt-1 truncate text-xs text-muted-foreground">{selectedProject.path}</div>
+        {project ? (
+          <section className="band">
+            <div className="meta">
+              <span className="title">{project.title}</span>
+              <span className="path">{project.path}</span>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              {activeJob.active ? (
-                <Button onClick={stopRun} disabled={loading === "stop"}>
-                  <Square className="h-4 w-4" />
-                  Stop
-                </Button>
+            <span className="runner">runner · {project.runner || "local"}</span>
+            <div className="actions">
+              {job.active ? (
+                <button className="btn danger" onClick={stopRun} disabled={loading === "stop"}>
+                  <Square size={15} fill="currentColor" /> Stop run
+                </button>
               ) : (
-                <Button onClick={() => startRun()} disabled={loading === "start" || !selectedProject.exists}>
-                  <Play className="h-4 w-4" />
-                  Run
-                </Button>
+                <button
+                  className="btn primary"
+                  onClick={() => startRun()}
+                  disabled={loading === "start" || !project.exists}
+                  title="Run the current script with current params · ⌘↵"
+                >
+                  <Play size={14} fill="currentColor" /> Run
+                </button>
               )}
-              <Button variant="outline" onClick={openInstruction} disabled={!selectedProject.exists}>
-                <FileText className="h-4 w-4" />
-                Report Instruction
-              </Button>
+              <button className="btn" onClick={() => setPanel({ kind: "log" })}>
+                <Terminal size={15} /> Live log
+              </button>
+              <button className="btn" onClick={openParams} disabled={!project.exists}>
+                <SlidersHorizontal size={15} /> Params
+              </button>
+              <button className="btn" onClick={openInstruction} disabled={!project.exists}>
+                <FileText size={15} /> Report instruction
+              </button>
             </div>
           </section>
         ) : null}
 
         {error ? (
-          <div className="rounded-md border border-destructive bg-destructive/10 px-3 py-2 text-sm text-destructive">
-            {error}
+          <div className="err-banner">
+            <AlertTriangle size={15} /> {error}
           </div>
         ) : null}
 
-        <section className="grid gap-3 md:grid-cols-4">
-          <Metric label="Runs" value={metrics.total} />
-          <Metric label="Completed" value={metrics.completed} tone="success" />
-          <Metric label="Failed" value={metrics.failed} tone="danger" />
-          <Metric label="Reports" value={metrics.reports} />
+        <section className="strip">
+          <Stat label="Runs" value={metrics.total} tone="runs" />
+          <Stat label="Completed" value={metrics.completed} tone="pass" total={metrics.total} />
+          <Stat label="Failed" value={metrics.failed} tone="fail" total={metrics.total} />
+          <Stat label="Reports" value={metrics.reports} tone="rep" total={metrics.total} />
         </section>
 
         <section
-          className={panel ? "workspace-split" : "grid min-h-0 flex-1"}
-          style={panel ? { gridTemplateColumns: `${split}% 6px minmax(0, 1fr)` } : undefined}
+          className={`work${panel ? " split" : ""}`}
+          style={panel ? ({ "--lcol": `${leftColumn}%` } as React.CSSProperties) : undefined}
         >
-          <div className="surface flex min-h-[520px] min-w-0 flex-col overflow-hidden">
-            <div className="flex flex-col gap-3 border-b p-4 md:flex-row md:items-center md:justify-between">
+          <div className="card">
+            <div className="card-head">
               <div>
-                <h2 className="text-base font-semibold">Recent runs</h2>
-                <p className="text-sm text-muted-foreground">{selectedProject ? "Project artifacts and reports" : "Create or register an Autoexp project to begin"}</p>
+                <div className="eyebrow">ledger</div>
+                <h2>Recent runs</h2>
               </div>
-              <label className="relative w-full md:w-72">
-                <Search className="pointer-events-none absolute left-3 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" />
+              <span className="sub">
+                {project
+                  ? "Each run pins the script and config that produced it"
+                  : "Create or register an autoexp project to begin"}
+              </span>
+              <div className="search">
+                <Search className="si" size={15} />
                 <input
-                  className="h-9 w-full rounded-md border bg-card pl-9 pr-3 text-sm outline-none focus:ring-2 focus:ring-ring"
+                  ref={searchRef}
                   placeholder="Filter runs"
                   value={query}
                   onChange={(event) => setQuery(event.target.value)}
-                  disabled={!selectedProject}
+                  disabled={!project}
                 />
-              </label>
+                <span className="kbd">/</span>
+              </div>
             </div>
-            <RunsTable
+            <RunLedger
               runs={filteredRuns}
-              selectedRun={selectedRun}
+              selected={selectedRun}
               loading={loading}
-              active={activeJob.active}
+              active={job.active}
+              project={project}
               onSelect={setSelectedRun}
               onScript={openScript}
               onReport={openReport}
               onTrigger={startRun}
+              onCopy={(runId) => {
+                void navigator.clipboard?.writeText(runId);
+                toast("Run ID copied");
+              }}
             />
+            {project ? (
+              <div className="hint-row ledger-hints">
+                <span><kbd>/</kbd> filter</span>
+                <span><kbd>⌘</kbd><kbd>↵</kbd> run</span>
+                <span><kbd>esc</kbd> close panel</span>
+                <span className="server-mode">live · autoexp server</span>
+              </div>
+            ) : null}
           </div>
-          {panel ? <SplitHandle value={split} onChange={setSplit} /> : null}
-          {panel ? <Viewer panel={panel} theme={theme} onSaveScript={saveScriptFile} onSaveInstruction={saveInstruction} onClose={() => setPanel(null)} /> : null}
+
+          {panel ? (
+            <SplitHandle value={leftColumn} onChange={setLeftColumn} />
+          ) : null}
+          {panel ? (
+            <Viewer
+              panel={panel}
+              theme={theme}
+              projectId={projectId}
+              active={job.active}
+              onSaveScript={saveScript}
+              onSaveInstruction={saveInstruction}
+              onSaveParams={saveParams}
+              onClose={() => setPanel(null)}
+            />
+          ) : null}
         </section>
       </div>
-    </main>
-  );
-}
 
-function SplitHandle({ value, onChange }: { value: number; onChange: (value: number) => void }) {
-  function startDrag(event: React.MouseEvent<HTMLButtonElement>) {
-    const container = event.currentTarget.parentElement;
-    if (!container) return;
-
-    const rect = container.getBoundingClientRect();
-    const move = (moveEvent: MouseEvent) => {
-      const next = ((moveEvent.clientX - rect.left) / rect.width) * 100;
-      onChange(Math.min(72, Math.max(28, next)));
-    };
-    const done = () => {
-      window.removeEventListener("mousemove", move);
-      window.removeEventListener("mouseup", done);
-    };
-
-    window.addEventListener("mousemove", move);
-    window.addEventListener("mouseup", done);
-  }
-
-  return (
-    <button
-      className="split-handle"
-      type="button"
-      aria-label="Resize viewer split"
-      aria-valuemin={28}
-      aria-valuemax={72}
-      aria-valuenow={Math.round(value)}
-      onMouseDown={startDrag}
-    />
-  );
-}
-
-function Metric({ label, value, tone }: { label: string; value: number; tone?: "success" | "danger" }) {
-  return (
-    <div className="metric">
-      <div className="text-sm text-muted-foreground">{label}</div>
-      <div className={tone === "success" ? "mt-2 text-2xl font-semibold text-accent" : tone === "danger" ? "mt-2 text-2xl font-semibold text-destructive" : "mt-2 text-2xl font-semibold text-primary"}>
-        {value}
+      <div className="toasts">
+        {toasts.map((item) => (
+          <div key={item.id} className={`toast${item.kind ? ` ${item.kind}` : ""}`}>
+            <span className="ti">
+              {item.kind === "ok" ? (
+                <Check size={15} />
+              ) : item.kind === "bad" ? (
+                <AlertTriangle size={15} />
+              ) : (
+                <RefreshCw size={15} />
+              )}
+            </span>
+            {item.message}
+          </div>
+        ))}
       </div>
+    </>
+  );
+}
+
+function Stat({
+  label,
+  value,
+  tone,
+  total,
+}: {
+  label: string;
+  value: number;
+  tone: "runs" | "pass" | "fail" | "rep";
+  total?: number;
+}) {
+  const percent = total ? Math.round((value / total) * 100) : null;
+  return (
+    <div className={`stat ${tone}`}>
+      <span className="k">{label}</span>
+      <span className="v">
+        {value}
+        {percent !== null && value > 0 ? <small>{percent}%</small> : null}
+      </span>
     </div>
   );
 }
 
-function RunsTable({
+function SplitHandle({
+  value,
+  onChange,
+}: {
+  value: number;
+  onChange: (value: number) => void;
+}) {
+  function startDrag(event: React.MouseEvent<HTMLDivElement>) {
+    const container = event.currentTarget.closest(".work");
+    if (!container) return;
+    const rect = container.getBoundingClientRect();
+    const move = (moveEvent: MouseEvent) => {
+      const next = ((moveEvent.clientX - rect.left) / rect.width) * 100;
+      onChange(Math.min(74, Math.max(30, next)));
+    };
+    const done = () => {
+      window.removeEventListener("mousemove", move);
+      window.removeEventListener("mouseup", done);
+      document.body.style.userSelect = "";
+    };
+    document.body.style.userSelect = "none";
+    window.addEventListener("mousemove", move);
+    window.addEventListener("mouseup", done);
+  }
+  return (
+    <div
+      className="handle"
+      role="separator"
+      aria-label="Resize panel"
+      tabIndex={0}
+      aria-valuenow={Math.round(value)}
+      aria-valuemin={30}
+      aria-valuemax={74}
+      onMouseDown={startDrag}
+      onKeyDown={(event) => {
+        if (event.key === "ArrowLeft") onChange(Math.max(30, value - 3));
+        if (event.key === "ArrowRight") onChange(Math.min(74, value + 3));
+      }}
+    >
+      <span className="grip" />
+    </div>
+  );
+}
+
+function RunLedger({
   runs,
-  selectedRun,
+  selected,
   loading,
   active,
+  project,
   onSelect,
   onScript,
   onReport,
   onTrigger,
+  onCopy,
 }: {
   runs: Run[];
-  selectedRun: string;
+  selected: string;
   loading: string;
   active: boolean;
+  project: Project | null;
   onSelect: (runId: string) => void;
   onScript: (run: Run) => void;
   onReport: (run: Run) => void;
   onTrigger: (run: Run) => void;
+  onCopy: (runId: string) => void;
 }) {
+  if (!project) {
+    return (
+      <div className="empty">
+        <div className="big">No project selected</div>
+        <div>Spin up a workspace, then open it here.</div>
+        <div className="cmd"><b>autoexp init</b> demo_eval &nbsp;·&nbsp; <b>autoexp view</b></div>
+      </div>
+    );
+  }
+  if (!runs.length) {
+    return (
+      <div className="empty">
+        <div className="big">No runs yet</div>
+        <div>Run the experiment to create the first traceable run.</div>
+        <div className="cmd"><b>autoexp run</b></div>
+      </div>
+    );
+  }
   return (
-    <div className="table-scroll flex-1 overflow-auto">
-      <Table className="min-w-[980px] table-fixed">
-        <TableHeader>
-          <TableRow>
-            <TableHead className="w-[22%] text-left">Run ID</TableHead>
-            <TableHead className="w-[14%]">Status</TableHead>
-            <TableHead className="w-[22%]">Script</TableHead>
-            <TableHead className="w-[18%]">Report</TableHead>
-            <TableHead className="w-[12%]">Output</TableHead>
-            <TableHead className="w-[12%]">Trigger</TableHead>
-          </TableRow>
-        </TableHeader>
-        <TableBody>
+    <div className="ledger-wrap">
+      <table className="ledger">
+        <thead>
+          <tr>
+            <th style={{ width: "26%" }}>Run</th>
+            <th style={{ width: "13%" }}>Status</th>
+            <th style={{ width: "21%" }}>Script</th>
+            <th style={{ width: "16%" }}>Report</th>
+            <th style={{ width: "16%" }}>Output</th>
+            <th style={{ width: "8%" }}>Re-run</th>
+          </tr>
+        </thead>
+        <tbody>
           {runs.map((run) => (
-            <TableRow
+            <tr
               key={run.run_id}
-              className={selectedRun === run.run_id ? "bg-muted/60" : ""}
+              className={selected === run.run_id ? "sel" : ""}
               onClick={() => onSelect(run.run_id)}
             >
-              <TableCell className="mono truncate text-left text-xs">{run.run_id}</TableCell>
-              <TableCell>
-                <span className={run.status === "failed" ? "font-semibold text-destructive" : "font-semibold text-accent"}>
+              <td>
+                <div className="runid">
+                  <div className="runid-stack">
+                    <span className="id">{run.run_id}</span>
+                    <span className="when">{relativeTime(run.created_at)}</span>
+                  </div>
+                  <button
+                    className="copy"
+                    title="Copy run ID"
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onCopy(run.run_id);
+                    }}
+                  >
+                    <Clipboard size={13} />
+                  </button>
+                </div>
+              </td>
+              <td>
+                <span className={`status ${run.status}`}>
+                  <span className="d" />
                   {statusLabel(run.status)}
                 </span>
-              </TableCell>
-              <TableCell>
-                <Button
-                  variant="outline"
-                  size="sm"
-                  className="max-w-full justify-start"
+              </td>
+              <td>
+                <button
+                  className="cell-btn"
                   onClick={(event) => {
                     event.stopPropagation();
                     onScript(run);
                   }}
                 >
-                  <FileCode2 className="h-4 w-4 shrink-0" />
-                  <span className="truncate">{loading === `script:${run.run_id}` ? "loading" : run.script_name || run.script || `script-${run.run_id}`}</span>
-                </Button>
-              </TableCell>
-              <TableCell>
+                  <Code2 size={14} />
+                  <span className="t">
+                    {loading === `script:${run.run_id}`
+                      ? "loading…"
+                      : run.script_name || run.script || "script"}
+                  </span>
+                </button>
+              </td>
+              <td>
                 {run.report_path ? (
-                  <Button
-                    variant="outline"
-                    size="sm"
+                  <button
+                    className="cell-btn"
                     onClick={(event) => {
                       event.stopPropagation();
                       onReport(run);
                     }}
                   >
-                    <FileText className="h-4 w-4" />
-                    {loading === `report:${run.run_id}` ? "loading" : "view report"}
-                  </Button>
+                    <FileText size={14} />
+                    <span className="t">
+                      {loading === `report:${run.run_id}` ? "loading…" : "view report"}
+                    </span>
+                  </button>
                 ) : (
-                  <span className="text-muted-foreground">-</span>
+                  <span className="dash">—</span>
                 )}
-              </TableCell>
-              <TableCell>
+              </td>
+              <td>
                 {run.output_files?.length ? (
-                  <span
-                    className="mono block truncate text-xs text-foreground"
-                    title={run.output_files.join("\n")}
-                  >
-                    {run.output_files[0]}
-                    {run.output_files.length > 1 ? ` +${run.output_files.length - 1}` : ""}
+                  <span className="out" title={run.output_files.join("\n")}>
+                    {run.output_files[0].split("/").pop()}
+                    {run.output_files.length > 1 ? (
+                      <span className="more"> +{run.output_files.length - 1}</span>
+                    ) : null}
                   </span>
                 ) : (
-                  <span className="text-muted-foreground">-</span>
+                  <span className="dash">—</span>
                 )}
-              </TableCell>
-              <TableCell>
-                <Button
-                  variant="outline"
-                  size="icon"
+              </td>
+              <td>
+                <button
+                  className="trigger"
                   disabled={active || loading === `trigger:${run.run_id}`}
-                  aria-label={`Run ${run.run_id}`}
+                  title="Re-run this snapshot"
                   onClick={(event) => {
                     event.stopPropagation();
                     onTrigger(run);
                   }}
                 >
-                  <Play className="h-4 w-4" />
-                </Button>
-              </TableCell>
-            </TableRow>
+                  <Play size={13} fill="currentColor" />
+                </button>
+              </td>
+            </tr>
           ))}
-          {!runs.length ? (
-            <TableRow>
-              <TableCell colSpan={6} className="h-16 text-left text-muted-foreground">
-                No runs yet.
-              </TableCell>
-            </TableRow>
-          ) : null}
-        </TableBody>
-      </Table>
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -552,118 +767,143 @@ function RunsTable({
 function Viewer({
   panel,
   theme,
+  projectId,
+  active,
   onSaveScript,
   onSaveInstruction,
+  onSaveParams,
   onClose,
 }: {
   panel: Panel;
-  theme: "light" | "dark";
-  onSaveScript: (runId: string, path: string, text: string, saveAs: string) => Promise<{ path: string; run: Run }>;
+  theme: Theme;
+  projectId: string;
+  active: boolean;
+  onSaveScript: (
+    runId: string,
+    path: string,
+    text: string,
+    saveAs: string,
+  ) => Promise<{ path: string; run: Run }>;
   onSaveInstruction: (text: string) => Promise<InstructionPayload>;
+  onSaveParams: (params: Record<string, unknown>) => Promise<ParamsPayload>;
   onClose: () => void;
 }) {
   const title =
     panel.kind === "script"
-      ? `${panel.run.run_id} / script`
+      ? <><span className="muted">{panel.run.run_id}</span> / script</>
       : panel.kind === "report"
-        ? `${panel.run.run_id} / report`
-        : "Report Instruction";
+        ? <><span className="muted">{panel.run.run_id}</span> / report</>
+        : panel.kind === "instruction"
+          ? "Report instruction"
+          : panel.kind === "params"
+            ? "Params · script/params.json"
+            : "Live log";
+  const Icon =
+    panel.kind === "report" || panel.kind === "instruction"
+      ? FileText
+      : panel.kind === "log"
+        ? Terminal
+        : panel.kind === "params"
+          ? SlidersHorizontal
+          : Code2;
 
   return (
-    <aside className="panel flex min-h-[520px] flex-col overflow-hidden">
-      <header className="flex min-h-14 items-center gap-2 border-b px-4">
-        <div className="min-w-0 flex-1">
-          <div className="mono truncate text-sm font-medium">{title}</div>
+    <aside className="card panel">
+      <div className="card-head">
+        <div className="ptitle">
+          <span className="ic"><Icon size={16} /></span>
+          <span className="txt">{title}</span>
         </div>
-        <Button variant="ghost" size="icon" onClick={onClose} aria-label="Close viewer">
-          <X className="h-4 w-4" />
-        </Button>
-      </header>
-      <div className="min-h-0 flex-1 overflow-auto">
+        <button className="btn ghost sm" onClick={onClose} aria-label="Close panel">
+          <X size={16} />
+        </button>
+      </div>
+      <div className="panel-body">
         {panel.kind === "script" ? (
-          <SourceViewer
+          <SourceEditor
             data={panel.data}
             theme={theme}
-            onSave={(path, text, saveAs) => onSaveScript(panel.run.run_id, path, text, saveAs)}
+            onSave={(path, text, saveAs) =>
+              onSaveScript(panel.run.run_id, path, text, saveAs)
+            }
           />
         ) : null}
-        {panel.kind === "report" ? <MarkdownViewer path={panel.data.path} text={panel.data.text} /> : null}
-        {panel.kind === "instruction" ? <InstructionEditor data={panel.data} theme={theme} onSave={onSaveInstruction} /> : null}
+        {panel.kind === "report" ? (
+          <MarkdownViewer path={panel.data.path} text={panel.data.text} />
+        ) : null}
+        {panel.kind === "instruction" ? (
+          <TextEditor
+            value={panel.data.text}
+            label={panel.data.source}
+            onSave={onSaveInstruction}
+          />
+        ) : null}
+        {panel.kind === "params" ? (
+          <ParamsEditor data={panel.data} onSave={onSaveParams} />
+        ) : null}
+        {panel.kind === "log" ? (
+          <LogViewer projectId={projectId} active={active} />
+        ) : null}
       </div>
     </aside>
   );
 }
 
-function InstructionEditor({
-  data,
-  theme,
-  onSave,
+function CodePane({
+  value,
+  editing,
+  onChange,
 }: {
-  data: InstructionPayload;
-  theme: "light" | "dark";
-  onSave: (text: string) => Promise<InstructionPayload>;
+  value: string;
+  editing: boolean;
+  onChange: (value: string) => void;
 }) {
-  const [draft, setDraft] = useState(data.text);
-  const [editing, setEditing] = useState(false);
-  const [saving, setSaving] = useState(false);
-
-  useEffect(() => {
-    setDraft(data.text);
-    setEditing(false);
-    setSaving(false);
-  }, [data]);
-
-  const changed = draft !== data.text;
-
-  async function save() {
-    if (!changed) return;
-    setSaving(true);
-    try {
-      await onSave(draft);
-      setEditing(false);
-    } finally {
-      setSaving(false);
-    }
-  }
-
+  const lines = value.split("\n");
   return (
-    <div className="flex h-full min-h-[520px] flex-col">
-      <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
-        <div className="mono min-w-0 flex-1 truncate text-sm text-muted-foreground">{data.source}</div>
-        <div className="ml-auto flex items-center gap-2">
-          <Button variant="outline" size="icon" onClick={() => setEditing(true)} disabled={editing} aria-label="Edit report instruction">
-            <Edit3 className="h-4 w-4" />
-          </Button>
-          {changed ? (
-            <Button size="icon" onClick={save} disabled={saving} aria-label="Save report instruction">
-              <Save className="h-4 w-4" />
-            </Button>
-          ) : null}
+    <div className="code">
+      <div className="codeflex">
+        <div className="gutter">
+          {lines.map((_, index) => <div key={index}>{index + 1}</div>)}
+        </div>
+        <div className="codearea">
+          {editing ? (
+            <textarea
+              spellCheck={false}
+              value={value}
+              onChange={(event) => onChange(event.target.value)}
+              onKeyDown={(event) => {
+                if (event.key !== "Tab") return;
+                event.preventDefault();
+                const target = event.currentTarget;
+                const start = target.selectionStart;
+                const end = target.selectionEnd;
+                onChange(value.slice(0, start) + "    " + value.slice(end));
+                requestAnimationFrame(() => {
+                  target.selectionStart = target.selectionEnd = start + 4;
+                });
+              }}
+              style={{ height: `${lines.length * 20.625 + 28}px` }}
+            />
+          ) : (
+            <pre><code>{value}</code></pre>
+          )}
         </div>
       </div>
-      <Editor
-        height="100%"
-        language="markdown"
-        theme={theme === "dark" ? "vs-dark" : "light"}
-        value={draft}
-        onChange={(value) => setDraft(value || "")}
-        options={{
-          ...EDITOR_OPTIONS,
-          readOnly: !editing,
-        }}
-      />
     </div>
   );
 }
 
-function SourceViewer({
+function SourceEditor({
   data,
-  theme,
   onSave,
 }: {
   data: SourcePayload;
-  theme: "light" | "dark";
-  onSave: (path: string, text: string, saveAs: string) => Promise<{ path: string; run: Run }>;
+  theme: Theme;
+  onSave: (
+    path: string,
+    text: string,
+    saveAs: string,
+  ) => Promise<{ path: string; run: Run }>;
 }) {
   const [files, setFiles] = useState(data.files);
   const [selected, setSelected] = useState(data.selected);
@@ -679,11 +919,8 @@ function SourceViewer({
   useEffect(() => {
     setFiles(data.files);
     setSelected(data.selected);
-    setSaveAs("");
     setEditing(false);
-    setSaving(false);
   }, [data]);
-
   useEffect(() => {
     setDraft(file?.text || "");
     setSaveAs(file ? nextScriptPath(file.path, files) : "");
@@ -691,19 +928,24 @@ function SourceViewer({
   }, [file?.path, files]);
 
   if (!file) {
-    return <EmptyViewer />;
+    return <Empty title="No script snapshot">This run has no source files to show.</Empty>;
   }
-
   const changed = draft !== file.text;
 
   async function save() {
     if (!changed) return;
     setSaving(true);
     try {
-      const result = await onSave(file.path, draft, saveAs || nextScriptPath(file.path, files));
+      const result = await onSave(
+        file.path,
+        draft,
+        saveAs || nextScriptPath(file.path, files),
+      );
       setFiles((current) =>
         current.some((item) => item.path === result.path)
-          ? current.map((item) => item.path === result.path ? { ...item, text: draft } : item)
+          ? current.map((item) =>
+              item.path === result.path ? { ...item, text: draft } : item,
+            )
           : [...current, { path: result.path, text: draft }],
       );
       setSelected(result.path);
@@ -714,76 +956,250 @@ function SourceViewer({
   }
 
   return (
-    <div className="flex h-full min-h-[520px] flex-col">
-      <div className="flex flex-wrap items-center gap-2 border-b px-3 py-2">
-        <select
-          className="mono h-9 max-w-full flex-1 rounded-md border bg-card px-3 text-sm md:flex-none"
-          value={file.path}
-          onChange={(event) => setSelected(event.target.value)}
-        >
+    <div className="editor-shell">
+      <div className="ptools">
+        <select value={file.path} onChange={(event) => setSelected(event.target.value)}>
           {files.map((item) => (
-            <option key={item.path} value={item.path}>
-              {item.path}
-            </option>
+            <option key={item.path} value={item.path}>{item.path}</option>
           ))}
         </select>
         {editing ? (
           <input
-            className="mono h-9 min-w-[180px] flex-1 rounded-md border bg-card px-3 text-sm"
+            className="saveas"
             value={saveAs}
             onChange={(event) => setSaveAs(event.target.value)}
-            aria-label="Saved script name"
+            aria-label="Save as new snapshot"
           />
         ) : null}
-        <div className="ml-auto flex items-center gap-2">
-          <Button
-            variant="outline"
-            size="icon"
-            onClick={() => setEditing(true)}
-            disabled={editing}
-            aria-label="Edit script"
-          >
-            <Edit3 className="h-4 w-4" />
-          </Button>
-          {changed ? (
-            <Button size="icon" onClick={save} disabled={saving} aria-label="Save script">
-              <Save className="h-4 w-4" />
-            </Button>
-          ) : null}
+        <div className="right">
+          {editing && changed ? <span className="savehint">saves a new snapshot</span> : null}
+          {!editing ? (
+            <button className="btn sm" onClick={() => setEditing(true)}>
+              <Pencil size={14} /> Edit
+            </button>
+          ) : (
+            <button className="btn primary sm" onClick={save} disabled={!changed || saving}>
+              <Save size={14} /> {saving ? "Saving…" : "Save snapshot"}
+            </button>
+          )}
         </div>
       </div>
-      <Editor
-        height="100%"
-        language={editorLanguage(file.path)}
-        theme={theme === "dark" ? "vs-dark" : "light"}
-        value={draft}
-        onChange={(value) => setDraft(value || "")}
-        options={{
-          ...EDITOR_OPTIONS,
-          readOnly: !editing,
-        }}
-      />
+      <CodePane value={editing ? draft : file.text} editing={editing} onChange={setDraft} />
+    </div>
+  );
+}
+
+function ParamsEditor({
+  data,
+  onSave,
+}: {
+  data: ParamsPayload;
+  onSave: (params: Record<string, unknown>) => Promise<ParamsPayload>;
+}) {
+  const initial = JSON.stringify(data.params || {}, null, 2);
+  const [draft, setDraft] = useState(initial);
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  const [invalid, setInvalid] = useState(false);
+
+  useEffect(() => {
+    setDraft(JSON.stringify(data.params || {}, null, 2));
+    setEditing(false);
+    setInvalid(false);
+  }, [data]);
+  const changed = draft !== initial;
+
+  function update(value: string) {
+    setDraft(value);
+    try {
+      JSON.parse(value);
+      setInvalid(false);
+    } catch {
+      setInvalid(true);
+    }
+  }
+  async function save() {
+    if (!changed || invalid) return;
+    setSaving(true);
+    try {
+      await onSave(JSON.parse(draft) as Record<string, unknown>);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="editor-shell">
+      <div className="ptools">
+        <span className="tool-label">script/params.json · applied on the next run</span>
+        <div className="right">
+          {editing && invalid ? <span className="savehint invalid">invalid JSON</span> : null}
+          {!editing ? (
+            <button className="btn sm" onClick={() => setEditing(true)}>
+              <Pencil size={14} /> Edit
+            </button>
+          ) : (
+            <button
+              className="btn primary sm"
+              onClick={save}
+              disabled={!changed || invalid || saving}
+            >
+              <Save size={14} /> {saving ? "Saving…" : "Save"}
+            </button>
+          )}
+        </div>
+      </div>
+      <CodePane value={draft} editing={editing} onChange={update} />
+    </div>
+  );
+}
+
+function TextEditor({
+  value,
+  label,
+  onSave,
+}: {
+  value: string;
+  label: string;
+  onSave: (text: string) => Promise<InstructionPayload>;
+}) {
+  const [draft, setDraft] = useState(value);
+  const [editing, setEditing] = useState(false);
+  const [saving, setSaving] = useState(false);
+  useEffect(() => {
+    setDraft(value);
+    setEditing(false);
+  }, [value]);
+  const changed = draft !== value;
+
+  async function save() {
+    if (!changed) return;
+    setSaving(true);
+    try {
+      await onSave(draft);
+      setEditing(false);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <div className="editor-shell">
+      <div className="ptools">
+        <span className="tool-label">{label}</span>
+        <div className="right">
+          {!editing ? (
+            <button className="btn sm" onClick={() => setEditing(true)}>
+              <Pencil size={14} /> Edit
+            </button>
+          ) : (
+            <button className="btn primary sm" onClick={save} disabled={!changed || saving}>
+              <Save size={14} /> {saving ? "Saving…" : "Save"}
+            </button>
+          )}
+        </div>
+      </div>
+      <CodePane value={draft} editing={editing} onChange={setDraft} />
     </div>
   );
 }
 
 function MarkdownViewer({ path, text }: { path: string; text: string }) {
   if (!text) {
-    return <EmptyViewer />;
+    return (
+      <Empty title="No report yet">
+        Write a report under this run&apos;s <span className="mono-inline">report/</span> directory,
+        or let an agent generate one.
+      </Empty>
+    );
   }
-
   return (
-    <article className="markdown">
-      {path ? <p className="mono text-sm text-muted-foreground">{path}</p> : null}
-      <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
-    </article>
+    <div className="md">
+      {path ? <div className="mpath">{path}</div> : null}
+      <div className="mbody">
+        <ReactMarkdown remarkPlugins={[remarkGfm]}>{text}</ReactMarkdown>
+      </div>
+    </div>
   );
 }
 
-function EmptyViewer() {
+function LogViewer({
+  projectId,
+  active,
+}: {
+  projectId: string;
+  active: boolean;
+}) {
+  const [log, setLog] = useState("");
+  const viewRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    let mounted = true;
+    const pull = async () => {
+      try {
+        const data = await api<{ log: string }>(
+          `/api/run/log?tail_bytes=65536&project_id=${encodeURIComponent(projectId)}`,
+        );
+        if (mounted) setLog(data.log || "");
+      } catch {
+        // Status polling reports server errors in the main banner.
+      }
+    };
+    void pull();
+    const timer = window.setInterval(pull, 1000);
+    return () => {
+      mounted = false;
+      window.clearInterval(timer);
+    };
+  }, [projectId]);
+
+  useEffect(() => {
+    if (viewRef.current) viewRef.current.scrollTop = viewRef.current.scrollHeight;
+  }, [log]);
+
   return (
-    <div className="grid min-h-[360px] place-items-center px-6 text-center text-muted-foreground">
-      -
+    <div className="log">
+      <div className="logbar">
+        {active ? (
+          <span className="live"><span className="d" />active run · streaming stdout</span>
+        ) : (
+          <span className="idle">no active run · showing the last job&apos;s output</span>
+        )}
+        <span className="log-project">{projectId}</span>
+      </div>
+      <div className="logview" ref={viewRef}>
+        {log ? (
+          log.split("\n").map((line, index) => {
+            const className = /exit 0|finished|wrote/.test(line)
+              ? "ok"
+              : /error|fail|\^C|canceled|traceback/i.test(line)
+                ? "err"
+                : /^\$|^resolved|^starting|^loaded/.test(line)
+                  ? "dim"
+                  : "ln";
+            return <div key={index} className={className}>{line || " "}</div>;
+          })
+        ) : (
+          <div className="dim">waiting for output…</div>
+        )}
+        {active ? <span className="cursor" /> : null}
+      </div>
+    </div>
+  );
+}
+
+function Empty({
+  title,
+  children,
+}: {
+  title: string;
+  children: React.ReactNode;
+}) {
+  return (
+    <div className="empty">
+      <div className="big">{title}</div>
+      <div>{children}</div>
     </div>
   );
 }

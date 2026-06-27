@@ -1,14 +1,28 @@
 from pathlib import Path
 
 from .runs import get_run, script_name, source_root_for_run
-from .workspace import APP_ENV, PROJECT_CONFIG, PROJECT_REPORT_INSTRUCTIONS, die, project_root, read_json, write_json
+from .workspace import (
+    APP_ENV,
+    PROJECT_CONFIG,
+    PROJECT_REPORT_INSTRUCTIONS,
+    ensure_within_project,
+    read_json,
+    resolve_root,
+    run_dir_for,
+    write_json,
+)
+
+
+INSIDE_PROJECT_MSG = "report instruction file must stay inside the autoexp project"
 
 
 def app_env_keys(root=None):
-    root = project_root() if root is None else Path(root)
-    path, keys = root / APP_ENV, []
+    """Names of the variables declared in app.env (values are never returned)."""
+    root = resolve_root(root)
+    path = root / APP_ENV
     if not path.exists():
-        return keys
+        return []
+    keys = []
     for line in path.read_text().splitlines():
         line = line.strip()
         if line and not line.startswith("#") and "=" in line:
@@ -16,12 +30,15 @@ def app_env_keys(root=None):
     return keys
 
 
-def report_instruction(root=None):
-    root = project_root() if root is None else Path(root)
+def _configured_instruction_path(root):
     configured = read_json(root / PROJECT_CONFIG).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
-    path = Path(configured)
-    if path.is_absolute() or ".." in path.parts or not path.name:
-        raise ValueError("report instruction file must stay inside the autoexp project")
+    return configured, ensure_within_project(configured, INSIDE_PROJECT_MSG)
+
+
+def report_instruction(root=None):
+    """Read the active report-instruction file, returning its source path and text."""
+    root = resolve_root(root)
+    configured, path = _configured_instruction_path(root)
     target = root / path
     if not target.is_file():
         raise FileNotFoundError(f"missing report instruction file: {configured}")
@@ -29,16 +46,17 @@ def report_instruction(root=None):
 
 
 def set_report_instruction(path, root=None):
-    root, path = project_root() if root is None else Path(root), Path(path)
+    """Point the project at a different report-instruction file."""
+    root = resolve_root(root)
+    path = Path(path)
     if path.is_absolute():
         try:
             path = path.relative_to(root)
         except ValueError:
-            die("report instruction file must live inside the autoexp project")
-    if ".." in path.parts or not path.name:
-        die("report instruction file must live inside the autoexp project")
+            raise ValueError(INSIDE_PROJECT_MSG)
+    path = ensure_within_project(path, INSIDE_PROJECT_MSG)
     if not (root / path).is_file():
-        die(f"missing report instruction file: {path}")
+        raise FileNotFoundError(f"missing report instruction file: {path}")
     cfg = read_json(root / PROJECT_CONFIG)
     cfg["report_instruction_file"] = path.as_posix()
     write_json(root / PROJECT_CONFIG, cfg)
@@ -46,13 +64,15 @@ def set_report_instruction(path, root=None):
 
 
 def write_report_instruction(text, root=None):
+    """Overwrite the active report-instruction file's text."""
     if not isinstance(text, str):
         raise ValueError("text must be a string")
-    root = project_root() if root is None else Path(root)
+    root = resolve_root(root)
     cfg = read_json(root / PROJECT_CONFIG)
-    path = Path(cfg.get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS)
-    if path.is_absolute() or ".." in path.parts or not path.name:
-        raise ValueError("report instruction file must stay inside the autoexp project")
+    path = ensure_within_project(
+        cfg.get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS,
+        INSIDE_PROJECT_MSG,
+    )
     target = root / path
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text)
@@ -63,29 +83,40 @@ def write_report_instruction(text, root=None):
 
 
 def artifact_files(base):
+    """Every file under base, as {path, text} relative to base."""
     base = Path(base)
     if not base.exists():
         return []
     return [
         {"path": item.relative_to(base).as_posix(), "text": item.read_text(errors="replace")}
-        for item in sorted(base.rglob("*")) if item.is_file()
+        for item in sorted(base.rglob("*"))
+        if item.is_file()
     ]
 
 
 def artifact_paths(base, root):
+    """Every file under base, as project-relative path strings."""
     base = Path(base)
-    return [item.relative_to(root).as_posix() for item in sorted(base.rglob("*")) if item.is_file()] if base.exists() else []
+    if not base.exists():
+        return []
+    return [
+        item.relative_to(root).as_posix()
+        for item in sorted(base.rglob("*"))
+        if item.is_file()
+    ]
 
 
 def write_report_bundle(run_id, root=None):
-    root = project_root() if root is None else Path(root)
+    """Write runs/<id>/report/report_bundle.json: pointers a reporter needs in one place."""
+    root = resolve_root(root)
     run = get_run(run_id, root)
-    run_dir = root / (run.get("run_dir") or f"runs/{run_id}")
+    run_dir = run_dir_for(run, root)
     if not run_dir.exists():
-        die(f"missing run directory: {run_dir.relative_to(root)}")
+        raise FileNotFoundError(f"missing run directory: {run_dir.relative_to(root)}")
     source_root = source_root_for_run(run, root)
     params_path = source_root / "script" / "params.json"
-    report_dir, bundle_path = run_dir / "report", run_dir / "report" / "report_bundle.json"
+    report_dir = run_dir / "report"
+    bundle_path = report_dir / "report_bundle.json"
     report_dir.mkdir(parents=True, exist_ok=True)
     bundle = {
         "bundle_path": bundle_path.relative_to(root).as_posix(),

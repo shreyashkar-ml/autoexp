@@ -14,6 +14,7 @@ export type Project = {
   path: string;
   exists: boolean;
   last_opened_at?: string;
+  runner?: "docker" | "local" | string;
 };
 
 export type SourceFile = {
@@ -37,4 +38,9 @@ export type ReportPayload = {
 export type InstructionPayload = {
   source: string;
   text: string;
+};
+
+export type ParamsPayload = {
+  schema: Record<string, unknown> | null;
+  params: Record<string, unknown> | null;
 };

@@ -45,12 +45,16 @@ Path(ctx["output_dir"]).mkdir(parents=True, exist_ok=True)
 """
 
 
+# --- small primitives -------------------------------------------------------
+
 def die(message):
+    """Print a user-facing error and stop the program."""
     print(f"error: {message}", file=sys.stderr)
     raise SystemExit(1)
 
 
 def now():
+    """UTC timestamp in a filename-safe ISO-like form."""
     return time.strftime("%Y-%m-%dT%H-%M-%SZ", time.gmtime())
 
 
@@ -61,6 +65,52 @@ def read_json(path):
 def write_json(path, data):
     path.write_text(json.dumps(data, indent=2) + "\n")
 
+
+# --- project location & path safety -----------------------------------------
+
+def is_project_root(path):
+    """True when path has the directory/file shape Autoexp expects of a project."""
+    path = Path(path)
+    has_dirs = (path / "script").is_dir() and (path / "runs").is_dir()
+    has_files = all(
+        (path / name).is_file()
+        for name in (PROJECT_CONFIG, PROJECT_INSTRUCTIONS, ".gitignore")
+    )
+    return has_dirs and has_files
+
+
+def project_root():
+    """Walk up from the current directory to the nearest project root."""
+    for path in (Path.cwd(), *Path.cwd().parents):
+        if is_project_root(path):
+            return path
+    die("not an autoexp project; run `autoexp init <project_name>` first")
+
+
+def resolve_root(root=None):
+    """The active project root: the caller's path, or the discovered one."""
+    return project_root() if root is None else Path(root)
+
+
+def run_dir_for(run, root):
+    """On-disk location of a run, honoring an explicit run_dir or the default layout."""
+    return Path(root) / (run.get("run_dir") or f"runs/{run['run_id']}")
+
+
+def is_within_project(path):
+    """True when path is relative, has a name, and cannot escape via '..'."""
+    path = Path(path)
+    return not path.is_absolute() and ".." not in path.parts and bool(path.name)
+
+
+def ensure_within_project(path, message):
+    """Return path as a Path, raising ValueError if it would escape the project."""
+    if not is_within_project(path):
+        raise ValueError(message)
+    return Path(path)
+
+
+# --- per-user project registry ----------------------------------------------
 
 def user_data_dir():
     override = os.environ.get("AUTOEXP_HOME")
@@ -100,26 +150,27 @@ def registry_db():
 
 def project_title(root):
     path = Path(root) / PROJECT_CONFIG
-    return (read_json(path).get("title") or Path(root).name) if path.exists() else Path(root).name
+    if not path.exists():
+        return Path(root).name
+    return read_json(path).get("title") or Path(root).name
 
 
-def is_project_root(path):
-    path = Path(path)
-    return (path / "script").is_dir() and (path / "runs").is_dir() and all(
-        (path / name).is_file() for name in (PROJECT_CONFIG, PROJECT_INSTRUCTIONS, ".gitignore")
-    )
-
-
-def project_root():
-    for path in (Path.cwd(), *Path.cwd().parents):
-        if is_project_root(path):
-            return path
-    die("not an autoexp project; run `autoexp init <project_name>` first")
+def project_runner(root):
+    path = Path(root) / PROJECT_CONFIG
+    if not path.exists():
+        return "local"
+    return read_json(path).get("runner", "local")
 
 
 def project_entry(root):
     root = Path(root).resolve()
-    return {"project_id": project_id(root), "title": project_title(root), "path": str(root), "exists": is_project_root(root)}
+    return {
+        "project_id": project_id(root),
+        "title": project_title(root),
+        "path": str(root),
+        "exists": is_project_root(root),
+        "runner": project_runner(root),
+    }
 
 
 def register_project(root):
@@ -144,16 +195,19 @@ def list_registered_projects():
     conn = registry_db()
     rows = conn.execute("select * from projects order by last_opened_at desc, title").fetchall()
     conn.close()
-    return [
-        {
+    projects = []
+    for row in rows:
+        path = Path(row["path"])
+        exists = is_project_root(path)
+        projects.append({
             "project_id": row["project_id"],
-            "title": project_title(Path(row["path"])) if is_project_root(Path(row["path"])) else row["title"],
+            "title": project_title(path) if exists else row["title"],
             "path": row["path"],
-            "exists": is_project_root(Path(row["path"])),
+            "exists": exists,
+            "runner": project_runner(path) if exists else "local",
             "last_opened_at": row["last_opened_at"],
-        }
-        for row in rows
-    ]
+        })
+    return projects
 
 
 def resolve_registered_project(project=None):
@@ -170,60 +224,103 @@ def resolve_registered_project(project=None):
     die(f"unknown autoexp project: {selected}")
 
 
+# --- .gitignore matching -----------------------------------------------------
+
 def gitignore_patterns(root):
     path = Path(root) / ".gitignore"
-    return [] if not path.exists() else [
-        line.strip() for line in path.read_text().splitlines()
+    if not path.exists():
+        return []
+    return [
+        line.strip()
+        for line in path.read_text().splitlines()
         if line.strip() and not line.lstrip().startswith(("#", "!"))
     ]
 
 
 def ignored(rel, patterns):
-    name, parts = Path(rel).name, Path(rel).parts
+    """True when project-relative path `rel` matches any .gitignore pattern."""
+    name = Path(rel).name
+    parts = Path(rel).parts
     for raw in patterns:
-        anchored, pattern = raw.startswith("/"), raw.lstrip("/")
-        directory, pattern = pattern.endswith("/"), pattern.rstrip("/")
-        if directory and ((anchored and (rel == pattern or rel.startswith(f"{pattern}/"))) or (not anchored and pattern in parts)):
-            return True
-        if not directory and (fnmatch.fnmatchcase(rel, pattern) or fnmatch.fnmatchcase(name, pattern)):
+        anchored = raw.startswith("/")
+        pattern = raw.lstrip("/")
+        is_dir_pattern = pattern.endswith("/")
+        pattern = pattern.rstrip("/")
+        if is_dir_pattern:
+            if anchored and (rel == pattern or rel.startswith(f"{pattern}/")):
+                return True
+            if not anchored and pattern in parts:
+                return True
+        elif fnmatch.fnmatchcase(rel, pattern) or fnmatch.fnmatchcase(name, pattern):
             return True
     return False
 
 
+# --- source set & script manifest -------------------------------------------
+
 def source_paths(root=None):
-    root = project_root() if root is None else Path(root)
+    """The tracked source set: script/, config, contract, .gitignore, and report instruction."""
+    root = resolve_root(root)
     paths = list(SOURCE_PATHS)
     configured = read_json(root / PROJECT_CONFIG).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
     report_path = Path(configured)
-    if not report_path.is_absolute() and ".." not in report_path.parts and report_path.name:
+    if is_within_project(report_path):
         paths.insert(-1, report_path.as_posix())
     return tuple(paths)
 
 
 def script_manifest(root=None):
-    root = project_root() if root is None else Path(root)
+    """Read and validate script/stage.json."""
+    root = resolve_root(root)
     path = root / "script" / "stage.json"
-    manifest = read_json(path) if path.exists() else die(f"missing {path}")
+    if not path.exists():
+        die(f"missing {path}")
+    manifest = read_json(path)
     for key in ("name", "command", "working_dir", "interface_version"):
         if key not in manifest:
             die(f"{path} missing `{key}`")
     return manifest
 
 
+# --- project scaffolding -----------------------------------------------------
+
 def write_default_project(root, title, runner):
     for name in ("script", "runs", ".autoexp"):
         (root / name).mkdir(parents=True)
-    write_json(root / PROJECT_CONFIG, {"title": title, "description": "", "runner": runner, "sandbox": {"image": "python:3.12-slim", "network": "none", "cpus": "1", "memory": "512m"}, "runtime": {}, "report_instruction_file": PROJECT_REPORT_INSTRUCTIONS})
-    write_json(root / "script" / "stage.json", {"name": "script", "command": "python script.py --ctx ${CTX}", "working_dir": "script", "interface_version": "1"})
+
+    write_json(root / PROJECT_CONFIG, {
+        "title": title,
+        "description": "",
+        "runner": runner,
+        "sandbox": {"image": "python:3.12-slim", "network": "none", "cpus": "1", "memory": "512m"},
+        "runtime": {},
+        "report_instruction_file": PROJECT_REPORT_INSTRUCTIONS,
+    })
+    write_json(root / "script" / "stage.json", {
+        "name": "script",
+        "command": "python script.py --ctx ${CTX}",
+        "working_dir": "script",
+        "interface_version": "1",
+    })
     write_json(root / "script" / "params.json", {"message": "hello from script params"})
-    write_json(root / "script" / "params.schema.json", {"type": "object", "properties": {"message": {"type": "string", "title": "Message", "default": "hello from script params"}}, "required": ["message"]})
+    write_json(root / "script" / "params.schema.json", {
+        "type": "object",
+        "properties": {"message": {"type": "string", "title": "Message", "default": "hello from script params"}},
+        "required": ["message"],
+    })
     (root / "script" / "script.py").write_text(DEFAULT_SCRIPT)
     (root / PROJECT_INSTRUCTIONS).write_text(INSTRUCTION_FILE.read_text())
     (root / PROJECT_REPORT_INSTRUCTIONS).write_text(BUILTIN_REPORT_INSTRUCTIONS.read_text())
     (root / "AGENTS.md").write_text(AGENTS_TEXT)
     write_json(root / ".mcp.json", {"mcpServers": {"autoexp": {"command": "autoexp", "args": ["mcp"]}}})
-    (root / APP_ENV).write_text("# Project-local environment for Autoexp runs.\n# Values here are passed to the runner and remain outside Autoexp history.\nAUTOEXP_MESSAGE=hello from app.env\n")
-    (root / ".gitignore").write_text("/.autoexp/\n/app.env\n/index.sqlite\n/runs/\n/server/\n__pycache__/\n*.pyc\n")
+    (root / APP_ENV).write_text(
+        "# Project-local environment for Autoexp runs.\n"
+        "# Values here are passed to the runner and remain outside Autoexp history.\n"
+        "AUTOEXP_MESSAGE=hello from app.env\n"
+    )
+    (root / ".gitignore").write_text(
+        "/.autoexp/\n/app.env\n/index.sqlite\n/runs/\n/server/\n__pycache__/\n*.pyc\n"
+    )
 
 
 def create_project(root, title, runner="local"):
