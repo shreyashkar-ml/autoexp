@@ -5,17 +5,24 @@ import {
   Clipboard,
   Code2,
   FileText,
+  FlaskConical,
   FolderOpen,
+  GitBranch,
+  GitCommit,
+  Lock,
   Moon,
   Pencil,
   Play,
   RefreshCw,
+  Repeat2,
   Save,
   Search,
   SlidersHorizontal,
   Square,
   Sun,
   Terminal,
+  Target,
+  Bot,
   X,
 } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -28,22 +35,49 @@ import type {
   ParamsPayload,
   Project,
   ReportPayload,
+  ResearchExperiment,
+  ResearchFilePayload,
+  ResearchObjective,
+  ResearchState,
   Run,
   SourcePayload,
 } from "@/types";
 
 type Theme = "light" | "dark";
+type ProjectMode = "standard" | "autoresearch";
 type Panel =
   | { kind: "script"; run: Run; data: SourcePayload }
   | { kind: "report"; run: Run; data: ReportPayload }
   | { kind: "instruction"; data: InstructionPayload }
   | { kind: "params"; data: ParamsPayload }
+  | { kind: "program"; data: ResearchFilePayload }
+  | { kind: "evaluator"; data: ResearchFilePayload }
+  | { kind: "diff"; experiment: ResearchExperiment; objective: ResearchObjective }
   | { kind: "log" };
 type JobState = { active: boolean; job: { status?: string } | null };
 type Toast = { id: number; message: string; kind?: "ok" | "bad" };
 
+const EMPTY_RESEARCH: ResearchState = {
+  objective: { metric: "score", direction: "max", baseline: null, best: null, budget_sec: 300 },
+  files: [
+    { path: "script/program.md", role: "human", desc: "research directions and loop rules" },
+    { path: "script/train.py", role: "agent", desc: "the implementation the agent improves" },
+    { path: "script/evaluate.py", role: "frozen", desc: "the stable evaluator" },
+  ],
+  experiments: [],
+  loop: { active: false, phase: "idle", tag: null },
+};
+
 function statusLabel(status: string) {
   return status === "success" ? "completed" : status || "unknown";
+}
+
+function formatScore(score: number | null) {
+  if (score === null) return "—";
+  const magnitude = Math.abs(score);
+  if (magnitude >= 1000) return score.toLocaleString(undefined, { maximumFractionDigits: 2 });
+  if (magnitude > 0 && magnitude < 0.001) return score.toExponential(2);
+  return score.toFixed(4);
 }
 
 function relativeTime(value?: string) {
@@ -88,6 +122,7 @@ export default function App() {
   );
   const [projects, setProjects] = useState<Project[]>([]);
   const [projectId, setProjectId] = useState("");
+  const [projectMode, setProjectMode] = useState<ProjectMode>("standard");
   const [runs, setRuns] = useState<Run[]>([]);
   const [job, setJob] = useState<JobState>({ active: false, job: null });
   const [query, setQuery] = useState("");
@@ -97,9 +132,18 @@ export default function App() {
   const [loading, setLoading] = useState("");
   const [error, setError] = useState("");
   const [toasts, setToasts] = useState<Toast[]>([]);
+  const [research, setResearch] = useState<ResearchState | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
 
   const project = projects.find((item) => item.project_id === projectId) || null;
+  const isResearch = project?.mode === "autoresearch";
+  const researchView = projectMode === "autoresearch";
+  const filteredProjects = projects.filter((item) =>
+    projectMode === "autoresearch" ? item.mode === "autoresearch" : item.mode !== "autoresearch",
+  );
+  const hasAvailableProjects = filteredProjects.some((item) => item.exists);
+  const displayedResearch = researchView ? (project ? research : EMPTY_RESEARCH) : null;
+  const active = isResearch ? Boolean(research?.loop.active) : job.active;
 
   const toast = useCallback((message: string, kind?: Toast["kind"]) => {
     const id = Date.now() + Math.random();
@@ -120,13 +164,26 @@ export default function App() {
     const data = await api<{ projects: Project[]; selected_project_id: string | null }>(
       `/api/projects${suffix}`,
     );
-    setProjects(data.projects || []);
+    const items = data.projects || [];
+    const candidates = items.filter((item) =>
+      projectMode === "autoresearch" ? item.mode === "autoresearch" : item.mode !== "autoresearch",
+    );
     const next =
-      data.selected_project_id ||
-      data.projects.find((item) => item.exists)?.project_id ||
+      candidates.find((item) => item.exists && item.project_id === preferred)?.project_id ||
+      candidates.find((item) => item.exists && item.project_id === data.selected_project_id)?.project_id ||
+      candidates.find((item) => item.exists)?.project_id ||
       "";
-    setProjectId((current) => preferred || current || next);
-    return preferred || next;
+    setProjects(items);
+    setProjectId(next);
+    return next;
+  }
+
+  function switchProjectMode(mode: ProjectMode) {
+    setProjectMode(mode);
+    const next = projects.find((item) =>
+      item.exists && (mode === "autoresearch" ? item.mode === "autoresearch" : item.mode !== "autoresearch"),
+    );
+    setProjectId(next?.project_id || "");
   }
 
   async function loadStatus(id = projectId) {
@@ -142,11 +199,17 @@ export default function App() {
     setRuns(data.runs || []);
   }
 
+  async function loadResearch(id = projectId) {
+    if (!id) return;
+    setResearch(await api<ResearchState>(projectPath("/api/research", id)));
+  }
+
   async function refresh() {
     setError("");
     try {
       const id = await loadProjects(projectId);
       await loadStatus(id);
+      if (isResearch) await loadResearch(id);
       toast("Refreshed");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
@@ -168,14 +231,21 @@ export default function App() {
     setPanel(null);
     setSelectedRun("");
     setQuery("");
+    setResearch(null);
     loadStatus(projectId).catch((caught) =>
       setError(caught instanceof Error ? caught.message : String(caught)),
     );
+    if (isResearch) {
+      loadResearch(projectId).catch((caught) =>
+        setError(caught instanceof Error ? caught.message : String(caught)),
+      );
+    }
     const timer = window.setInterval(() => {
       loadStatus(projectId).catch(() => undefined);
+      if (isResearch) loadResearch(projectId).catch(() => undefined);
     }, 1400);
     return () => window.clearInterval(timer);
-  }, [projectId]);
+  }, [projectId, isResearch]);
 
   useEffect(() => {
     function shortcut(event: KeyboardEvent) {
@@ -184,14 +254,17 @@ export default function App() {
         searchRef.current?.focus();
       } else if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
         event.preventDefault();
-        if (project?.exists && !job.active) void startRun();
+        if (project?.exists && !active) {
+          if (isResearch) void startResearchLoop();
+          else void startRun();
+        }
       } else if (event.key === "Escape" && panel) {
         setPanel(null);
       }
     }
     window.addEventListener("keydown", shortcut);
     return () => window.removeEventListener("keydown", shortcut);
-  }, [project, job.active, panel]);
+  }, [project, active, isResearch, panel]);
 
   async function startRun(run?: Run) {
     if (!projectId) return;
@@ -346,6 +419,86 @@ export default function App() {
     return data;
   }
 
+  async function startResearchLoop() {
+    if (!projectId) return;
+    setLoading("research-loop");
+    setError("");
+    try {
+      await api<JobState>("/api/research/loop/start", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: projectId }),
+      });
+      await loadResearch(projectId);
+      toast("Autoresearch loop started");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function stopResearchLoop() {
+    if (!projectId) return;
+    setLoading("research-loop");
+    setError("");
+    try {
+      await api<JobState>("/api/research/loop/kill", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: projectId }),
+      });
+      await loadResearch(projectId);
+      toast("Autoresearch loop stopped");
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function openResearchFile(path: string) {
+    setLoading(`research-file:${path}`);
+    setError("");
+    try {
+      const data = await api<ResearchFilePayload>(
+        projectPath(`/api/research/file?path=${encodeURIComponent(path)}`),
+      );
+      setPanel(data.role === "human" ? { kind: "program", data } : { kind: "evaluator", data });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function openResearchDiff(experiment: ResearchExperiment) {
+    setSelectedRun(experiment.tag);
+    setLoading(`research-diff:${experiment.tag}`);
+    setError("");
+    try {
+      const data = await api<{ tag: string; diff: string }>(
+        projectPath(`/api/research/diff?tag=${encodeURIComponent(experiment.tag)}`),
+      );
+      setPanel({ kind: "diff", experiment: { ...experiment, diff: data.diff }, objective: research!.objective });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function saveProgram(text: string) {
+    const data = await api<ResearchFilePayload>("/api/research/program", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ project_id: projectId, text }),
+    });
+    setPanel({ kind: "program", data });
+    toast("Program saved", "ok");
+    return data;
+  }
+
   const filteredRuns = runs.filter((run) => {
     const text =
       `${run.run_id} ${run.status} ${run.script_name || ""} ${run.report_path || ""} ${(run.output_files || []).join(" ")}`.toLowerCase();
@@ -363,21 +516,44 @@ export default function App() {
       <div className="shell">
         <header className="topbar">
           <div className="wordmark">
-            <b>auto<i>exp</i></b>
+            <div className="logo-lockup">
+              <b>auto<i>exp</i></b>
+              {researchView ? (
+                <><span className="logo-divider">|</span><span className="submark">auto<i>research</i></span></>
+              ) : null}
+            </div>
             <span className="tag">local autonomous experimentation</span>
           </div>
           <div className="bar-spacer" />
           <div className="bar-tools">
+            <div className="mode-switch" role="group" aria-label="Project mode">
+              <button
+                className={projectMode === "standard" ? "active" : ""}
+                onClick={() => switchProjectMode("standard")}
+                aria-pressed={projectMode === "standard"}
+              >
+                Standard
+              </button>
+              <button
+                className={projectMode === "autoresearch" ? "active research" : ""}
+                onClick={() => switchProjectMode("autoresearch")}
+                aria-pressed={projectMode === "autoresearch"}
+              >
+                Autoresearch
+              </button>
+            </div>
             <label className="picker">
               <FolderOpen size={15} />
               <span className="lbl">project</span>
               <select
                 value={projectId}
                 onChange={(event) => setProjectId(event.target.value)}
-                disabled={!projects.length}
+                disabled={!hasAvailableProjects}
               >
-                {!projects.length ? <option value="">No projects</option> : null}
-                {projects.map((item) => (
+                {!hasAvailableProjects ? (
+                  <option value="">No available {researchView ? "autoresearch" : "standard"} projects</option>
+                ) : null}
+                {filteredProjects.map((item) => (
                   <option
                     key={item.project_id}
                     value={item.project_id}
@@ -389,9 +565,13 @@ export default function App() {
               </select>
               <ChevronDown className="chev" size={15} />
             </label>
-            <span className={`lamp${job.active ? " live" : ""}`}>
+            <span className={`lamp${active ? " live" : ""}`}>
               <span className="dot" />
-              {job.active ? `run ${job.job?.status || "running"}` : "idle"}
+              {active
+                ? isResearch
+                  ? `loop ${research?.loop.phase || "running"}`
+                  : `run ${job.job?.status || "running"}`
+                : "idle"}
             </span>
             <button className="icon-btn" onClick={refresh} title="Refresh" aria-label="Refresh">
               <RefreshCw size={16} />
@@ -407,7 +587,7 @@ export default function App() {
           </div>
         </header>
 
-        {project ? (
+        {project && !isResearch ? (
           <section className="band">
             <div className="meta">
               <span className="title">{project.title}</span>
@@ -442,12 +622,68 @@ export default function App() {
           </section>
         ) : null}
 
+        {project && isResearch && research ? (
+          <section className="band">
+            <div className="meta">
+              <span className="title">{project.title}</span>
+              <span className="path">{project.path}</span>
+            </div>
+            <div className="research-chips">
+              <span className="chip">
+                <Target size={14} /> {research.objective.metric}
+                <span className="dir">{research.objective.direction === "min" ? "↓ min" : "↑ max"}</span>
+              </span>
+              <span className="chip best">
+                <FlaskConical size={13} /> best <b>{formatScore(research.objective.best)}</b>
+                <span className="from">/ baseline {formatScore(research.objective.baseline)}</span>
+              </span>
+              <span className="chip"><Repeat2 size={13} /> {Math.round(research.objective.budget_sec / 60)} min/exp</span>
+            </div>
+            <div className="actions">
+              {research.loop.active ? (
+                <button className="btn danger" onClick={stopResearchLoop} disabled={loading === "research-loop"}>
+                  <Square size={15} fill="currentColor" /> Stop loop
+                </button>
+              ) : (
+                <button className="btn primary" onClick={startResearchLoop} disabled={loading === "research-loop"}>
+                  <Repeat2 size={15} /> Start loop
+                </button>
+              )}
+              <button className="btn" onClick={() => openResearchFile("script/program.md")}>
+                <FileText size={15} /> program.md
+              </button>
+              <button className="btn" onClick={() => setPanel({ kind: "log" })}>
+                <Terminal size={15} /> Live log
+              </button>
+            </div>
+          </section>
+        ) : null}
+
         {error ? (
           <div className="err-banner">
             <AlertTriangle size={15} /> {error}
           </div>
         ) : null}
 
+        {displayedResearch ? (
+          <ResearchDashboard
+            research={displayedResearch}
+            selected={selectedRun}
+            panel={project ? panel : null}
+            leftColumn={leftColumn}
+            theme={theme}
+            projectId={projectId}
+            preview={!project}
+            onSelect={setSelectedRun}
+            onExperiment={openResearchDiff}
+            onOpenFile={openResearchFile}
+            onResize={setLeftColumn}
+            onSaveProgram={saveProgram}
+            onClose={() => setPanel(null)}
+          />
+        ) : null}
+
+        {!researchView ? <>
         <section className="strip">
           <Stat label="Runs" value={metrics.total} tone="runs" />
           <Stat label="Completed" value={metrics.completed} tone="pass" total={metrics.total} />
@@ -465,11 +701,7 @@ export default function App() {
                 <div className="eyebrow">ledger</div>
                 <h2>Recent runs</h2>
               </div>
-              <span className="sub">
-                {project
-                  ? "Each run pins the script and config that produced it"
-                  : "Create or register an autoexp project to begin"}
-              </span>
+              {project ? <span className="sub">Each run pins the script and config that produced it</span> : null}
               <div className="search">
                 <Search className="si" size={15} />
                 <input
@@ -523,6 +755,7 @@ export default function App() {
             />
           ) : null}
         </section>
+        </> : null}
       </div>
 
       <div className="toasts">
@@ -542,6 +775,480 @@ export default function App() {
         ))}
       </div>
     </>
+  );
+}
+
+function ResearchDashboard({
+  research,
+  selected,
+  panel,
+  leftColumn,
+  theme,
+  projectId,
+  preview = false,
+  onSelect,
+  onExperiment,
+  onOpenFile,
+  onResize,
+  onSaveProgram,
+  onClose,
+}: {
+  research: ResearchState;
+  selected: string;
+  panel: Panel | null;
+  leftColumn: number;
+  theme: Theme;
+  projectId: string;
+  preview?: boolean;
+  onSelect: (tag: string) => void;
+  onExperiment: (experiment: ResearchExperiment) => void;
+  onOpenFile: (path: string) => void;
+  onResize: (value: number) => void;
+  onSaveProgram: (text: string) => Promise<ResearchFilePayload>;
+  onClose: () => void;
+}) {
+  const kept = research.experiments.filter((item) => item.status === "kept").length;
+  const reverted = research.experiments.filter((item) => item.status === "reverted").length;
+  const { baseline, best, direction } = research.objective;
+  const improvement =
+    baseline === null || best === null
+      ? null
+      : direction === "min"
+        ? baseline - best
+        : best - baseline;
+
+  return (
+    <>
+      <section className="strip">
+        <Stat label="Experiments" value={research.experiments.length} tone="runs" />
+        <Stat label="Kept" value={kept} tone="pass" />
+        <Stat label="Reverted" value={reverted} tone="rep" />
+        <div className="stat pass">
+          <span className="k">Improvement vs baseline</span>
+          <span className="v research-delta">
+            {improvement === null ? "—" : `+${formatScore(improvement)}`}
+          </span>
+        </div>
+      </section>
+
+      <div className="card chart-card">
+        <div className="card-head">
+          <div>
+            <div className="eyebrow">objective</div>
+            <h2>Ratchet · {research.objective.metric} over attempts</h2>
+          </div>
+          <div className="chart-legend">
+            <span className="lg"><span className="sw best" /> best-so-far</span>
+            <span className="lg"><span className="sw kept" /> kept</span>
+            <span className="lg"><span className="sw rev" /> reverted</span>
+          </div>
+        </div>
+        <RatchetChart
+          experiments={research.experiments}
+          objective={research.objective}
+          emptyText={preview ? "Create a project to establish a baseline and begin the ratchet." : undefined}
+        />
+      </div>
+
+      <div className="card">
+        <div className="card-head">
+          <div>
+            <div className="eyebrow">contract</div>
+            <h2>Files &amp; ownership</h2>
+          </div>
+          <span className="sub">The human directs, the agent edits, and the evaluator stays fixed</span>
+        </div>
+        <ResearchContract files={research.files} onOpen={onOpenFile} disabled={preview} />
+      </div>
+
+      <section
+        className={`work${panel ? " split" : ""}`}
+        style={panel ? ({ "--lcol": `${leftColumn}%` } as React.CSSProperties) : undefined}
+      >
+        <div className="card">
+          <div className="card-head">
+            <div>
+              <div className="eyebrow">ledger</div>
+              <h2>Experiments</h2>
+            </div>
+            <span className="sub">Every hypothesis remains visible, whether kept or reverted</span>
+          </div>
+          <ExperimentLedger
+            experiments={research.experiments}
+            objective={research.objective}
+            selected={selected}
+            onSelect={onSelect}
+            onOpen={onExperiment}
+            preview={preview}
+          />
+          <div className="hint-row ledger-hints">
+            <span>
+              {preview
+                ? "template preview"
+                : research.loop.active
+                ? `loop running · ${research.loop.phase}`
+                : "loop idle"}
+            </span>
+            <span className="server-mode">{preview ? "autoexp init metric_lab --autoresearch" : "live · autoexp server"}</span>
+          </div>
+        </div>
+        {panel ? <SplitHandle value={leftColumn} onChange={onResize} /> : null}
+        {panel ? (
+          <ResearchViewer
+            panel={panel}
+            theme={theme}
+            projectId={projectId}
+            active={research.loop.active}
+            onSaveProgram={onSaveProgram}
+            onClose={onClose}
+          />
+        ) : null}
+      </section>
+    </>
+  );
+}
+
+function RatchetChart({
+  experiments,
+  objective,
+  emptyText,
+}: {
+  experiments: ResearchExperiment[];
+  objective: ResearchObjective;
+  emptyText?: string;
+}) {
+  const chronological = [...experiments].reverse();
+  const scored = chronological.filter(
+    (item): item is ResearchExperiment & { score: number } => item.score !== null,
+  );
+  if (!scored.length) {
+    return (
+      <div className="empty chart-empty">
+        {emptyText || "Start the loop to establish a baseline and begin the ratchet."}
+      </div>
+    );
+  }
+
+  const baseline = objective.baseline ?? scored[0].score;
+  const best = objective.best ?? baseline;
+  const values = scored.map((item) => item.score);
+  const low = Math.min(...values, baseline, best);
+  const high = Math.max(...values, baseline, best);
+  const padding = (high - low) * 0.18 || Math.max(Math.abs(high) * 0.02, 0.01);
+  const min = low - padding;
+  const max = high + padding;
+  const width = 720;
+  const height = 210;
+  const left = 56;
+  const right = 18;
+  const top = 14;
+  const bottom = 28;
+  const x = (index: number) =>
+    left +
+    (chronological.length <= 1
+      ? 0
+      : (index / (chronological.length - 1)) * (width - left - right));
+  const y = (value: number) =>
+    top + ((max - value) / (max - min)) * (height - top - bottom);
+
+  let currentBest: number | null = objective.baseline;
+  const step: [number, number][] = [];
+  chronological.forEach((item, index) => {
+    if (item.score !== null && item.status === "kept") {
+      currentBest =
+        currentBest === null
+          ? item.score
+          : objective.direction === "min"
+            ? Math.min(currentBest, item.score)
+            : Math.max(currentBest, item.score);
+    }
+    if (currentBest !== null) step.push([x(index), y(currentBest)]);
+  });
+  const path = step
+    .map((point, index) =>
+      index === 0
+        ? `M ${point[0]} ${point[1]}`
+        : `L ${point[0]} ${step[index - 1][1]} L ${point[0]} ${point[1]}`,
+    )
+    .join(" ");
+  const ticks = [max, (max + min) / 2, min];
+  const lastStep = step[step.length - 1];
+
+  return (
+    <div className="chart-wrap">
+      <svg className="ratchet" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Objective score and best-so-far by attempt">
+        {ticks.map((tick) => (
+          <g key={tick}>
+            <line className="gl" x1={left} y1={y(tick)} x2={width - right} y2={y(tick)} />
+            <text className="tick" x={left - 8} y={y(tick) + 3} textAnchor="end">{formatScore(tick)}</text>
+          </g>
+        ))}
+        <line className="base" x1={left} y1={y(baseline)} x2={width - right} y2={y(baseline)} />
+        <text className="tick" x={width - right} y={y(baseline) - 5} textAnchor="end">
+          baseline {formatScore(baseline)}
+        </text>
+        <path className="step" d={path} />
+        {chronological.map((item, index) =>
+          item.score === null ? null : (
+            <circle
+              key={item.tag}
+              className={item.status === "kept" ? "kept" : "rev"}
+              cx={x(index)}
+              cy={y(item.score)}
+              r={item.status === "kept" ? 3.6 : 3.2}
+            />
+          ),
+        )}
+        {lastStep ? (
+          <text className="blabel" x={lastStep[0]} y={lastStep[1] - 7} textAnchor="end">
+            best {formatScore(best)}
+          </text>
+        ) : null}
+        <text className="tick" x={left} y={height - 8}>a01</text>
+        <text className="tick" x={width - right} y={height - 8} textAnchor="end">attempt →</text>
+      </svg>
+    </div>
+  );
+}
+
+function ResearchContract({
+  files,
+  onOpen,
+  disabled = false,
+}: {
+  files: ResearchState["files"];
+  onOpen: (path: string) => void;
+  disabled?: boolean;
+}) {
+  return (
+    <div className="contract">
+      {files.map((file) => (
+        <div className="crow" key={file.path}>
+          <span className={`role ${file.role}`}>
+            {file.role === "frozen" ? <Lock size={11} /> : file.role === "agent" ? <Bot size={12} /> : null}
+            {file.role}
+          </span>
+          <div className="contract-name">
+            <div className="fname">{file.path}</div>
+            <div className="fdesc">{file.desc}</div>
+          </div>
+          <div className="fmeta">
+            {file.hash ? (
+              <span className="fhash"><Lock size={12} /> {file.hash}</span>
+            ) : null}
+            <button className="btn sm" onClick={() => onOpen(file.path)} disabled={disabled}>
+              {file.role === "human" ? <Pencil size={13} /> : file.role === "frozen" ? <Lock size={13} /> : <Code2 size={13} />}
+              {file.role === "human" ? "Edit" : "Open"}
+            </button>
+          </div>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function ExperimentLedger({
+  experiments,
+  objective,
+  selected,
+  onSelect,
+  onOpen,
+  preview = false,
+}: {
+  experiments: ResearchExperiment[];
+  objective: ResearchObjective;
+  selected: string;
+  onSelect: (tag: string) => void;
+  onOpen: (experiment: ResearchExperiment) => void;
+  preview?: boolean;
+}) {
+  if (!experiments.length) {
+    if (preview) {
+      return (
+        <div className="empty">
+          <div className="big">No attempts yet</div>
+          <div>Create an Autoresearch project to activate this workspace.</div>
+          <div className="cmd"><b>autoexp init</b> metric_lab --autoresearch</div>
+        </div>
+      );
+    }
+    return <Empty title="No attempts yet">Start the loop and the agent will begin proposing experiments.</Empty>;
+  }
+  const deltas = new Map<string, number>();
+  let best = objective.baseline;
+  [...experiments].reverse().forEach((item) => {
+    if (item.score === null || item.status !== "kept") return;
+    if (best !== null) {
+      deltas.set(
+        item.tag,
+        objective.direction === "min" ? best - item.score : item.score - best,
+      );
+    }
+    best =
+      best === null
+        ? item.score
+        : objective.direction === "min"
+          ? Math.min(best, item.score)
+          : Math.max(best, item.score);
+  });
+  return (
+    <div className="ledger-wrap">
+      <table className="ledger research-ledger">
+        <thead>
+          <tr>
+            <th>Attempt</th>
+            <th>Result</th>
+            <th>{objective.metric}</th>
+            <th>Improvement</th>
+            <th>Hypothesis</th>
+            <th>Snapshot</th>
+          </tr>
+        </thead>
+        <tbody>
+          {experiments.map((item) => {
+            const delta = deltas.get(item.tag);
+            return (
+              <tr
+                key={item.tag}
+                className={`${item.status === "reverted" ? "rev-row " : ""}${selected === item.tag ? "sel" : ""}`}
+                onClick={() => {
+                  onSelect(item.tag);
+                  onOpen(item);
+                }}
+              >
+                <td><span className="tagcell">{item.tag}</span></td>
+                <td><span className={`status ${item.status}`}><span className="d" />{item.status}</span></td>
+                <td>{item.score === null ? <span className="dash">—</span> : <span className="score">{formatScore(item.score)}</span>}</td>
+                <td>{delta === undefined ? <span className="dash">—</span> : <span className={`delta ${delta > 0 ? "good" : "flat"}`}>{delta > 0 ? "+" : ""}{formatScore(delta)}</span>}</td>
+                <td><span className="hyp">{item.hyp}</span></td>
+                <td>
+                  {item.commit ? (
+                    <span className="commitcell"><GitCommit size={13} /> {item.commit}</span>
+                  ) : item.status === "running" ? (
+                    <span className="commitcell"><GitBranch size={13} /> autoexp/{item.tag}</span>
+                  ) : (
+                    <span className="dash">reverted</span>
+                  )}
+                </td>
+              </tr>
+            );
+          })}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function ResearchViewer({
+  panel,
+  theme,
+  projectId,
+  active,
+  onSaveProgram,
+  onClose,
+}: {
+  panel: Panel;
+  theme: Theme;
+  projectId: string;
+  active: boolean;
+  onSaveProgram: (text: string) => Promise<ResearchFilePayload>;
+  onClose: () => void;
+}) {
+  const title =
+    panel.kind === "program"
+      ? `${panel.data.path} · research directions`
+      : panel.kind === "evaluator"
+        ? `${panel.data.path} · ${panel.data.role}`
+        : panel.kind === "diff"
+          ? `${panel.experiment.tag} · experiment diff`
+          : "Live log";
+  const Icon = panel.kind === "program" ? FileText : panel.kind === "evaluator" ? Lock : panel.kind === "diff" ? GitBranch : Terminal;
+  return (
+    <aside className="card panel">
+      <div className="card-head">
+        <div className="ptitle"><span className="ic"><Icon size={16} /></span><span className="txt">{title}</span></div>
+        <button className="btn ghost sm" onClick={onClose} aria-label="Close panel"><X size={16} /></button>
+      </div>
+      <div className="panel-body">
+        {panel.kind === "program" ? (
+          <TextEditor value={panel.data.text} label={panel.data.path} onSave={onSaveProgram} />
+        ) : null}
+        {panel.kind === "evaluator" ? <ResearchFileViewer data={panel.data} /> : null}
+        {panel.kind === "diff" ? <DiffViewer experiment={panel.experiment} objective={panel.objective} /> : null}
+        {panel.kind === "log" ? <LogViewer projectId={projectId} active={active} /> : null}
+      </div>
+    </aside>
+  );
+}
+
+function ResearchFileViewer({ data }: { data: ResearchFilePayload }) {
+  return (
+    <div className="editor-shell">
+      <div className="frozenbar">
+        {data.role === "frozen" ? <Lock size={13} /> : <Code2 size={13} />}
+        {data.role} · {data.hash || data.path}
+        {data.role === "frozen" ? <span className="ok"><Lock size={13} /> fixed evaluator</span> : null}
+      </div>
+      <CodePane value={data.text} editing={false} onChange={() => undefined} />
+    </div>
+  );
+}
+
+function DiffViewer({
+  experiment,
+  objective,
+}: {
+  experiment: ResearchExperiment;
+  objective: ResearchObjective;
+}) {
+  const lines = (experiment.diff || "").split("\n");
+  let oldLine: number | null = null;
+  let newLine: number | null = null;
+  const numbered = lines.map((line, sourceIndex) => {
+    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+    let oldNumber: number | null = null;
+    let newNumber: number | null = null;
+    if (hunk) {
+      oldLine = Number(hunk[1]);
+      newLine = Number(hunk[2]);
+    } else if (oldLine !== null && newLine !== null && !line.startsWith("\\")) {
+      if (line.startsWith("+")) newNumber = newLine++;
+      else if (line.startsWith("-")) oldNumber = oldLine++;
+      else {
+        oldNumber = oldLine++;
+        newNumber = newLine++;
+      }
+    }
+    return { line, oldNumber, newNumber, sourceIndex };
+  });
+  const changed = numbered.filter(({ line }) =>
+    (line.startsWith("+") && !line.startsWith("+++")) ||
+    (line.startsWith("-") && !line.startsWith("---")),
+  );
+  return (
+    <div className="editor-shell">
+      <div className="diffhead">
+        <div className="dt">
+          {experiment.tag} · {experiment.status}
+          {experiment.score === null ? "" : ` · ${objective.metric} ${formatScore(experiment.score)}`}
+        </div>
+        <div className="dh">{experiment.hyp}</div>
+      </div>
+      <div className="diff">
+        {changed.length ? changed.map(({ line, oldNumber, newNumber, sourceIndex }, index) => {
+          const className = line.startsWith("+") ? "add" : "del";
+          const separated = index > 0 && sourceIndex > changed[index - 1].sourceIndex + 1;
+          return <React.Fragment key={sourceIndex}>
+            {separated ? <div className="diff-gap" /> : null}
+            <div className={`dl ${className}`}>
+              <span className="diff-ln">{oldNumber ?? ""}</span>
+              <span className="diff-ln">{newNumber ?? ""}</span>
+              <span className="diff-code">{line || " "}</span>
+            </div>
+          </React.Fragment>;
+        }) : <div className="diff-empty">No source changes in this attempt.</div>}
+      </div>
+    </div>
   );
 }
 
@@ -1062,7 +1769,7 @@ function TextEditor({
 }: {
   value: string;
   label: string;
-  onSave: (text: string) => Promise<InstructionPayload>;
+  onSave: (text: string) => Promise<unknown>;
 }) {
   const [draft, setDraft] = useState(value);
   const [editing, setEditing] = useState(false);

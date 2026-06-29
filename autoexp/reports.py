@@ -14,6 +14,11 @@ from .workspace import (
 
 
 INSIDE_PROJECT_MSG = "report instruction file must stay inside the autoexp project"
+REPORT_CONTRACT = """Use `runs/<run_id>/report/report_bundle.json` as the source of truth for report context. The bundle contains the run id, script name, available `app.env` variable names, run metadata, and project-relative paths to the report instruction, script params, output artifacts, logs, and expected report directory. Read referenced files only as needed.
+
+Write generated report files under `runs/<run_id>/report/`. Prefer `runs/<run_id>/report/report.md` for the main report unless the user asks for a different filename or format. Additional generated images, tables, data files, or appendices may also live in that same report directory.
+
+Do not assume access to secret values. The bundle intentionally includes environment variable names only. Base the report only on the bundled artifacts and the user's request."""
 
 
 def app_env_keys(root=None):
@@ -30,19 +35,24 @@ def app_env_keys(root=None):
     return keys
 
 
-def _configured_instruction_path(root):
-    configured = read_json(root / PROJECT_CONFIG).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
-    return configured, ensure_within_project(configured, INSIDE_PROJECT_MSG)
-
-
 def report_instruction(root=None):
-    """Read the active report-instruction file, returning its source path and text."""
+    """Read the editable, project-specific report guidance."""
     root = resolve_root(root)
-    configured, path = _configured_instruction_path(root)
+    configured = read_json(root / PROJECT_CONFIG).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
+    path = ensure_within_project(configured, INSIDE_PROJECT_MSG)
     target = root / path
     if not target.is_file():
         raise FileNotFoundError(f"missing report instruction file: {configured}")
-    return {"source": target.relative_to(root).as_posix(), "text": target.read_text()}
+    text = target.read_text().rstrip()
+    if text.endswith(REPORT_CONTRACT):
+        text = text.removesuffix(REPORT_CONTRACT).rstrip()
+    return {"source": target.relative_to(root).as_posix(), "text": text + "\n"}
+
+
+def report_generation_instruction(root=None):
+    """Join project guidance with Autoexp's invariant report contract."""
+    instruction = report_instruction(root)
+    return {**instruction, "text": f"{instruction['text'].rstrip()}\n\n{REPORT_CONTRACT}\n"}
 
 
 def set_report_instruction(path, root=None):

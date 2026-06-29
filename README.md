@@ -1,50 +1,41 @@
 <p align="center">
-  <img src="assets/autoexp-readme.png" alt="Autoexp - Local Autonomous Experimentation" width="480">
+  <img src="assets/dark.svg" alt="Autoexp - Local Autonomous Experimentation" width="480">
 </p>
 
 # autoexp
 
-Local-first experiment workspaces for scripts, runs, reports, and coding agents.
+Local-first experiment workspaces for developers using coding agents.
 
-`autoexp` turns black-box experiments into traceable workspaces. Each run connects its script and configuration snapshot with outputs, logs, report context, and a stable run ID. The package includes a CLI, local browser UI, private experiment history, and project-scoped MCP tools.
+Autoexp is for agent-led experimentation where the trail matters: keeping scripts, parameters, outputs, logs, reports, and run history tied together while an agent iterates.
 
-## Why `autoexp`
+Use standard Autoexp when the work is exploratory or qualitative: protein-folding experiments, microbiology protocol variants, qualitative eval suites, ablations, data checks, or any workflow where the useful output is a sequence of attempts and a good final report—not a single number to maximize.
 
-When experiments are just scripts and folders, the boring parts become fragile:
+Autoexp has two workflows:
 
-- Which script version produced this output?
-- Where are the logs?
-- Which params were used?
-- What should the report include?
-- How should an agent inspect or rerun this reliably?
+- **Standard experiments** for running attempts, comparing artifacts, and generating reports from custom instructions.
+- **Autoresearch** ([ref.](https://github.com/karpathy/autoresearch)) for metric-driven optimization where each attempt can be kept or reverted by score.
 
-**autoexp** gives every experiment a small workspace with repeatable runs, stable run IDs, local artifacts, and agent-readable context.
+## How it fits together
 
-## Features
+An Autoexp project is just a local folder with a few conventions:
 
-- **CLI workflow**: initialize projects, run experiments, list runs, restore old state, and diff runs.
-- **Local browser UI**: inspect runs, scripts, outputs, logs, reports, and edit script snapshots.
-- **Run snapshots**: every run keeps the script/config state that produced it.
-- **Private autoexp history**: each execution records its source and configuration in isolated, project-local history.
-- **Report bundles**: every run gets project-relative pointers to its params, outputs, logs, and reporting instructions.
-- **MCP server**: coding agents can inspect runs, edit scripts, run experiments, and write reports through structured tools.
-- **Flexible execution**: run Python, JavaScript, shell, or other commands through Docker isolation or the local host environment.
+- Put the experiment implementation under `script/`.
+- Keep secrets in `app.env`.
+- Tune regular inputs in `script/params.json`.
+- Tune report generation in `report.txt`.
+- Run experiments through Autoexp so each result is recorded.
+- Open the browser UI to review runs, outputs, diffs, reports, and project state.
+- Open the project in a coding agent to let it use Autoexp through MCP.
+
+If your work has a clear metric such as accuracy, loss, latency, cost, reward, or benchmark score, use Autoresearch. It adds `script/program.md`, where you describe the objective and constraints the agent should follow while optimizing that metric.
 
 ## Install
-
-With pip:
-
-```bash
-pip install "git+https://github.com/shreyashkar-ml/autoexp.git"
-```
-
-With uv:
 
 ```bash
 uv tool install "git+https://github.com/shreyashkar-ml/autoexp.git"
 ```
 
-Check the CLI:
+Check the installation:
 
 ```bash
 autoexp --help
@@ -52,146 +43,155 @@ autoexp --help
 
 ## Quickstart
 
-Create a workspace:
+Create a standard project:
 
 ```bash
 autoexp init demo_eval
 cd demo_eval
 ```
 
-Run the starter script:
+Initialization creates the workspace, starter files, agent instructions, and MCP config. It does not start experimenting by itself.
+
+Open this folder in your preferred coding agent. Claude users get `CLAUDE.md`; other agents can read `AGENTS.md`. Both files tell the agent how to use Autoexp, and `.mcp.json` lets MCP-aware clients start the Autoexp tools automatically. If your client does not read `.mcp.json`, configure a stdio MCP server that runs `autoexp mcp` from the project folder.
+
+Example prompt:
+
+```text
+Try three prompt variants for the classifier evaluation, compare the error patterns, and write a short report recommending the best variant.
+```
+
+If the experiment needs secrets or machine-specific values, put them in `app.env`:
+
+```bash
+OPENAI_API_KEY=...
+DATASET_PATH=/path/to/local/data
+```
+
+For normal non-secret inputs, edit `script/params.json`. To tune how generated reports should read, edit `report.txt`.
+
+You can also run the current experiment yourself:
 
 ```bash
 autoexp run
 ```
 
-Open the UI:
+Then open the browser UI to inspect runs, outputs, logs, reports, and diffs:
 
 ```bash
 autoexp view
 ```
 
-List runs:
+Autoexp prints a stable `run_id` for each run. Use that ID later when you want to rerun, restore, compare, or report on the same experiment state.
+
+For metric-driven research loops, start with:
 
 ```bash
-autoexp status
+autoexp init metric_lab --autoresearch
+cd metric_lab
 ```
 
-## Basic Workflow
+Then edit `script/program.md` with the research objective and ask your agent to run the Autoresearch loop through Autoexp MCP.
 
-Put experiment code under `script/` and set its command in:
+Example Autoresearch prompt:
 
 ```text
-script/stage.json
+Improve validation accuracy without increasing inference latency. Try one hypothesis at a time and stop after five attempts or once accuracy improves by 2%.
 ```
 
-Edit non-secret inputs:
+## Standard experiments
+
+Standard mode is the default Autoexp workflow. It works well when you want an agent to edit a script, try parameter changes, inspect artifacts, and write reports while you keep a clean run history.
+
+A new project starts with this shape:
 
 ```text
-script/params.json
+demo_eval/
+├── script/
+│   ├── stage.json          # command Autoexp runs
+│   ├── params.json         # editable, non-secret inputs
+│   ├── params.schema.json  # parameter descriptions for tools and UI
+│   └── script.py           # experiment implementation
+├── autoexp.json            # project and runner settings
+├── report.txt              # project-specific report guidance
+├── app.env                 # local environment values and secrets
+└── runs/                   # run outputs, logs, and reports
 ```
 
-Put local secrets or machine-specific values in:
+Common edits:
 
-```text
-app.env
-```
+- To change the experiment command, edit `script/stage.json`.
+- To tune non-secret inputs, edit `script/params.json`.
+- To change the experiment itself, edit `script/script.py`.
+- To tune report generation, edit `report.txt` with the audience, structure, depth, and what the report should explain.
+- To keep local secrets or machine-specific values, use `app.env`.
 
-Run:
+Your experiment receives a JSON context file through `${CTX}`. Read paths such as `output_dir`, `logs_dir`, and `script_params_path` from that context instead of hardcoding locations.
 
-```bash
-autoexp run
-```
-
-Autoexp prints a `run_id`. Use that ID to rerun, inspect, restore, diff, or report on the experiment.
-
-Every run is immediately indexed in `index.sqlite`, retained under `runs/<run_id>/`, and available in the browser UI. Its source and configuration are snapshotted automatically when execution starts.
-
-Rerun an existing run snapshot:
-
-```bash
-autoexp run <run_id>
-```
-
-Restore script/config from a run:
-
-```bash
-autoexp restore <run_id>
-```
-
-Compare source and configuration from two executed runs:
-
-```bash
-autoexp diff <run_a> <run_b>
-```
+If the same inputs produce the same outputs again, Autoexp returns the existing run instead of adding a duplicate row. Rerunning an earlier run refreshes that run's outputs and logs in place.
 
 ## Browser UI
 
-```bash
-autoexp view
-```
+The browser UI is the easiest way to review multiple projects. Start it with `autoexp view` from a project folder, or pass `--project /path/to/project` to open a specific one.
 
-The UI is included in the package. It runs locally and lets you:
+The UI lets you:
 
-- switch between Autoexp projects
-- start and stop runs
-- rerun existing runs
-- inspect run status
-- open script snapshots
-- edit scripts into new snapshots
-- view outputs and generated reports
-- edit report instructions
+- switch between filtered Standard and Autoresearch project lists
+- start, stop, and rerun experiments
+- inspect scripts, outputs, logs, and reports
+- edit a script into a new versioned snapshot
+- edit parameters and report guidance
+- view Autoresearch metrics, attempts, decisions, and source changes
+- start or stop an Autoresearch loop
+
+Projects may live in completely separate directories. Once initialized or opened, they remain available from the same project picker.
+
+Standard project view:
+
+![Autoexp standard empty project view](assets/new_autoexp.png)
+
+Autoresearch project view:
+
+![Autoexp Autoresearch empty project view](assets/new_autoresearch.png)
 
 ## Reports
 
-Autoexp prepares each run for a human- or agent-generated report.
-
-For each run, `report_bundle.json` points to the associated params, outputs, logs, report instruction, and report directory:
+Reports are meant to be generated from recorded run artifacts, not from memory. Every run includes a report bundle at:
 
 ```text
 runs/<run_id>/report/report_bundle.json
 ```
 
-Write final report files under:
+The bundle lists the run ID, script name, available environment variable names, run metadata, and project-relative paths to parameters, outputs, logs, report guidance, and the report directory.
+
+Generated reports belong under:
 
 ```text
 runs/<run_id>/report/
 ```
 
-Autoexp looks for these report entry points first:
+The preferred main report is:
 
 ```text
-report.md
-report.txt
-index.md
+runs/<run_id>/report/report.md
 ```
 
-Other report filenames are discovered as a fallback.
+To tune report generation, edit `report.txt` from the project or browser UI. Keep that file focused on what the report should say: subject matter, depth, audience, analysis, and structure. Autoexp adds the standard artifact-handling and secret-safety instructions internally.
 
-Each workspace starts with an editable report instruction file:
+If you want to point the project at a different report guidance file, use `autoexp report-instruction <path>`.
+
+## Coding agents and MCP
+
+MCP is how a coding agent talks to Autoexp directly instead of guessing shell commands and file paths.
+
+`autoexp init` creates project-local agent configuration:
 
 ```text
-report.txt
-```
-
-Use a different instruction file:
-
-```bash
-autoexp report-instruction path/to/report.md
-```
-
-## MCP For Agents
-
-Autoexp includes a project-scoped MCP server for coding agents.
-
-`autoexp init` automatically creates:
-
-```text
+CLAUDE.md
 AGENTS.md
 .mcp.json
 ```
 
-The generated `.mcp.json` contains:
+Claude Code reads `CLAUDE.md`. Other coding agents can read `AGENTS.md`. The generated `.mcp.json` starts the MCP server with:
 
 ```json
 {
@@ -204,67 +204,114 @@ The generated `.mcp.json` contains:
 }
 ```
 
-Open the project in a coding agent that supports project-local `.mcp.json` configuration. The client starts `autoexp mcp` from that workspace. Clients that read `AGENTS.md` also receive the Autoexp workflow and project contract in `autoexp.md`.
+Open the project in a coding agent that can launch project-local stdio MCP servers. Clients that do not read `.mcp.json` can be configured manually to run `autoexp mcp`. The `autoexp` command must be available on the agent's `PATH`.
 
-The server resolves the Autoexp project from its working directory, keeping tools and resources scoped to the current workspace. Ensure the installed `autoexp` command is available on the agent's `PATH`.
+A useful prompt is:
 
-Through MCP, agents can:
-
-- read workspace context
-- list and inspect runs
-- read source snapshots, outputs, logs, and report bundles
-- edit scripts into versioned snapshots
-- update params
-- run experiments
-- restore and diff runs
-- read and update report instructions
-
-Agents run experiments through Autoexp tools or commands, preserving run IDs, snapshots, logs, and outputs.
-
-### Agent Workflow
-
-1. Create a project with `autoexp init <project_name>`.
-2. Open the project in the coding agent.
-3. Ask the agent to edit the experiment and run it through Autoexp.
-4. Inspect the returned `run_id`, outputs, logs, and report in the UI or through MCP.
-5. Restore a run snapshot or compare two executed runs by their `run_id` values.
-
-## Command Reference
-
-```bash
-autoexp init <project_name> [--title TITLE]
-autoexp run [run_id]
-autoexp status [--limit N]
-autoexp hash
-autoexp view [--host HOST] [--port PORT] [--project PROJECT] [--allow-origin ORIGIN]
-autoexp restore <run_id>
-autoexp diff <run_a> <run_b>
-autoexp report-instruction [path]
-autoexp mcp
-autoexp doctor
+```text
+Run two dataset-cleaning experiments, compare the output artifacts, and write a report explaining which cleanup was more useful.
 ```
 
-## Execution
+Through MCP, an agent can:
 
-Autoexp uses Docker as the sandbox boundary for experiment execution. When you create a project, `autoexp init` checks whether the host Docker command and daemon are available.
+- read the project contract, script manifest, and parameters
+- list runs and inspect their source, outputs, logs, reports, and report bundles
+- create edited script snapshots
+- run, rerun, restore, and compare experiments
+- update parameters and project-specific report guidance
+- drive the complete Autoresearch attempt cycle
 
-- When Docker is available, the project starts with `runner: "docker"` and runs scripts inside the configured container limits.
-- When Docker is unavailable, the project starts with `runner: "local"` and initialization prints a short instruction for enabling sandboxing later.
+Autoexp also includes MCP prompts for improving a script, debugging a failed run, and writing a report.
 
-The selected runner is stored in `autoexp.json`, keeping project execution predictable across runs. After installing Docker, enable sandboxing by changing:
+## Autoresearch mode
+
+Use Autoresearch when the project has a metric that can decide whether an attempt improved the result: accuracy, loss, latency, cost, reward, benchmark score, or any JSON value your evaluator writes.
+
+Create an Autoresearch project:
+
+```bash
+autoexp init metric_lab --autoresearch
+cd metric_lab
+autoexp view
+```
+
+An Autoresearch project starts with three clear file roles:
+
+- `script/program.md` — your objective, research directions, and loop rules
+- `script/train.py` — the implementation the coding agent improves
+- `script/evaluate.py` — the stable evaluator that produces the metric
+
+Edit `script/program.md` to change the research direction, constraints, allowed strategies, or stopping criteria. The agent reads this file before proposing and finishing attempts.
+
+Configure the metric direction and agent command in the `autoresearch` section of `autoexp.json`:
+
+```json
+{
+  "objective": {
+    "metric": "score",
+    "direction": "max",
+    "baseline": null,
+    "budget_sec": 300
+  },
+  "metric": {
+    "kind": "json",
+    "path": "metrics.json",
+    "key": "score"
+  },
+  "agent": {
+    "cmd": ["codex", "exec", "Read script/program.md and run the autoresearch loop using the Autoexp MCP tools."]
+  }
+}
+```
+
+Use `"direction": "max"` when larger scores are better and `"direction": "min"` when smaller scores are better.
+
+Start the loop from the browser UI. For each attempt, the agent:
+
+1. reads the current research state
+2. proposes one hypothesis
+3. edits `script/train.py`
+4. runs the experiment
+5. reads the configured metric
+6. keeps an improvement or restores the previous best state
+
+The UI shows the metric over time, the best result against the baseline, kept and reverted attempts, hypotheses, and line-numbered source changes. The agent command is configurable; Autoexp does not require or display a specific agent identity.
+
+## Execution runners
+
+During initialization, Autoexp checks whether Docker and its daemon are available.
+
+- With Docker available, new projects use the Docker runner and the limits in `autoexp.json`.
+- Without Docker, new projects use the local runner and print instructions for enabling Docker later.
+
+To change an existing project, edit the runner setting in `autoexp.json`:
 
 ```json
 "runner": "local"
 ```
 
-to:
+or:
 
 ```json
 "runner": "docker"
 ```
 
-## Notes
+`app.env` values are passed to the selected runner but remain local and excluded from Autoexp's saved source history. Report context exposes environment variable names, never their secret values.
 
-- Runs, logs, outputs, reports, SQLite metadata, and source history remain local to the project.
-- Autoexp's private history lives under `.autoexp/`, isolated from the developer-managed git repository.
-- `app.env` keeps environment values machine-local and outside Autoexp history.
+## Common commands
+
+| Task | Command |
+| --- | --- |
+| Create a standard project | `autoexp init <project_name>` |
+| Create an Autoresearch project | `autoexp init <project_name> --autoresearch` |
+| Run the current experiment | `autoexp run` |
+| Rerun an earlier run | `autoexp run <run_id>` |
+| List recent runs | `autoexp status` |
+| Restore a run's script and config | `autoexp restore <run_id>` |
+| Compare two run snapshots | `autoexp diff <run_a> <run_b>` |
+| Open the browser UI | `autoexp view` |
+| Change the report guidance file | `autoexp report-instruction <path>` |
+| Check local setup | `autoexp doctor` |
+| Start the MCP server manually | `autoexp mcp` |
+
+Run `autoexp <command> --help` for command-specific usage.

@@ -20,7 +20,7 @@ AGENTS_TEXT = """# Autoexp Workspace
 This repository is an Autoexp workspace.
 
 - Read `autoexp.md` before changing experiment behavior.
-- Use `autoexp run` and Autoexp MCP tools for runs and artifact inspection.
+- Use `autoexp run` and the project MCP server (`autoexp mcp`) for runs and artifact inspection.
 - Keep experiment source in `script/`.
 - Do not create ad-hoc experiment folders.
 - Do not hand-edit `runs/<run_id>/output/` or `runs/<run_id>/logs/`.
@@ -45,7 +45,9 @@ Path(ctx["output_dir"]).mkdir(parents=True, exist_ok=True)
 """
 
 
-# --- small primitives -------------------------------------------------------
+# ======================================================================
+#  Small primitives
+# ======================================================================
 
 def die(message):
     """Print a user-facing error and stop the program."""
@@ -66,7 +68,9 @@ def write_json(path, data):
     path.write_text(json.dumps(data, indent=2) + "\n")
 
 
-# --- project location & path safety -----------------------------------------
+# ======================================================================
+#  Project location and path safety
+# ======================================================================
 
 def is_project_root(path):
     """True when path has the directory/file shape Autoexp expects of a project."""
@@ -110,7 +114,9 @@ def ensure_within_project(path, message):
     return Path(path)
 
 
-# --- per-user project registry ----------------------------------------------
+# ======================================================================
+#  Per-user project registry
+# ======================================================================
 
 def user_data_dir():
     override = os.environ.get("AUTOEXP_HOME")
@@ -125,16 +131,12 @@ def user_data_dir():
     return (Path(base) if base else Path.home() / ".local" / "share") / "autoexp"
 
 
-def registry_path():
-    return user_data_dir() / "projects.sqlite"
-
-
 def project_id(root):
     return hashlib.sha256(str(Path(root).resolve()).encode()).hexdigest()[:16]
 
 
 def registry_db():
-    path = registry_path()
+    path = user_data_dir() / "projects.sqlite"
     path.parent.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(path)
     conn.row_factory = sqlite3.Row
@@ -148,28 +150,24 @@ def registry_db():
     return conn
 
 
-def project_title(root):
+def project_mode(root):
     path = Path(root) / PROJECT_CONFIG
     if not path.exists():
-        return Path(root).name
-    return read_json(path).get("title") or Path(root).name
-
-
-def project_runner(root):
-    path = Path(root) / PROJECT_CONFIG
-    if not path.exists():
-        return "local"
-    return read_json(path).get("runner", "local")
+        return "standard"
+    return read_json(path).get("mode", "standard")
 
 
 def project_entry(root):
     root = Path(root).resolve()
+    config_path = root / PROJECT_CONFIG
+    config = read_json(config_path) if config_path.exists() else {}
     return {
         "project_id": project_id(root),
-        "title": project_title(root),
+        "title": config.get("title") or root.name,
         "path": str(root),
         "exists": is_project_root(root),
-        "runner": project_runner(root),
+        "runner": config.get("runner", "local"),
+        "mode": config.get("mode", "standard"),
     }
 
 
@@ -178,17 +176,18 @@ def register_project(root):
     if not is_project_root(root):
         die(f"{root} is not an autoexp project")
     timestamp = now()
+    entry = project_entry(root)
     conn = registry_db()
     conn.execute(
         """insert into projects(project_id, title, path, created_at, last_opened_at)
         values (?, ?, ?, ?, ?)
         on conflict(project_id) do update set title = excluded.title, path = excluded.path,
         last_opened_at = excluded.last_opened_at""",
-        (project_id(root), project_title(root), str(root), timestamp, timestamp),
+        (entry["project_id"], entry["title"], str(root), timestamp, timestamp),
     )
     conn.commit()
     conn.close()
-    return project_entry(root)
+    return entry
 
 
 def list_registered_projects():
@@ -198,15 +197,10 @@ def list_registered_projects():
     projects = []
     for row in rows:
         path = Path(row["path"])
-        exists = is_project_root(path)
-        projects.append({
-            "project_id": row["project_id"],
-            "title": project_title(path) if exists else row["title"],
-            "path": row["path"],
-            "exists": exists,
-            "runner": project_runner(path) if exists else "local",
-            "last_opened_at": row["last_opened_at"],
-        })
+        entry = project_entry(path)
+        if not entry["exists"]:
+            entry.update(project_id=row["project_id"], title=row["title"], runner="local", mode="standard")
+        projects.append({**entry, "last_opened_at": row["last_opened_at"]})
     return projects
 
 
@@ -224,7 +218,9 @@ def resolve_registered_project(project=None):
     die(f"unknown autoexp project: {selected}")
 
 
-# --- .gitignore matching -----------------------------------------------------
+# ======================================================================
+#  .gitignore matching
+# ======================================================================
 
 def gitignore_patterns(root):
     path = Path(root) / ".gitignore"
@@ -256,7 +252,9 @@ def ignored(rel, patterns):
     return False
 
 
-# --- source set & script manifest -------------------------------------------
+# ======================================================================
+#  Source set and script manifest
+# ======================================================================
 
 def source_paths(root=None):
     """The tracked source set: script/, config, contract, .gitignore, and report instruction."""
@@ -282,36 +280,47 @@ def script_manifest(root=None):
     return manifest
 
 
-# --- project scaffolding -----------------------------------------------------
+# ======================================================================
+#  Project scaffolding
+# ======================================================================
 
-def write_default_project(root, title, runner):
+def write_default_project(root, title, runner, autoresearch=False):
     for name in ("script", "runs", ".autoexp"):
         (root / name).mkdir(parents=True)
 
-    write_json(root / PROJECT_CONFIG, {
+    config = {
         "title": title,
         "description": "",
         "runner": runner,
         "sandbox": {"image": "python:3.12-slim", "network": "none", "cpus": "1", "memory": "512m"},
         "runtime": {},
         "report_instruction_file": PROJECT_REPORT_INSTRUCTIONS,
-    })
-    write_json(root / "script" / "stage.json", {
-        "name": "script",
-        "command": "python script.py --ctx ${CTX}",
-        "working_dir": "script",
-        "interface_version": "1",
-    })
-    write_json(root / "script" / "params.json", {"message": "hello from script params"})
-    write_json(root / "script" / "params.schema.json", {
-        "type": "object",
-        "properties": {"message": {"type": "string", "title": "Message", "default": "hello from script params"}},
-        "required": ["message"],
-    })
-    (root / "script" / "script.py").write_text(DEFAULT_SCRIPT)
+    }
+    if autoresearch:
+        from .autoresearch import config_block, scaffold
+
+        config.update(config_block())
+    write_json(root / PROJECT_CONFIG, config)
+    if autoresearch:
+        scaffold(root, write_json)
+    else:
+        write_json(root / "script" / "stage.json", {
+            "name": "script",
+            "command": "python script.py --ctx ${CTX}",
+            "working_dir": "script",
+            "interface_version": "1",
+        })
+        write_json(root / "script" / "params.json", {"message": "hello from script params"})
+        write_json(root / "script" / "params.schema.json", {
+            "type": "object",
+            "properties": {"message": {"type": "string", "title": "Message", "default": "hello from script params"}},
+            "required": ["message"],
+        })
+        (root / "script" / "script.py").write_text(DEFAULT_SCRIPT)
     (root / PROJECT_INSTRUCTIONS).write_text(INSTRUCTION_FILE.read_text())
     (root / PROJECT_REPORT_INSTRUCTIONS).write_text(BUILTIN_REPORT_INSTRUCTIONS.read_text())
     (root / "AGENTS.md").write_text(AGENTS_TEXT)
+    (root / "CLAUDE.md").write_text(AGENTS_TEXT)
     write_json(root / ".mcp.json", {"mcpServers": {"autoexp": {"command": "autoexp", "args": ["mcp"]}}})
     (root / APP_ENV).write_text(
         "# Project-local environment for Autoexp runs.\n"
@@ -323,21 +332,20 @@ def write_default_project(root, title, runner):
     )
 
 
-def create_project(root, title, runner="local"):
+def create_project(root, title, runner="local", autoresearch=False):
     from .store import AUTOEXP_GIT_DIR, autoexp_git, init_db, require_autoexp_git_repo
 
     root = Path(root)
     if root.exists() and any(root.iterdir()):
         die(f"{root} already exists and is not empty")
     root.mkdir(parents=True, exist_ok=True)
-    write_default_project(root, title, runner)
+    write_default_project(root, title, runner, autoresearch)
     autoexp_git(["init", "-b", "main"], root=root)
     require_autoexp_git_repo(root)
-    (root / AUTOEXP_GIT_DIR / "info" / "exclude").write_text("/.mcp.json\n/AGENTS.md\n")
-    if not autoexp_git(["config", "user.name"], root=root, capture=True, check=False):
-        autoexp_git(["config", "user.name", "Autoexp"], root=root)
-    if not autoexp_git(["config", "user.email"], root=root, capture=True, check=False):
-        autoexp_git(["config", "user.email", "autoexp@local"], root=root)
+    (root / AUTOEXP_GIT_DIR / "info" / "exclude").write_text("/.mcp.json\n/AGENTS.md\n/CLAUDE.md\n")
+    for key, value in (("user.name", "Autoexp"), ("user.email", "autoexp@local")):
+        if not autoexp_git(["config", key], root=root, capture=True, check=False):
+            autoexp_git(["config", key, value], root=root)
     init_db(root)
     autoexp_git(["add", *source_paths(root)], root=root)
     autoexp_git(["commit", "-m", "autoexp init"], root=root)

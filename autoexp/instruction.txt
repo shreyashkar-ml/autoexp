@@ -13,7 +13,7 @@ When you create or edit an experiment, use this workflow:
 Do not run files inside `script/` directly. `autoexp run` copies the exact script/config state into a self-contained `runs/<run_id>/` directory, passes `app.env` into the selected runner, writes output/log artifacts there, and records the run history.
 If the same capsule already produced identical stable output, Autoexp returns the existing `run_id` instead of recording a duplicate run.
 
-Every run is immediately recorded in `index.sqlite`, retained under `runs/<run_id>/`, and available in the UI. Source and configuration state are snapshotted automatically when the run starts.
+Each completed or failed run is recorded in `index.sqlite`, retained under `runs/<run_id>/`, and available in the UI. Source and configuration state are snapshotted automatically when the run starts.
 
 ## Project Structure
 

@@ -46,7 +46,9 @@ def json_value(value):
         return value
 
 
-# --- reading runs -----------------------------------------------------------
+# ======================================================================
+#  Reading runs
+# ======================================================================
 
 def report_path_for_run(run, root):
     """The run's report file: an explicit one, then known entry points, then any file."""
@@ -162,7 +164,9 @@ def read_report_bundle(run_id, root=None):
     return read_json(path)
 
 
-# --- editing scripts into new run snapshots ---------------------------------
+# ======================================================================
+#  Editing scripts into new run snapshots
+# ======================================================================
 
 def next_script_version(root, rel):
     """Next free `name_vN` for a script path, scanning prior run snapshots."""
@@ -190,15 +194,11 @@ def next_script_version(root, rel):
     return (parent / f"{base}_v{highest + 1}{suffix}").as_posix()
 
 
-def safe_script_path(path, label):
-    return ensure_within_project(path, f"{label} must stay inside script/")
-
-
 def save_script_file(path, text, root=None, source_run_id=None, save_as=None):
     """Write edited script text into a brand-new run snapshot (status 'edited')."""
     root = resolve_root(root)
-    rel = safe_script_path(path, "path")
-    saved_rel = safe_script_path(save_as, "save_as") if save_as else Path(next_script_version(root, rel))
+    rel = ensure_within_project(path, "path must stay inside script/")
+    saved_rel = ensure_within_project(save_as, "save_as must stay inside script/") if save_as else Path(next_script_version(root, rel))
 
     source_run = get_run(source_run_id, root) if source_run_id else None
     source_root = source_root_for_run(source_run, root) if source_run else root
@@ -256,7 +256,9 @@ def _retarget_manifest(manifest_path, old_rel, new_rel):
     write_json(manifest_path, manifest)
 
 
-# --- workspace-level verbs ---------------------------------------------------
+# ======================================================================
+#  Workspace-level verbs
+# ======================================================================
 
 def workspace(root=None):
     root = resolve_root(root)
@@ -289,7 +291,9 @@ def run_autoexp(run_id=None, root=None):
     return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "runs": list_runs(root=root)}
 
 
-# --- doctor ------------------------------------------------------------------
+# ======================================================================
+#  Doctor
+# ======================================================================
 
 def doctor(root=None):
     """Run a set of health checks and return {root, ok, checks}."""

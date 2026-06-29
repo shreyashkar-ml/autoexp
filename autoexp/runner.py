@@ -22,7 +22,6 @@ from .workspace import (
 
 
 # Paths *inside* the sandbox container. The host mounts the run/script dirs here.
-RUN_ARTIFACT_PATHS = ("output",)
 RUN_CONTEXT = {
     "run_dir": "/workspace/run",
     "script_dir": "/workspace/script",
@@ -33,7 +32,9 @@ RUN_CONTEXT = {
 }
 
 
-# --- hashing: identity of inputs (capsule) and outputs ----------------------
+# ======================================================================
+#  Hashing: identity of inputs (capsule) and outputs
+# ======================================================================
 
 def hash_json(data):
     return hashlib.sha256(json.dumps(data, sort_keys=True, separators=(",", ":")).encode()).hexdigest()
@@ -89,19 +90,16 @@ def hash_path(digest, path, base):
 def hash_run_output(run_dir):
     """Hash a run's output artifacts, so identical results can be recognized."""
     digest = hashlib.sha256()
-    run_dir = Path(run_dir)
-    for label in RUN_ARTIFACT_PATHS:
-        path = run_dir / label
-        digest.update(label.encode())
-        digest.update(b"\0")
-        if not path.exists():
-            digest.update(b"missing\0")
-        elif path.is_file():
-            hash_path(digest, path, path.parent)
-        else:
-            digest.update(b"dir\0")
-            for item in sorted(path.rglob("*")):
-                hash_path(digest, item, path)
+    path = Path(run_dir) / "output"
+    digest.update(b"output\0")
+    if not path.exists():
+        digest.update(b"missing\0")
+    elif path.is_file():
+        hash_path(digest, path, path.parent)
+    else:
+        digest.update(b"dir\0")
+        for item in sorted(path.rglob("*")):
+            hash_path(digest, item, path)
     return digest.hexdigest()
 
 
@@ -122,7 +120,9 @@ def find_duplicate_output_run(hashes, output_hash, root=None):
     return None
 
 
-# --- docker runner ----------------------------------------------------------
+# ======================================================================
+#  Docker runner
+# ======================================================================
 
 def run_script(run_dir, root=None, source_root=None):
     """Execute the experiment inside a docker sandbox; return the exit code."""
@@ -146,6 +146,9 @@ def run_script(run_dir, root=None, source_root=None):
     if app_env_path.exists():
         cmd += ["--env-file", str(app_env_path.resolve()),
                 "-v", f"{app_env_path.resolve()}:/workspace/app.env:ro"]
+    for key in ("AUTOEXP_RESEARCH_TAG", "AUTOEXP_RESEARCH_BUDGET_SEC"):
+        if key in os.environ:
+            cmd += ["-e", f"{key}={os.environ[key]}"]
     cmd += [
         "-e", "AUTOEXP_OUTPUT_DIR=/workspace/run/output",
         "-v", f"{(source_root / 'script').resolve()}:/workspace/script:ro",
@@ -174,7 +177,9 @@ def docker_ready():
     return True, ""
 
 
-# --- local runner -----------------------------------------------------------
+# ======================================================================
+#  Local runner
+# ======================================================================
 
 def app_env(root):
     """Parse app.env into a dict of {KEY: value} (quotes stripped)."""
@@ -229,13 +234,11 @@ def run_script_local(run_dir, root=None, source_root=None):
             command = f"{shlex.quote(sys.executable)} {command.removeprefix(python_alias)}"
             break
 
-    env = os.environ.copy()
-    env.update(app_env(root))
-    env.update({
+    env = os.environ | app_env(root) | {
         "AUTOEXP_RUN_DIR": str(Path(run_dir).resolve()),
         "AUTOEXP_SCRIPT_DIR": str((source_root / "script").resolve()),
         "AUTOEXP_OUTPUT_DIR": str((Path(run_dir) / "output").resolve()),
-    })
+    }
     logs = Path(run_dir) / "logs"
     with (logs / "script.stdout.log").open("w") as stdout, (logs / "script.stderr.log").open("w") as stderr:
         return subprocess.run(

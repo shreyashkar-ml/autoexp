@@ -51,10 +51,17 @@ def init_cmd(args):
     docker, _ = docker_ready()
     runner = "docker" if docker else "local"
     name = Path(args.project_name)
-    root = create_project(name.expanduser(), args.title or name.name, runner)
+    root = create_project(
+        name.expanduser(),
+        args.title or name.name,
+        runner,
+        autoresearch=args.autoresearch,
+    )
     register_project(root)
     print(f"initialized autoexp project: {root}")
     print(f"runner: {runner}")
+    if args.autoresearch:
+        print("mode: autoresearch")
     if not docker:
         print('sandboxing: install Docker, then set "runner": "docker" in autoexp.json', file=sys.stderr)
 
@@ -72,7 +79,9 @@ def print_run(run, duplicate=False):
         print(f"report: {run['report_path']}")
 
 
-# --- run: the core command --------------------------------------------------
+# ======================================================================
+#  Run: the core command
+# ======================================================================
 
 def _prepare_fresh(root, source_root, stage_commit):
     """Build a new run snapshot in runs/<id>/ and its initial metadata."""
@@ -143,18 +152,18 @@ def run_cmd(args):
 
     if source_run:
         print(f"refreshing run artifacts for {args.run_id}")
-        stage_commit = run_stage_commit(source_run)
         run_id, run_dir, meta, hashes = _prepare_rerun(root, source_run, source_root)
     else:
         stage_commit = git_commit_source("autoexp source snapshot", root)[0]
         run_id, run_dir, meta, hashes = _prepare_fresh(root, source_root, stage_commit)
 
-    def persist(meta, *, new=False, bundle_run_id=None):
+    def persist(meta, *, new=False):
         write_json(run_dir / "run.json", meta)
         (insert_run if new else update_run)(meta, root)
-        write_report_bundle(bundle_run_id or run_id, root)
+        write_report_bundle(run_id, root)
 
-    persist(meta, new=source_run is None)
+    if source_run:
+        persist(meta)
 
     try:
         runner = runner_type(root)
@@ -168,7 +177,7 @@ def run_cmd(args):
             "status": "failed",
             "stage_status": {"script": "failed:preflight"},
         })
-        persist(meta)
+        persist(meta, new=source_run is None)
         print_run(meta)
         raise
 
@@ -178,12 +187,7 @@ def run_cmd(args):
     if status == "success" and source_run is None:
         duplicate = find_duplicate_output_run(hashes, output_hash, root=root)
         if duplicate:
-            meta.update({
-                "output_hash": output_hash,
-                "status": "duplicate",
-                "stage_status": {"script": "duplicate"},
-            })
-            persist(meta, bundle_run_id=duplicate["run_id"])
+            shutil.rmtree(run_dir)
             _print_duplicate(duplicate, root)
             return
 
@@ -192,11 +196,13 @@ def run_cmd(args):
         "status": status,
         "stage_status": {"script": "success" if code == 0 else f"failed:{code}"},
     })
-    persist(meta)
+    persist(meta, new=source_run is None)
     print_run(meta)
 
 
-# --- other commands ----------------------------------------------------------
+# ======================================================================
+#  Other commands
+# ======================================================================
 
 def status_cmd(args):
     init_db()
@@ -262,7 +268,9 @@ def mcp_cmd(args):
     serve()
 
 
-# --- argument parser & entry point ------------------------------------------
+# ======================================================================
+#  Argument parser and entry point
+# ======================================================================
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="autoexp")
@@ -271,6 +279,7 @@ def build_parser():
     init = sub.add_parser("init")
     init.add_argument("project_name")
     init.add_argument("--title")
+    init.add_argument("--autoresearch", action="store_true")
     init.set_defaults(fn=init_cmd)
 
     run = sub.add_parser("run")

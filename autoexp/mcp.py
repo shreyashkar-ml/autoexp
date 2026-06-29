@@ -1,8 +1,9 @@
 import json
 import sys
 
+from .autoresearch import for_project as research_for_project
 from .reports import (
-    report_instruction as read_report_instruction,
+    report_generation_instruction,
     set_report_instruction as set_project_report_instruction,
     write_report_instruction as write_project_report_instruction,
 )
@@ -28,7 +29,9 @@ from .workspace import project_root, read_json, script_manifest
 PROTOCOL_VERSION = "2025-06-18"
 
 
-# --- JSON-RPC / MCP envelope helpers ----------------------------------------
+# ======================================================================
+#  JSON-RPC / MCP envelope helpers
+# ======================================================================
 
 def json_text(data):
     return json.dumps(data, indent=2)
@@ -55,7 +58,9 @@ def _run_id_schema():
     return tool_schema({"run_id": {"type": "string"}}, ["run_id"])
 
 
-# --- tool registry: description + schema + handler, defined together ---------
+# ======================================================================
+#  Tool registry: description, schema, and handler defined together
+# ======================================================================
 # Each handler takes (root, args) so adding a tool is a single self-contained entry.
 
 TOOLS = {
@@ -115,9 +120,9 @@ TOOLS = {
         "handler": lambda root, a: read_logs(a["run_id"], root),
     },
     "report_instruction": {
-        "description": "Read active report instruction.",
+        "description": "Read project report guidance joined with Autoexp's report contract.",
         "schema": tool_schema(),
-        "handler": lambda root, a: read_report_instruction(root),
+        "handler": lambda root, a: report_generation_instruction(root),
     },
     "write_report_instruction": {
         "description": "Write active project report instruction text.",
@@ -164,6 +169,26 @@ TOOLS = {
         "schema": _run_id_schema(),
         "handler": lambda root, a: restore(a["run_id"], root),
     },
+    "research_state": {
+        "description": "Read the autoresearch objective, contract, loop, and experiment ledger.",
+        "schema": tool_schema(),
+        "handler": lambda root, a: research_for_project(root).state(),
+    },
+    "research_diff": {
+        "description": "Read the Git diff for one autoresearch attempt.",
+        "schema": tool_schema({"tag": {"type": "string"}}, ["tag"]),
+        "handler": lambda root, a: research_for_project(root).diff(a["tag"]),
+    },
+    "research_begin_attempt": {
+        "description": "Record a hypothesis and run one autoresearch experiment.",
+        "schema": tool_schema({"hypothesis": {"type": "string"}}, ["hypothesis"]),
+        "handler": lambda root, a: research_for_project(root).begin_attempt(a["hypothesis"]),
+    },
+    "research_finish_attempt": {
+        "description": "Score an autoresearch attempt and keep or revert its change.",
+        "schema": tool_schema({"tag": {"type": "string"}}, ["tag"]),
+        "handler": lambda root, a: research_for_project(root).finish_attempt(a["tag"]),
+    },
 }
 
 
@@ -181,30 +206,28 @@ def call_tool(name, args):
     return spec["handler"](project_root(), args or {})
 
 
-# --- resources --------------------------------------------------------------
+# ======================================================================
+#  Resources
+# ======================================================================
+
+# URI -> (display name, MIME type, producer).
+RESOURCES = {
+    "autoexp://workspace": ("workspace", "application/json", lambda root: json_text(workspace(root))),
+    "autoexp://contract": ("contract", "text/markdown", lambda root: (root / "autoexp.md").read_text()),
+    "autoexp://config": ("config", "application/json", lambda root: json_text(read_json(root / "autoexp.json"))),
+    "autoexp://script/manifest": ("script manifest", "application/json", lambda root: json_text(script_manifest(root))),
+    "autoexp://script/params": ("script params", "application/json", lambda root: json_text(read_script_params(root))),
+    "autoexp://runs/latest": ("latest runs", "application/json", lambda root: json_text({"runs": list_runs(root=root)})),
+    "autoexp://report-instruction": ("report instruction", "application/json", lambda root: json_text(report_generation_instruction(root))),
+    "autoexp://research": ("autoresearch state", "application/json", lambda root: json_text(research_for_project(root).state())),
+}
+
 
 def resource_list():
     return [
-        {"uri": "autoexp://workspace", "name": "workspace", "mimeType": "application/json"},
-        {"uri": "autoexp://contract", "name": "contract", "mimeType": "text/markdown"},
-        {"uri": "autoexp://config", "name": "config", "mimeType": "application/json"},
-        {"uri": "autoexp://script/manifest", "name": "script manifest", "mimeType": "application/json"},
-        {"uri": "autoexp://script/params", "name": "script params", "mimeType": "application/json"},
-        {"uri": "autoexp://runs/latest", "name": "latest runs", "mimeType": "application/json"},
-        {"uri": "autoexp://report-instruction", "name": "report instruction", "mimeType": "application/json"},
+        {"uri": uri, "name": name, "mimeType": mime_type}
+        for uri, (name, mime_type, _) in RESOURCES.items()
     ]
-
-
-# Static resource URIs -> (mimeType, producer(root)).
-STATIC_RESOURCES = {
-    "autoexp://workspace": ("application/json", lambda root: json_text(workspace(root))),
-    "autoexp://contract": ("text/markdown", lambda root: (root / "autoexp.md").read_text()),
-    "autoexp://config": ("application/json", lambda root: json_text(read_json(root / "autoexp.json"))),
-    "autoexp://script/manifest": ("application/json", lambda root: json_text(script_manifest(root))),
-    "autoexp://script/params": ("application/json", lambda root: json_text(read_script_params(root))),
-    "autoexp://runs/latest": ("application/json", lambda root: json_text({"runs": list_runs(root=root)})),
-    "autoexp://report-instruction": ("application/json", lambda root: json_text(read_report_instruction(root))),
-}
 
 # Per-run section -> producer(run_id, root). "" means the run row itself.
 RUN_SECTIONS = {
@@ -218,8 +241,8 @@ RUN_SECTIONS = {
 
 def read_resource(uri):
     root = project_root()
-    if uri in STATIC_RESOURCES:
-        mime_type, produce = STATIC_RESOURCES[uri]
+    if uri in RESOURCES:
+        _, mime_type, produce = RESOURCES[uri]
         return mime_type, produce(root)
 
     prefix = "autoexp://runs/"
@@ -233,7 +256,9 @@ def read_resource(uri):
     raise ValueError(f"unknown resource: {uri}")
 
 
-# --- JSON-RPC method dispatch ------------------------------------------------
+# ======================================================================
+#  JSON-RPC method dispatch
+# ======================================================================
 
 def handle(message):
     method = message.get("method")
@@ -271,7 +296,9 @@ def handle(message):
     raise ValueError(f"unsupported method: {method}")
 
 
-# --- stdio transport ---------------------------------------------------------
+# ======================================================================
+#  Stdio transport
+# ======================================================================
 
 def write_message(message):
     sys.stdout.write(json.dumps(message, separators=(",", ":")) + "\n")

@@ -9,7 +9,9 @@ from .workspace import die, resolve_root, source_paths
 AUTOEXP_GIT_DIR = ".autoexp/git"
 
 
-# --- private git (snapshots of script/config, separate from the user's repo) ---
+# ======================================================================
+#  Private Git: script/config snapshots separate from the user's repo
+# ======================================================================
 
 def autoexp_git(args, root=None, capture=False, check=True):
     """Run git against the project's private .autoexp/git store."""
@@ -57,7 +59,9 @@ def git_commit_source(message, root=None):
     return current_autoexp_commit(root), True
 
 
-# --- run index (index.sqlite) -----------------------------------------------
+# ======================================================================
+#  Run index (index.sqlite)
+# ======================================================================
 
 def db(root=None):
     root = resolve_root(root)

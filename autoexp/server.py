@@ -5,19 +5,20 @@ import signal
 import subprocess
 import sys
 import threading
-import time
 import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
 
 from .reports import report_instruction, write_report_instruction
+from .autoresearch import for_project as research_for_project
 from .store import init_db, require_autoexp_git_repo
 from .workspace import (
     is_project_root,
     list_registered_projects,
     now,
     project_id,
+    project_mode,
     register_project,
     resolve_registered_project,
 )
@@ -43,7 +44,9 @@ def clamp(raw, default=20, maximum=200):
         return default
 
 
-# --- run lifecycle: one background `autoexp run` per project ----------------
+# ======================================================================
+#  Run lifecycle: one background `autoexp run` per project
+# ======================================================================
 
 class RunManager:
     """Owns at most one running experiment subprocess for a single project."""
@@ -141,6 +144,7 @@ class AutoexpHTTPServer(ThreadingHTTPServer):
         super().__init__(server_address, handler_class)
         self.default_project = default_project
         self.managers = {}
+        self.researchers = {}
         self.allow_origins = set(allow_origins or [])
 
     def project_root(self, raw=None):
@@ -155,11 +159,19 @@ class AutoexpHTTPServer(ThreadingHTTPServer):
             self.managers[key] = RunManager(root)
         return self.managers[key]
 
+    def research(self, root):
+        key = project_id(root)
+        if key not in self.researchers:
+            self.researchers[key] = research_for_project(root)
+        return self.researchers[key]
+
 
 class AutoexpHandler(BaseHTTPRequestHandler):
     server_version = "AutoexpHTTP/0.1"
 
-    # --- method entry points -------------------------------------------------
+    # ------------------------------------------------------------------
+    #  Method entry points
+    # ------------------------------------------------------------------
 
     def do_OPTIONS(self):
         self.send_response(204)
@@ -189,7 +201,9 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         except Exception as exc:
             self._json({"error": str(exc)}, 500)
 
-    # --- GET routes ----------------------------------------------------------
+    # ------------------------------------------------------------------
+    #  GET routes
+    # ------------------------------------------------------------------
 
     def _get(self):
         parsed = urlparse(self.path)
@@ -221,13 +235,26 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             return self._json(read_script_params(root))
         if path == "/api/report/instruction":
             return self._json(report_instruction(root))
+        if path == "/api/research":
+            return self._json(self.server.research(root).state())
+        if path == "/api/research/diff":
+            tag = query.get("tag", [""])[0]
+            if not tag:
+                return self._json({"error": "tag is required"}, 400)
+            return self._json(self.server.research(root).diff(tag))
+        if path == "/api/research/file":
+            rel = query.get("path", [""])[0]
+            if not rel:
+                return self._json({"error": "path is required"}, 400)
+            return self._json(self.server.research(root).open_file(rel))
         if path == "/api/run/source":
             return self._run_scoped(query, root, run_source)
         if path == "/api/run/report":
             return self._run_scoped(query, root, run_report)
         if path == "/api/run/log":
             tail = clamp(query.get("tail_bytes", [65536])[0], default=65536, maximum=1048576)
-            return self._json({"log": manager.log(tail)})
+            log = self.server.research(root).log(tail) if project_mode(root) == "autoresearch" else manager.log(tail)
+            return self._json({"log": log})
         self._static(path)
 
     def _run_scoped(self, query, root, fn):
@@ -236,7 +263,9 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             return self._json({"error": "run_id is required"}, 400)
         return self._json(fn(run_id, root))
 
-    # --- POST/PUT/PATCH routes ----------------------------------------------
+    # ------------------------------------------------------------------
+    #  POST / PUT / PATCH routes
+    # ------------------------------------------------------------------
 
     def _post(self):
         path = urlparse(self.path).path
@@ -253,6 +282,12 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             root = self._project_root(body)
             ok, payload = self.server.manager(root).kill(bool(body.get("force")))
             return self._json(payload, 202 if ok else 409)
+        if path == "/api/research/loop/start":
+            root = self._project_root(body)
+            return self._json(self.server.research(root).start_loop(), 202)
+        if path == "/api/research/loop/kill":
+            root = self._project_root(body)
+            return self._json(self.server.research(root).stop_loop(), 202)
         self._json({"error": "not found"}, 404)
 
     def _patch(self):
@@ -286,6 +321,13 @@ class AutoexpHandler(BaseHTTPRequestHandler):
                 return self._json({"error": "text must be a string"}, 400)
             return self._json(write_report_instruction(text, self._project_root(body)))
 
+        if path == "/api/research/program":
+            body = self._body({})
+            text = body.get("text") if isinstance(body, dict) else None
+            if not isinstance(text, str):
+                return self._json({"error": "text must be a string"}, 400)
+            return self._json(self.server.research(self._project_root(body)).save_program(text))
+
         if path != "/api/script/params":
             return self._json({"error": "not found"}, 404)
 
@@ -297,7 +339,9 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         root_data = body if isinstance(body, dict) else {}
         self._json(write_script_params(params, self._project_root(root_data)))
 
-    # --- shared helpers ------------------------------------------------------
+    # ------------------------------------------------------------------
+    #  Shared helpers
+    # ------------------------------------------------------------------
 
     @staticmethod
     def _project_id_from(data):
