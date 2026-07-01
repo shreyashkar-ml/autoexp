@@ -147,11 +147,11 @@ Projects may live in completely separate directories. Once initialized or opened
 
 Standard project view:
 
-![Autoexp standard empty project view](assets/new_autoexp.png)
+![Autoexp standard empty project view](https://github.com/user-attachments/assets/6b030ab6-5c54-44d2-ac1e-b52df3c55bb0)
 
 Autoresearch project view:
 
-![Autoexp Autoresearch empty project view](assets/new_autoresearch.png)
+![Autoexp Autoresearch empty project view](https://github.com/user-attachments/assets/d8dad830-3ce6-4088-b7d0-a563df03f02f)
 
 ## Reports
 
@@ -182,6 +182,26 @@ If you want to point the project at a different report guidance file, use `autoe
 ## Coding agents and MCP
 
 MCP is how a coding agent talks to Autoexp directly instead of guessing shell commands and file paths.
+
+### Optional Claude Code or Codex plugin
+
+The plugin adds the Autoexp workflow as an agent skill and wires the MCP server into Codex. The `autoexp` command must already be installed and available on `PATH`.
+
+For Claude Code:
+
+```bash
+claude plugin marketplace add https://github.com/shreyashkar-ml/autoexp
+claude plugin install autoexp@autoexp
+```
+
+For Codex:
+
+```bash
+codex plugin marketplace add https://github.com/shreyashkar-ml/autoexp
+codex plugin add autoexp@autoexp
+```
+
+The plugin is optional. Projects created with `autoexp init` still include their own agent instructions and project-local MCP configuration. Pi and other agents that discover `AGENTS.md` can use that project guidance without a plugin; MCP-only operations still require an MCP-capable client.
 
 `autoexp init` creates project-local agent configuration:
 

@@ -1,0 +1,20 @@
+{
+  "name": "autoexp",
+  "interface": {
+    "displayName": "Autoexp"
+  },
+  "plugins": [
+    {
+      "name": "autoexp",
+      "source": {
+        "source": "local",
+        "path": "./plugins/autoexp"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}

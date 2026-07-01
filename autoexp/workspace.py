@@ -20,7 +20,8 @@ AGENTS_TEXT = """# Autoexp Workspace
 This repository is an Autoexp workspace.
 
 - Read `autoexp.md` before changing experiment behavior.
-- Use `autoexp run` and the project MCP server (`autoexp mcp`) for runs and artifact inspection.
+- When MCP tools are available, use their live schemas. Start with `workspace` and `contract`; standard work uses `list_runs`, `read_*`, `write_*`, `run`, `diff_runs`, and `restore_run`; Autoresearch uses `research_state`, `research_begin_attempt`, `research_finish_attempt`, and `research_diff`.
+- MCP tool names are not shell commands. Without MCP, use the `autoexp` CLI and project files; do not run `autoexp mcp` manually.
 - Keep experiment source in `script/`.
 - Do not create ad-hoc experiment folders.
 - Do not hand-edit `runs/<run_id>/output/` or `runs/<run_id>/logs/`.

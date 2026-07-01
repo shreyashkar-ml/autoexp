@@ -1,0 +1,30 @@
+{
+  "name": "autoexp",
+  "version": "0.1.0",
+  "description": "Run and review reproducible local experiments with Autoexp.",
+  "author": {
+    "name": "Shreyashkar Sahu",
+    "url": "https://github.com/shreyashkar-ml"
+  },
+  "homepage": "https://github.com/shreyashkar-ml/autoexp",
+  "repository": "https://github.com/shreyashkar-ml/autoexp",
+  "license": "Apache-2.0",
+  "keywords": ["experiments", "autoresearch", "mcp"],
+  "skills": "./skills/",
+  "mcpServers": {
+    "autoexp": {
+      "command": "autoexp",
+      "args": ["mcp"]
+    }
+  },
+  "interface": {
+    "displayName": "Autoexp",
+    "shortDescription": "Run reproducible agent-led experiments.",
+    "longDescription": "Use Autoexp to run experiments, inspect artifacts, compare attempts, write reports, and drive metric-based Autoresearch loops.",
+    "developerName": "Shreyashkar Sahu",
+    "category": "Productivity",
+    "capabilities": ["Interactive", "Write"],
+    "websiteURL": "https://github.com/shreyashkar-ml/autoexp",
+    "defaultPrompt": "Use Autoexp to run and compare experiments for this project."
+  }
+}

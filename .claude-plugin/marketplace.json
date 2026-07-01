@@ -1,0 +1,14 @@
+{
+  "name": "autoexp",
+  "owner": {
+    "name": "Shreyashkar Sahu"
+  },
+  "description": "Autoexp tools for coding agents",
+  "plugins": [
+    {
+      "name": "autoexp",
+      "source": "./plugins/autoexp",
+      "description": "Run and review reproducible local experiments with Autoexp"
+    }
+  ]
+}

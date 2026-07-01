@@ -1,0 +1,13 @@
+{
+  "name": "autoexp",
+  "displayName": "Autoexp",
+  "description": "Run and review reproducible local experiments with Autoexp.",
+  "author": {
+    "name": "Shreyashkar Sahu",
+    "url": "https://github.com/shreyashkar-ml"
+  },
+  "homepage": "https://github.com/shreyashkar-ml/autoexp",
+  "repository": "https://github.com/shreyashkar-ml/autoexp",
+  "license": "Apache-2.0",
+  "keywords": ["experiments", "autoresearch", "mcp"]
+}
