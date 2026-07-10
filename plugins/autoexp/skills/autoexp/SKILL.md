@@ -35,10 +35,11 @@ For reports, read the run's report bundle and active report instruction, then wr
 ## Autoresearch
 
 1. Read `script/program.md` and call `research_state`.
-2. Form one concrete hypothesis and edit only the file marked `agent`.
-3. Call `research_begin_attempt` with that hypothesis.
-4. Call `research_finish_attempt` with the returned attempt tag.
-5. Inspect the score, decision, and diff, then repeat within the user's stopping rule.
+2. If the user provided a reference training script and no attempts exist yet, adapt or copy it into the file marked `agent` as the baseline.
+3. Form one concrete hypothesis and edit only the file marked `agent`.
+4. Call `research_begin_attempt` with that hypothesis.
+5. Call `research_finish_attempt` with the returned attempt tag.
+6. Inspect the score, decision, and diff, then repeat within the user's stopping rule.
 
 Do not edit files marked `human` or `frozen`. Keep reverted attempts in the ledger; they are part of the research record.
 

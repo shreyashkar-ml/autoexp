@@ -23,6 +23,7 @@ import {
   Terminal,
   Target,
   Bot,
+  Upload,
   X,
 } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
@@ -40,6 +41,7 @@ import type {
   ResearchObjective,
   ResearchState,
   Run,
+  ScriptSavePayload,
   SourcePayload,
 } from "@/types";
 
@@ -66,6 +68,7 @@ const EMPTY_RESEARCH: ResearchState = {
   ],
   experiments: [],
   loop: { active: false, phase: "idle", tag: null },
+  can_import_baseline: false,
 };
 
 function statusLabel(status: string) {
@@ -376,24 +379,24 @@ export default function App() {
 
   async function saveScript(
     runId: string,
+    snapshotId: string | null,
     path: string,
     text: string,
     saveAs: string,
   ) {
-    const result = await api<{ path: string; run: Run }>("/api/script/file", {
+    const result = await api<ScriptSavePayload>("/api/script/file", {
       method: "PATCH",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         project_id: projectId,
         run_id: runId,
+        ...(snapshotId ? { snapshot_id: snapshotId } : {}),
         path,
         text,
         save_as: saveAs,
       }),
     });
-    setSelectedRun(result.run.run_id);
-    await loadStatus(projectId);
-    toast(`Saved ${saveAs}`, "ok");
+    toast(`Saved ${saveAs} as ${result.snapshot.snapshot_id}`, "ok");
     return result;
   }
 
@@ -415,7 +418,10 @@ export default function App() {
       body: JSON.stringify({ project_id: projectId, params }),
     });
     setPanel({ kind: "params", data });
-    toast("Params saved", "ok");
+    toast(
+      data.snapshot ? `Params saved as ${data.snapshot.snapshot_id}` : "Params saved",
+      "ok",
+    );
     return data;
   }
 
@@ -497,6 +503,29 @@ export default function App() {
     setPanel({ kind: "program", data });
     toast("Program saved", "ok");
     return data;
+  }
+
+  async function importResearchBaseline(file: File) {
+    if (!projectId) return;
+    setLoading("research-import");
+    setError("");
+    try {
+      const text = await file.text();
+      const data = await api<ResearchFilePayload>("/api/research/subject", {
+        method: "PUT",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: projectId, text }),
+      });
+      await loadResearch(projectId);
+      setPanel({ kind: "evaluator", data });
+      toast(`Imported ${file.name} as ${data.path}`, "ok");
+    } catch (caught) {
+      const message = caught instanceof Error ? caught.message : String(caught);
+      setError(message);
+      toast("Couldn't import baseline", "bad");
+    } finally {
+      setLoading("");
+    }
   }
 
   const filteredRuns = runs.filter((run) => {
@@ -679,6 +708,8 @@ export default function App() {
             onOpenFile={openResearchFile}
             onResize={setLeftColumn}
             onSaveProgram={saveProgram}
+            onImportBaseline={importResearchBaseline}
+            importing={loading === "research-import"}
             onClose={() => setPanel(null)}
           />
         ) : null}
@@ -791,6 +822,8 @@ function ResearchDashboard({
   onOpenFile,
   onResize,
   onSaveProgram,
+  onImportBaseline,
+  importing,
   onClose,
 }: {
   research: ResearchState;
@@ -805,6 +838,8 @@ function ResearchDashboard({
   onOpenFile: (path: string) => void;
   onResize: (value: number) => void;
   onSaveProgram: (text: string) => Promise<ResearchFilePayload>;
+  onImportBaseline: (file: File) => Promise<void>;
+  importing?: boolean;
   onClose: () => void;
 }) {
   const kept = research.experiments.filter((item) => item.status === "kept").length;
@@ -849,6 +884,10 @@ function ResearchDashboard({
           emptyText={preview ? "Create a project to establish a baseline and begin the ratchet." : undefined}
         />
       </div>
+
+      {research.can_import_baseline && !preview ? (
+        <BaselineImport onImport={onImportBaseline} disabled={importing} />
+      ) : null}
 
       <div className="card">
         <div className="card-head">
@@ -1011,6 +1050,57 @@ function RatchetChart({
   );
 }
 
+function BaselineImport({
+  onImport,
+  disabled = false,
+}: {
+  onImport: (file: File) => Promise<void>;
+  disabled?: boolean;
+}) {
+  const inputRef = useRef<HTMLInputElement>(null);
+  const [over, setOver] = useState(false);
+
+  async function pick(files: FileList | null) {
+    const file = files?.[0];
+    if (file) await onImport(file);
+  }
+
+  return (
+    <div
+      className={`card baseline-import${over ? " over" : ""}`}
+      onDragOver={(event) => {
+        event.preventDefault();
+        if (!disabled) setOver(true);
+      }}
+      onDragLeave={() => setOver(false)}
+      onDrop={(event) => {
+        event.preventDefault();
+        setOver(false);
+        if (!disabled) void pick(event.dataTransfer.files);
+      }}
+    >
+      <div>
+        <div className="eyebrow">baseline</div>
+        <h2>Upload your autoresearch loop script</h2>
+        <p>Drop a Python script here to import it as <span className="mono-inline">script/train.py</span>.</p>
+      </div>
+      <button className="btn" disabled={disabled} onClick={() => inputRef.current?.click()}>
+        <Upload size={15} /> {disabled ? "Importing…" : "Choose file"}
+      </button>
+      <input
+        ref={inputRef}
+        type="file"
+        accept=".py,text/x-python,text/plain"
+        hidden
+        onChange={(event) => {
+          void pick(event.target.files);
+          event.currentTarget.value = "";
+        }}
+      />
+    </div>
+  );
+}
+
 function ResearchContract({
   files,
   onOpen,
@@ -1162,7 +1252,12 @@ function ResearchViewer({
         : panel.kind === "diff"
           ? `${panel.experiment.tag} · experiment diff`
           : "Live log";
-  const Icon = panel.kind === "program" ? FileText : panel.kind === "evaluator" ? Lock : panel.kind === "diff" ? GitBranch : Terminal;
+  const Icon =
+    panel.kind === "program"
+      ? FileText
+      : panel.kind === "evaluator"
+        ? panel.data.role === "frozen" ? Lock : Code2
+        : panel.kind === "diff" ? GitBranch : Terminal;
   return (
     <aside className="card panel">
       <div className="card-head">
@@ -1487,10 +1582,11 @@ function Viewer({
   active: boolean;
   onSaveScript: (
     runId: string,
+    snapshotId: string | null,
     path: string,
     text: string,
     saveAs: string,
-  ) => Promise<{ path: string; run: Run }>;
+  ) => Promise<ScriptSavePayload>;
   onSaveInstruction: (text: string) => Promise<InstructionPayload>;
   onSaveParams: (params: Record<string, unknown>) => Promise<ParamsPayload>;
   onClose: () => void;
@@ -1530,8 +1626,8 @@ function Viewer({
           <SourceEditor
             data={panel.data}
             theme={theme}
-            onSave={(path, text, saveAs) =>
-              onSaveScript(panel.run.run_id, path, text, saveAs)
+            onSave={(snapshotId, path, text, saveAs) =>
+              onSaveScript(panel.run.run_id, snapshotId, path, text, saveAs)
             }
           />
         ) : null}
@@ -1607,10 +1703,11 @@ function SourceEditor({
   data: SourcePayload;
   theme: Theme;
   onSave: (
+    snapshotId: string | null,
     path: string,
     text: string,
     saveAs: string,
-  ) => Promise<{ path: string; run: Run }>;
+  ) => Promise<ScriptSavePayload>;
 }) {
   const [files, setFiles] = useState(data.files);
   const [selected, setSelected] = useState(data.selected);
@@ -1618,6 +1715,7 @@ function SourceEditor({
   const [saveAs, setSaveAs] = useState("");
   const [editing, setEditing] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [baseSnapshotId, setBaseSnapshotId] = useState<string | null>(null);
   const file = useMemo(
     () => files.find((item) => item.path === selected) || files[0],
     [files, selected],
@@ -1626,6 +1724,7 @@ function SourceEditor({
   useEffect(() => {
     setFiles(data.files);
     setSelected(data.selected);
+    setBaseSnapshotId(null);
     setEditing(false);
   }, [data]);
   useEffect(() => {
@@ -1644,17 +1743,22 @@ function SourceEditor({
     setSaving(true);
     try {
       const result = await onSave(
+        baseSnapshotId,
         file.path,
         draft,
         saveAs || nextScriptPath(file.path, files),
       );
-      setFiles((current) =>
-        current.some((item) => item.path === result.path)
-          ? current.map((item) =>
+      setBaseSnapshotId(result.snapshot.snapshot_id);
+      setFiles((current) => {
+        const derived = result.path === file.path
+          ? current
+          : current.filter((item) => item.path !== file.path);
+        return derived.some((item) => item.path === result.path)
+          ? derived.map((item) =>
               item.path === result.path ? { ...item, text: draft } : item,
             )
-          : [...current, { path: result.path, text: draft }],
-      );
+          : [...derived, { path: result.path, text: draft }];
+      });
       setSelected(result.path);
       setEditing(false);
     } finally {

@@ -44,6 +44,19 @@ export type InstructionPayload = {
 export type ParamsPayload = {
   schema: Record<string, unknown> | null;
   params: Record<string, unknown> | null;
+  snapshot?: SourceSnapshot;
+};
+
+export type SourceSnapshot = {
+  snapshot_id: string;
+  parent_snapshot_id?: string | null;
+  git_commit: string;
+  source_hash: string;
+};
+
+export type ScriptSavePayload = {
+  path: string;
+  snapshot: SourceSnapshot;
 };
 
 export type ResearchObjective = {
@@ -77,6 +90,7 @@ export type ResearchState = {
   files: ResearchFile[];
   experiments: ResearchExperiment[];
   loop: { active: boolean; phase: string; tag: string | null };
+  can_import_baseline: boolean;
 };
 
 export type ResearchFilePayload = {

@@ -71,9 +71,29 @@ def db(root=None):
 
 
 def init_db(root=None):
+    root = resolve_root(root)
     conn = db(root)
-    conn.executescript(
-        """
+    has_runs = conn.execute(
+        "select 1 from sqlite_master where type = 'table' and name = 'runs'"
+    ).fetchone()
+    conn.execute(
+        """create table if not exists schema_metadata(
+            schema_version integer not null,
+            legacy_snapshot_migration_complete integer not null default 0
+        )"""
+    )
+    version = conn.execute("select schema_version from schema_metadata").fetchone()
+    if version is None:
+        conn.execute(
+            "insert into schema_metadata(schema_version) values (?)",
+            (1 if has_runs else 0,),
+        )
+        version = (1 if has_runs else 0,)
+
+    if version[0] < 1:
+        conn.executescript(
+            """
+        begin;
         create table if not exists runs(
             run_id text primary key, run_dir text not null, report_path text not null,
             output_hash text not null, capsule_hash text not null, script_name text not null,
@@ -82,16 +102,59 @@ def init_db(root=None):
             status text not null, stage_status text not null, created_at text not null
         );
         create index if not exists idx_runs_capsule on runs(capsule_hash, status);
-        """
-    )
+        update schema_metadata set schema_version = 1;
+        commit;
+            """
+        )
+
+    if version[0] < 2:
+        conn.executescript(
+            """
+            begin;
+            create table source_snapshots(
+                snapshot_id text primary key,
+                project_id text not null,
+                parent_snapshot_id text references source_snapshots(snapshot_id),
+                git_commit text not null,
+                script_hash text not null,
+                params_hash text not null,
+                manifest_hash text not null,
+                runtime_config_hash text not null,
+                source_hash text not null,
+                created_at text not null,
+                created_by_trigger_id text,
+                label text,
+                legacy_run_id text unique
+            );
+            create index idx_source_snapshots_hash on source_snapshots(source_hash);
+            alter table runs add column source_snapshot_id text references source_snapshots(snapshot_id);
+            update schema_metadata
+            set schema_version = 2, legacy_snapshot_migration_complete = 0;
+            commit;
+            """
+        )
     conn.commit()
+    migration_complete = conn.execute(
+        "select legacy_snapshot_migration_complete from schema_metadata"
+    ).fetchone()[0]
     conn.close()
+
+    if not migration_complete:
+        from .snapshots import migrate_legacy_run_snapshots
+
+        if migrate_legacy_run_snapshots(root):
+            conn = db(root)
+            conn.execute(
+                "update schema_metadata set legacy_snapshot_migration_complete = 1"
+            )
+            conn.commit()
+            conn.close()
 
 
 RUN_COLUMNS = (
     "run_id", "run_dir", "report_path", "output_hash", "capsule_hash", "script_name",
     "script_hash", "script_env_hash", "runtime_context_hash", "stage_commit",
-    "status", "stage_status", "created_at",
+    "status", "stage_status", "created_at", "source_snapshot_id",
 )
 
 
@@ -109,6 +172,7 @@ def insert_run(meta, root=None):
         "run_dir": f"runs/{meta['run_id']}",
         "report_path": "",
         "output_hash": "",
+        "source_snapshot_id": None,
         "script_name": meta.get("script_name") or script_name(meta["run_id"], root),
         **meta,
     }

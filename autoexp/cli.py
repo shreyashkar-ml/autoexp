@@ -26,10 +26,10 @@ from .runs import (
     source_root_for_run,
 )
 from .runtime import doctor
+from .snapshots import capture_workspace, materialize_snapshot
 from .store import (
     autoexp_git,
     db,
-    git_commit_source,
     init_db,
     insert_run,
     require_autoexp_git_repo,
@@ -83,13 +83,16 @@ def print_run(run, duplicate=False):
 #  Run: the core command
 # ======================================================================
 
-def _prepare_fresh(root, source_root, stage_commit):
+def _prepare_fresh(root, source_root, stage_commit, source_snapshot_id=None):
     """Build a new run snapshot in runs/<id>/ and its initial metadata."""
     tmp = root / "runs" / f".tmp_{uuid.uuid4().hex}"
     tmp.mkdir(parents=True)
+    if source_snapshot_id:
+        materialize_snapshot(source_snapshot_id, tmp, root)
+    else:
+        copy_run_source(source_root, tmp)
     for name in ("output", "logs", "report"):
         (tmp / name).mkdir()
-    copy_run_source(source_root, tmp)
 
     hashes = compute_hashes(tmp)
     run_id, created_at = new_run_id(hashes, root)
@@ -104,6 +107,7 @@ def _prepare_fresh(root, source_root, stage_commit):
         **hashes,
         "script_name": script_name(run_id, run_dir),
         "stage_commit": stage_commit,
+        "source_snapshot_id": source_snapshot_id,
         "status": "running",
         "stage_status": {"script": "running"},
         "created_at": created_at,
@@ -154,8 +158,13 @@ def run_cmd(args):
         print(f"refreshing run artifacts for {args.run_id}")
         run_id, run_dir, meta, hashes = _prepare_rerun(root, source_run, source_root)
     else:
-        stage_commit = git_commit_source("autoexp source snapshot", root)[0]
-        run_id, run_dir, meta, hashes = _prepare_fresh(root, source_root, stage_commit)
+        snapshot = capture_workspace(root)
+        run_id, run_dir, meta, hashes = _prepare_fresh(
+            root,
+            source_root,
+            snapshot["git_commit"],
+            snapshot["snapshot_id"],
+        )
 
     def persist(meta, *, new=False):
         write_json(run_dir / "run.json", meta)

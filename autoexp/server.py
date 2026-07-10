@@ -305,11 +305,21 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         run_id = body.get("run_id")
         if run_id is not None and not isinstance(run_id, str):
             return self._json({"error": "run_id must be a string"}, 400)
+        snapshot_id = body.get("snapshot_id")
+        if snapshot_id is not None and not isinstance(snapshot_id, str):
+            return self._json({"error": "snapshot_id must be a string"}, 400)
         save_as = body.get("save_as")
         if save_as is not None and not isinstance(save_as, str):
             return self._json({"error": "save_as must be a string"}, 400)
 
-        self._json(save_script_file(rel, text, self._project_root(body), run_id, save_as))
+        self._json(save_script_file(
+            rel,
+            text,
+            self._project_root(body),
+            source_run_id=run_id,
+            save_as=save_as,
+            source_snapshot_id=snapshot_id,
+        ))
 
     def _put(self):
         path = urlparse(self.path).path
@@ -327,6 +337,16 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             if not isinstance(text, str):
                 return self._json({"error": "text must be a string"}, 400)
             return self._json(self.server.research(self._project_root(body)).save_program(text))
+
+        if path == "/api/research/subject":
+            body = self._body({})
+            text = body.get("text") if isinstance(body, dict) else None
+            if not isinstance(text, str):
+                return self._json({"error": "text must be a string"}, 400)
+            research = self.server.research(self._project_root(body))
+            if not research.can_import_baseline():
+                return self._json({"error": "baseline import is only available before attempts and before train.py is edited"}, 409)
+            return self._json(research.save_subject(text))
 
         if path != "/api/script/params":
             return self._json({"error": "not found"}, 404)

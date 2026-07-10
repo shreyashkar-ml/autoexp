@@ -261,6 +261,8 @@ An Autoresearch project starts with three clear file roles:
 - `script/train.py` — the implementation the coding agent improves
 - `script/evaluate.py` — the stable evaluator that produces the metric
 
+On a fresh Autoresearch project, the browser view can import an existing Python script as the starting `script/train.py`.
+
 Edit `script/program.md` to change the research direction, constraints, allowed strategies, or stopping criteria. The agent reads this file before proposing and finishing attempts.
 
 Configure the metric direction and agent command in the `autoresearch` section of `autoexp.json`:

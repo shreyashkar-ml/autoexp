@@ -1,18 +1,22 @@
 import json
 import subprocess
 import sys
-import uuid
+import tempfile
 from pathlib import Path
 
 from .reports import artifact_files, report_instruction, write_report_bundle
-from .runner import RUN_CONTEXT, compute_hashes, docker_ready, hash_run_output
-from .runs import copy_run_source, get_run, new_run_id, source_root_for_run, restore_run_state, run_stage_commit
+from .runner import docker_ready
+from .runs import get_run, source_root_for_run, restore_run_state, run_stage_commit
+from .snapshots import (
+    capture_source_tree,
+    capture_workspace,
+    get_snapshot,
+    materialize_snapshot,
+)
 from .store import (
     autoexp_git,
-    current_autoexp_commit,
     db,
     init_db,
-    insert_run,
     require_autoexp_git_repo,
 )
 from .workspace import (
@@ -21,7 +25,6 @@ from .workspace import (
     PROJECT_INSTRUCTIONS,
     ensure_within_project,
     is_project_root,
-    now,
     project_entry,
     read_json,
     resolve_root,
@@ -110,8 +113,10 @@ def write_script_params(params, root=None):
     if not isinstance(params, dict):
         raise ValueError("params must be a JSON object")
     root = resolve_root(root)
+    init_db(root)
     write_json(root / "script" / "params.json", params)
-    return read_script_params(root)
+    snapshot = capture_workspace(root, label="Params update")
+    return {**read_script_params(root), "snapshot": snapshot}
 
 
 def run_source(run_id, root=None):
@@ -168,8 +173,8 @@ def read_report_bundle(run_id, root=None):
 #  Editing scripts into new run snapshots
 # ======================================================================
 
-def next_script_version(root, rel):
-    """Next free `name_vN` for a script path, scanning prior run snapshots."""
+def next_script_version(source_root, rel):
+    """Next free `name_vN` for a script path within one source snapshot."""
     rel = Path(rel)
     parent = rel.parent
     suffix = rel.suffix
@@ -180,10 +185,10 @@ def next_script_version(root, rel):
             base = prefix
 
     highest = 1  # a bare `base` (no suffix) counts as version 1
-    for script in (Path(root) / "runs").glob("*/script/*"):
-        if not script.is_file() or script.parent.parent.name.startswith("."):
+    for script in (Path(source_root) / "script").rglob("*"):
+        if not script.is_file():
             continue
-        existing = script.relative_to(script.parent.parent / "script")
+        existing = script.relative_to(Path(source_root) / "script")
         if existing.parent != parent or existing.suffix != suffix:
             continue
         if existing.stem.startswith(f"{base}_v"):
@@ -194,53 +199,70 @@ def next_script_version(root, rel):
     return (parent / f"{base}_v{highest + 1}{suffix}").as_posix()
 
 
-def save_script_file(path, text, root=None, source_run_id=None, save_as=None):
-    """Write edited script text into a brand-new run snapshot (status 'edited')."""
+def _source_snapshot(root, source_run_id=None, source_snapshot_id=None):
+    if source_snapshot_id:
+        return get_snapshot(source_snapshot_id, root)
+    if not source_run_id:
+        return capture_workspace(root, label="Script edit base")
+
+    run = get_run(source_run_id, root)
+    if run.get("source_snapshot_id"):
+        return get_snapshot(run["source_snapshot_id"], root)
+
+    snapshot = capture_source_tree(
+        source_root_for_run(run, root),
+        root,
+        parent_commit=run_stage_commit(run),
+        label=f"Recovered source for run {source_run_id}",
+    )
+    conn = db(root)
+    conn.execute(
+        "update runs set source_snapshot_id = ? where run_id = ?",
+        (snapshot["snapshot_id"], source_run_id),
+    )
+    conn.commit()
+    conn.close()
+    return snapshot
+
+
+def save_script_file(
+    path,
+    text,
+    root=None,
+    source_run_id=None,
+    save_as=None,
+    source_snapshot_id=None,
+):
+    """Derive an edited source snapshot without creating an execution row."""
     root = resolve_root(root)
+    init_db(root)
     rel = ensure_within_project(path, "path must stay inside script/")
-    saved_rel = ensure_within_project(save_as, "save_as must stay inside script/") if save_as else Path(next_script_version(root, rel))
+    base = _source_snapshot(root, source_run_id, source_snapshot_id)
 
-    source_run = get_run(source_run_id, root) if source_run_id else None
-    source_root = source_root_for_run(source_run, root) if source_run else root
-    if not (source_root / "script" / rel).is_file():
-        raise ValueError(f"unknown script file: {rel.as_posix()}")
-
-    # Assemble the snapshot in a temp dir, then atomically rename into runs/<id>.
-    tmp = root / "runs" / f".tmp_ui_edit_{uuid.uuid4().hex}"
-    tmp.mkdir(parents=True)
-    for name in ("output", "logs", "report"):
-        (tmp / name).mkdir()
-    copy_run_source(source_root, tmp)
-    if saved_rel != rel:
-        (tmp / "script" / rel).unlink(missing_ok=True)
-    edited = tmp / "script" / saved_rel
-    edited.parent.mkdir(parents=True, exist_ok=True)
-    edited.write_text(text)
-
-    _retarget_manifest(tmp / "script" / "stage.json", rel, saved_rel)
-
-    hashes = compute_hashes(tmp)
-    run_id, _ = new_run_id(hashes, root)
-    run_dir = root / "runs" / run_id
-    tmp.rename(run_dir)
-
-    meta = {
-        "run_id": run_id,
-        "run_dir": f"runs/{run_id}",
-        "report_path": "",
-        "output_hash": hash_run_output(run_dir),
-        "script_name": saved_rel.as_posix(),
-        **hashes,
-        "stage_commit": current_autoexp_commit(root),
-        "status": "edited",
-        "stage_status": {"script": "edited"},
-        "created_at": now(),
-    }
-    write_json(run_dir / "ctx.json", RUN_CONTEXT)
-    write_json(run_dir / "run.json", meta)
-    insert_run(meta, root=root)
-    write_report_bundle(run_id, root=root)
-    return {"path": saved_rel.as_posix(), "run": run_row(meta, root)}
+    with tempfile.TemporaryDirectory(prefix="autoexp-script-edit-") as tmp:
+        source_root = Path(tmp)
+        materialize_snapshot(base["snapshot_id"], source_root, root)
+        saved_rel = (
+            ensure_within_project(save_as, "save_as must stay inside script/")
+            if save_as
+            else Path(next_script_version(source_root, rel))
+        )
+        source = source_root / "script" / rel
+        if not source.is_file():
+            raise ValueError(f"unknown script file: {rel.as_posix()}")
+        if saved_rel != rel:
+            source.unlink()
+        edited = source_root / "script" / saved_rel
+        edited.parent.mkdir(parents=True, exist_ok=True)
+        edited.write_text(text)
+        _retarget_manifest(source_root / "script" / "stage.json", rel, saved_rel)
+        snapshot = capture_source_tree(
+            source_root,
+            root,
+            parent_snapshot_id=base["snapshot_id"],
+            label=f"Edited {saved_rel.as_posix()}",
+        )
+    return {"path": saved_rel.as_posix(), "snapshot": snapshot}
 
 
 def _retarget_manifest(manifest_path, old_rel, new_rel):

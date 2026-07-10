@@ -339,6 +339,7 @@ class AutoResearch:
             "files": files,
             "experiments": experiments,
             "loop": dict(self._loop),
+            "can_import_baseline": self.can_import_baseline(),
         }
 
     def diff(self, tag: str) -> dict:
@@ -361,10 +362,25 @@ class AutoResearch:
         (self.dir / program).write_text(text)
         return self.open_file(program)
 
+    def can_import_baseline(self) -> bool:
+        """Only a fresh scaffold can be replaced by an uploaded baseline."""
+        return not self._read_ledger() and (self.dir / self.cfg.subject_path).read_text() == TRAIN_TEXT
+
+    def save_subject(self, text: str) -> dict:
+        """PUT /api/research/subject -- initial baseline import into the agent-owned file."""
+        if not self.can_import_baseline():
+            raise ValueError("baseline import is only available before attempts and before train.py is edited")
+        subject = self.cfg.subject_path
+        (self.dir / subject).write_text(text)
+        return self.open_file(subject)
+
 
 PROGRAM_TEXT = """# Autoresearch program
 
 Improve the objective by editing only `script/train.py`.
+
+If you have an existing training or experiment script, use it as the starting
+point for `script/train.py` before beginning the first attempt.
 
 The loop:
 

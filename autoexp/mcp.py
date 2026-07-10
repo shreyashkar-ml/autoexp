@@ -130,18 +130,24 @@ TOOLS = {
         "handler": lambda root, a: write_project_report_instruction(a["text"], root),
     },
     "write_script_file": {
-        "description": "Create a versioned run snapshot with edited script content.",
+        "description": "Create a source snapshot with edited script content without executing it.",
         "schema": tool_schema(
             {
                 "path": {"type": "string"},
                 "content": {"type": "string"},
                 "run_id": {"type": "string"},
+                "snapshot_id": {"type": "string"},
                 "save_as": {"type": "string"},
             },
             ["path", "content"],
         ),
         "handler": lambda root, a: save_script_file(
-            a["path"], a["content"], root=root, source_run_id=a.get("run_id"), save_as=a.get("save_as")
+            a["path"],
+            a["content"],
+            root=root,
+            source_run_id=a.get("run_id"),
+            save_as=a.get("save_as"),
+            source_snapshot_id=a.get("snapshot_id"),
         ),
     },
     "write_script_params": {
