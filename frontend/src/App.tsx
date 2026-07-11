@@ -56,13 +56,14 @@ import type {
 type Theme = "light" | "dark";
 type ProjectMode = "standard" | "autoresearch";
 type StandardTab = "overview" | "script" | "output" | "logs" | "report" | "diff";
+type ResearchTab = "diff" | "run" | "artifacts";
 type Panel =
   | { kind: "run"; run: Run; tab: StandardTab }
   | { kind: "instruction"; data: InstructionPayload }
   | { kind: "params"; data: ParamsPayload }
   | { kind: "program"; data: ResearchFilePayload }
   | { kind: "evaluator"; data: ResearchFilePayload }
-  | { kind: "diff"; experiment: ResearchExperiment; objective: ResearchObjective }
+  | { kind: "attempt"; experiment: ResearchExperiment; objective: ResearchObjective }
   | { kind: "log" };
 type JobState = {
   active: boolean;
@@ -74,7 +75,9 @@ type Toast = { id: number; message: string; kind?: "ok" | "bad" };
 type RunRequestPayload = Run | { run?: Run | null; run_id?: string | null; job?: { run_id?: string | null } };
 
 const EMPTY_RESEARCH: ResearchState = {
+  contract: { contract_id: "preview", status: "draft", current_best_snapshot_id: null, evaluator_hash: null },
   objective: { metric: "score", direction: "max", baseline: null, best: null, budget_sec: 300 },
+  preflight: { ok: false, checks: [] },
   files: [
     { path: "script/program.md", role: "human", desc: "research directions and loop rules" },
     { path: "script/train.py", role: "agent", desc: "the implementation the agent improves" },
@@ -95,6 +98,33 @@ function formatScore(score: number | null) {
   if (magnitude >= 1000) return score.toLocaleString(undefined, { maximumFractionDigits: 2 });
   if (magnitude > 0 && magnitude < 0.001) return score.toExponential(2);
   return score.toFixed(4);
+}
+
+function formatBudget(seconds: number) {
+  if (seconds < 60) return `${seconds} sec`;
+  if (seconds % 60 === 0) return `${seconds / 60} min`;
+  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
+}
+
+function attemptKey(attempt: ResearchExperiment) {
+  return attempt.key || attempt.attempt_id || attempt.tag || "attempt";
+}
+
+function attemptLabel(attempt: ResearchExperiment) {
+  return attempt.attempt_id || attempt.tag || attempt.key || "attempt";
+}
+
+function attemptHypothesis(attempt: ResearchExperiment) {
+  return attempt.hypothesis || attempt.hyp || "No hypothesis recorded";
+}
+
+function attemptVerdict(attempt: ResearchExperiment) {
+  if (attempt.verdict) return attempt.verdict;
+  return attempt.status === "kept" || attempt.status === "reverted" ? attempt.status : null;
+}
+
+function attemptState(attempt: ResearchExperiment) {
+  return attempt.state || (attempt.status === "failed" ? "failed" : attempt.status === "running" ? "running" : "scored");
 }
 
 function relativeTime(value?: string) {
@@ -169,6 +199,7 @@ export default function App() {
   const hasAvailableProjects = filteredProjects.some((item) => item.exists);
   const displayedResearch = researchView ? (project ? research : EMPTY_RESEARCH) : null;
   const active = isResearch ? Boolean(research?.loop.active) : job.active;
+  const researchReady = !isResearch || Boolean(research?.preflight.ok);
 
   const toast = useCallback((message: string, kind?: Toast["kind"]) => {
     const id = Date.now() + Math.random();
@@ -242,7 +273,13 @@ export default function App() {
 
   async function loadResearch(id = projectId) {
     if (!id) return;
-    setResearch(await api<ResearchState>(projectPath("/api/research", id)));
+    const data = await api<ResearchState>(projectPath("/api/research", id));
+    setResearch(data);
+    setPanel((current) => {
+      if (current?.kind !== "attempt") return current;
+      const updated = data.experiments.find((item) => attemptKey(item) === attemptKey(current.experiment));
+      return updated ? { ...current, experiment: updated, objective: data.objective } : current;
+    });
   }
 
   async function refresh() {
@@ -296,7 +333,7 @@ export default function App() {
         searchRef.current?.focus();
       } else if ((event.metaKey || event.ctrlKey) && event.key === "Enter") {
         event.preventDefault();
-        if (project?.exists && !active) {
+        if (project?.exists && !active && researchReady) {
           if (isResearch) void startResearchLoop();
           else void startRun();
         }
@@ -307,7 +344,7 @@ export default function App() {
     }
     window.addEventListener("keydown", shortcut);
     return () => window.removeEventListener("keydown", shortcut);
-  }, [project, active, isResearch, panel]);
+  }, [project, active, isResearch, panel, researchReady]);
 
   async function startRun() {
     if (!projectId) return;
@@ -495,7 +532,7 @@ export default function App() {
   }
 
   async function startResearchLoop() {
-    if (!projectId) return;
+    if (!projectId || !research?.preflight.ok) return;
     setLoading("research-loop");
     setError("");
     try {
@@ -508,6 +545,7 @@ export default function App() {
       toast("Autoresearch loop started");
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
+      await loadResearch(projectId).catch(() => undefined);
     } finally {
       setLoading("");
     }
@@ -539,7 +577,7 @@ export default function App() {
       const data = await api<ResearchFilePayload>(
         projectPath(`/api/research/file?path=${encodeURIComponent(path)}`),
       );
-      setPanel(data.role === "human" ? { kind: "program", data } : { kind: "evaluator", data });
+      setPanel(data.role === "frozen" ? { kind: "evaluator", data } : { kind: "program", data });
     } catch (caught) {
       setError(caught instanceof Error ? caught.message : String(caught));
     } finally {
@@ -547,30 +585,21 @@ export default function App() {
     }
   }
 
-  async function openResearchDiff(experiment: ResearchExperiment) {
-    setSelectedRun(experiment.tag);
-    setLoading(`research-diff:${experiment.tag}`);
-    setError("");
-    try {
-      const data = await api<{ tag: string; diff: string }>(
-        projectPath(`/api/research/diff?tag=${encodeURIComponent(experiment.tag)}`),
-      );
-      setPanel({ kind: "diff", experiment: { ...experiment, diff: data.diff }, objective: research!.objective });
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setLoading("");
-    }
+  function openResearchAttempt(experiment: ResearchExperiment) {
+    const key = attemptKey(experiment);
+    setSelectedRun(key);
+    setPanel({ kind: "attempt", experiment, objective: research!.objective });
   }
 
-  async function saveProgram(text: string) {
-    const data = await api<ResearchFilePayload>("/api/research/program", {
+  async function saveResearchFile(path: string, text: string) {
+    const data = await api<ResearchFilePayload>("/api/research/file", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ project_id: projectId, text }),
+      body: JSON.stringify({ project_id: projectId, path, text }),
     });
-    setPanel({ kind: "program", data });
-    toast("Program saved", "ok");
+    setPanel(data.role === "frozen" ? { kind: "evaluator", data } : { kind: "program", data });
+    await loadResearch(projectId);
+    toast(data.snapshot ? `Saved ${path} as ${data.snapshot.snapshot_id}` : `Saved ${path}`, "ok");
     return data;
   }
 
@@ -580,13 +609,13 @@ export default function App() {
     setError("");
     try {
       const text = await file.text();
-      const data = await api<ResearchFilePayload>("/api/research/subject", {
+      const data = await api<ResearchFilePayload>("/api/research/file", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId, text }),
+        body: JSON.stringify({ project_id: projectId, path: "script/train.py", text }),
       });
       await loadResearch(projectId);
-      setPanel({ kind: "evaluator", data });
+      setPanel({ kind: "program", data });
       toast(`Imported ${file.name} as ${data.path}`, "ok");
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught);
@@ -735,7 +764,10 @@ export default function App() {
                 <FlaskConical size={13} /> best <b>{formatScore(research.objective.best)}</b>
                 <span className="from">/ baseline {formatScore(research.objective.baseline)}</span>
               </span>
-              <span className="chip"><Repeat2 size={13} /> {Math.round(research.objective.budget_sec / 60)} min/exp</span>
+              <span className="chip"><Repeat2 size={13} /> {formatBudget(research.objective.budget_sec)}/exp</span>
+              {research.contract.current_best_snapshot_id ? (
+                <span className="chip"><GitCommit size={13} /> best source <b>{research.contract.current_best_snapshot_id}</b></span>
+              ) : null}
             </div>
             <div className="actions">
               {research.loop.active ? (
@@ -743,7 +775,12 @@ export default function App() {
                   <Square size={15} fill="currentColor" /> Stop loop
                 </button>
               ) : (
-                <button className="btn primary" onClick={startResearchLoop} disabled={loading === "research-loop"}>
+                <button
+                  className="btn primary"
+                  onClick={startResearchLoop}
+                  disabled={loading === "research-loop" || !research.preflight.ok}
+                  title={research.preflight.ok ? "Start the Autoresearch loop · ⌘↵" : "Resolve required preflight checks before starting"}
+                >
                   <Repeat2 size={15} /> Start loop
                 </button>
               )}
@@ -773,10 +810,10 @@ export default function App() {
             projectId={projectId}
             preview={!project}
             onSelect={setSelectedRun}
-            onExperiment={openResearchDiff}
+            onExperiment={openResearchAttempt}
             onOpenFile={openResearchFile}
             onResize={setLeftColumn}
-            onSaveProgram={saveProgram}
+            onSaveFile={saveResearchFile}
             onImportBaseline={importResearchBaseline}
             importing={loading === "research-import"}
             onClose={() => setPanel(null)}
@@ -903,7 +940,7 @@ function ResearchDashboard({
   onExperiment,
   onOpenFile,
   onResize,
-  onSaveProgram,
+  onSaveFile,
   onImportBaseline,
   importing,
   onClose,
@@ -919,13 +956,13 @@ function ResearchDashboard({
   onExperiment: (experiment: ResearchExperiment) => void;
   onOpenFile: (path: string) => void;
   onResize: (value: number) => void;
-  onSaveProgram: (text: string) => Promise<ResearchFilePayload>;
+  onSaveFile: (path: string, text: string) => Promise<ResearchFilePayload>;
   onImportBaseline: (file: File) => Promise<void>;
   importing?: boolean;
   onClose: () => void;
 }) {
-  const kept = research.experiments.filter((item) => item.status === "kept").length;
-  const reverted = research.experiments.filter((item) => item.status === "reverted").length;
+  const kept = research.experiments.filter((item) => attemptVerdict(item) === "kept").length;
+  const reverted = research.experiments.filter((item) => attemptVerdict(item) === "reverted").length;
   const { baseline, best, direction } = research.objective;
   const improvement =
     baseline === null || best === null
@@ -978,9 +1015,14 @@ function ResearchDashboard({
             <h2>Files &amp; ownership</h2>
           </div>
           <span className="sub">The human directs, the agent edits, and the evaluator stays fixed</span>
+          <span className="sub contract-meta">
+            {research.contract.contract_id} · {research.contract.status} · evaluator {research.contract.evaluator_hash || "unavailable"}
+          </span>
         </div>
         <ResearchContract files={research.files} onOpen={onOpenFile} disabled={preview} />
       </div>
+
+      {!preview ? <ResearchPreflight research={research} /> : null}
 
       <section
         className={`work${panel ? " split" : ""}`}
@@ -1007,8 +1049,8 @@ function ResearchDashboard({
               {preview
                 ? "template preview"
                 : research.loop.active
-                ? `loop running · ${research.loop.phase}`
-                : "loop idle"}
+                ? `loop ${research.loop.status || "running"} · ${research.loop.phase}${research.loop.session_id ? ` · ${research.loop.session_id}` : ""}`
+                : `loop ${research.loop.status || "idle"}`}
             </span>
             <span className="server-mode">{preview ? "autoexp init metric_lab --autoresearch" : "live · autoexp server"}</span>
           </div>
@@ -1020,7 +1062,7 @@ function ResearchDashboard({
             theme={theme}
             projectId={projectId}
             active={research.loop.active}
-            onSaveProgram={onSaveProgram}
+            onSaveFile={onSaveFile}
             onClose={onClose}
           />
         ) : null}
@@ -1075,7 +1117,7 @@ function RatchetChart({
   let currentBest: number | null = objective.baseline;
   const step: [number, number][] = [];
   chronological.forEach((item, index) => {
-    if (item.score !== null && item.status === "kept") {
+    if (item.score !== null && attemptVerdict(item) === "kept") {
       currentBest =
         currentBest === null
           ? item.score
@@ -1112,11 +1154,11 @@ function RatchetChart({
         {chronological.map((item, index) =>
           item.score === null ? null : (
             <circle
-              key={item.tag}
-              className={item.status === "kept" ? "kept" : "rev"}
+              key={attemptKey(item)}
+              className={attemptVerdict(item) === "kept" ? "kept" : "rev"}
               cx={x(index)}
               cy={y(item.score)}
-              r={item.status === "kept" ? 3.6 : 3.2}
+              r={attemptVerdict(item) === "kept" ? 3.6 : 3.2}
             />
           ),
         )}
@@ -1209,12 +1251,43 @@ function ResearchContract({
               <span className="fhash"><Lock size={12} /> {file.hash}</span>
             ) : null}
             <button className="btn sm" onClick={() => onOpen(file.path)} disabled={disabled}>
-              {file.role === "human" ? <Pencil size={13} /> : file.role === "frozen" ? <Lock size={13} /> : <Code2 size={13} />}
-              {file.role === "human" ? "Edit" : "Open"}
+              {file.role === "frozen" ? <Lock size={13} /> : <Pencil size={13} />}
+              {file.role === "frozen" ? "Open" : "Edit"}
             </button>
           </div>
         </div>
       ))}
+    </div>
+  );
+}
+
+function ResearchPreflight({ research }: { research: ResearchState }) {
+  const failed = research.preflight.checks.filter((check) => check.required && !check.ok);
+  return (
+    <div className={`card preflight-card${research.preflight.ok ? " ready" : " blocked"}`}>
+      <div className="card-head">
+        <div>
+          <div className="eyebrow">preflight</div>
+          <h2>{research.preflight.ok ? "Ready to start" : failed.length ? `${failed.length} required check${failed.length === 1 ? "" : "s"} failed` : "Preflight unavailable"}</h2>
+        </div>
+        <span className={`preflight-state ${research.preflight.ok ? "ok" : "bad"}`}>
+          {research.preflight.ok ? <Check size={13} /> : <AlertTriangle size={13} />}
+          {research.preflight.ok ? "ready" : "start disabled"}
+        </span>
+      </div>
+      <div className="preflight-checks">
+        {research.preflight.checks.map((check) => (
+          <div className={`preflight-check${check.ok ? " ok" : check.required ? " bad" : " warn"}`} key={check.name}>
+            <span className="preflight-icon">{check.ok ? "✓" : "!"}</span>
+            <span><b>{humanize(check.name)}</b><small>{check.detail}</small></span>
+            {!check.required ? <em>optional</em> : null}
+          </div>
+        ))}
+        {!research.preflight.checks.length ? <div className="evidence-empty">No preflight results are available.</div> : null}
+      </div>
+      {research.loop.failure_message ? (
+        <div className="preflight-failure"><AlertTriangle size={13} /> {research.loop.failure_message}</div>
+      ) : null}
     </div>
   );
 }
@@ -1246,23 +1319,6 @@ function ExperimentLedger({
     }
     return <Empty title="No attempts yet">Start the loop and the agent will begin proposing experiments.</Empty>;
   }
-  const deltas = new Map<string, number>();
-  let best = objective.baseline;
-  [...experiments].reverse().forEach((item) => {
-    if (item.score === null || item.status !== "kept") return;
-    if (best !== null) {
-      deltas.set(
-        item.tag,
-        objective.direction === "min" ? best - item.score : item.score - best,
-      );
-    }
-    best =
-      best === null
-        ? item.score
-        : objective.direction === "min"
-          ? Math.min(best, item.score)
-          : Math.max(best, item.score);
-  });
   return (
     <div className="ledger-wrap">
       <table className="ledger research-ledger">
@@ -1278,28 +1334,43 @@ function ExperimentLedger({
         </thead>
         <tbody>
           {experiments.map((item) => {
-            const delta = deltas.get(item.tag);
+            const key = attemptKey(item);
+            const label = attemptLabel(item);
+            const verdict = attemptVerdict(item);
+            const state = attemptState(item);
+            const result = verdict || state;
+            const improvement = item.improvement;
             return (
               <tr
-                key={item.tag}
-                className={`${item.status === "reverted" ? "rev-row " : ""}${selected === item.tag ? "sel" : ""}`}
+                key={key}
+                className={`${verdict === "reverted" ? "rev-row " : ""}${selected === key ? "sel" : ""}`}
+                tabIndex={0}
+                aria-label={`Inspect research attempt ${label}`}
                 onClick={() => {
-                  onSelect(item.tag);
+                  onSelect(key);
+                  onOpen(item);
+                }}
+                onKeyDown={(event) => {
+                  if (event.target !== event.currentTarget || !["Enter", " "].includes(event.key)) return;
+                  event.preventDefault();
+                  onSelect(key);
                   onOpen(item);
                 }}
               >
-                <td><span className="tagcell">{item.tag}</span></td>
-                <td><span className={`status ${item.status}`}><span className="d" />{item.status}</span></td>
+                <td><span className="tagcell">{label}</span></td>
+                <td><span className={`status ${result}`}><span className="d" />{result}</span></td>
                 <td>{item.score === null ? <span className="dash">—</span> : <span className="score">{formatScore(item.score)}</span>}</td>
-                <td>{delta === undefined ? <span className="dash">—</span> : <span className={`delta ${delta > 0 ? "good" : "flat"}`}>{delta > 0 ? "+" : ""}{formatScore(delta)}</span>}</td>
-                <td><span className="hyp">{item.hyp}</span></td>
+                <td>{improvement === null || improvement === undefined ? <span className="dash">—</span> : <span className={`delta ${improvement > 0 ? "good" : "flat"}`}>{improvement > 0 ? "+" : ""}{formatScore(improvement)}</span>}</td>
+                <td><span className="hyp">{attemptHypothesis(item)}</span></td>
                 <td>
-                  {item.commit ? (
+                  {item.candidate_snapshot_id ? (
+                    <span className="commitcell"><GitCommit size={13} /> {item.candidate_snapshot_id}</span>
+                  ) : item.commit ? (
                     <span className="commitcell"><GitCommit size={13} /> {item.commit}</span>
-                  ) : item.status === "running" ? (
-                    <span className="commitcell"><GitBranch size={13} /> autoexp/{item.tag}</span>
+                  ) : state === "running" ? (
+                    <span className="commitcell"><GitBranch size={13} /> candidate pending</span>
                   ) : (
-                    <span className="dash">reverted</span>
+                    <span className="dash">—</span>
                   )}
                 </td>
               </tr>
@@ -1316,30 +1387,38 @@ function ResearchViewer({
   theme,
   projectId,
   active,
-  onSaveProgram,
+  onSaveFile,
   onClose,
 }: {
   panel: Panel;
   theme: Theme;
   projectId: string;
   active: boolean;
-  onSaveProgram: (text: string) => Promise<ResearchFilePayload>;
+  onSaveFile: (path: string, text: string) => Promise<ResearchFilePayload>;
   onClose: () => void;
 }) {
+  if (panel.kind === "attempt") {
+    return (
+      <ResearchAttemptInspector
+        experiment={panel.experiment}
+        objective={panel.objective}
+        projectId={projectId}
+        onClose={onClose}
+      />
+    );
+  }
   const title =
     panel.kind === "program"
-      ? `${panel.data.path} · research directions`
+      ? `${panel.data.path} · ${panel.data.role}-owned`
       : panel.kind === "evaluator"
         ? `${panel.data.path} · ${panel.data.role}`
-        : panel.kind === "diff"
-          ? `${panel.experiment.tag} · experiment diff`
-          : "Agent log";
+        : "Agent log";
   const Icon =
     panel.kind === "program"
-      ? FileText
+      ? panel.data.role === "agent" ? Bot : FileText
       : panel.kind === "evaluator"
         ? panel.data.role === "frozen" ? Lock : Code2
-        : panel.kind === "diff" ? GitBranch : Terminal;
+        : Terminal;
   return (
     <aside className="card panel">
       <div className="card-head">
@@ -1348,10 +1427,9 @@ function ResearchViewer({
       </div>
       <div className="panel-body">
         {panel.kind === "program" ? (
-          <TextEditor value={panel.data.text} label={panel.data.path} onSave={onSaveProgram} />
+          <TextEditor value={panel.data.text} label={panel.data.path} onSave={(text) => onSaveFile(panel.data.path, text)} />
         ) : null}
         {panel.kind === "evaluator" ? <ResearchFileViewer data={panel.data} /> : null}
-        {panel.kind === "diff" ? <DiffViewer experiment={panel.experiment} objective={panel.objective} /> : null}
         {panel.kind === "log" ? <LogViewer projectId={projectId} active={active} kind="agent" /> : null}
       </div>
     </aside>
@@ -1371,61 +1449,149 @@ function ResearchFileViewer({ data }: { data: ResearchFilePayload }) {
   );
 }
 
-function DiffViewer({
+function ResearchAttemptInspector({
   experiment,
   objective,
+  projectId,
+  onClose,
 }: {
   experiment: ResearchExperiment;
   objective: ResearchObjective;
+  projectId: string;
+  onClose: () => void;
 }) {
-  const lines = (experiment.diff || "").split("\n");
-  let oldLine: number | null = null;
-  let newLine: number | null = null;
-  const numbered = lines.map((line, sourceIndex) => {
-    const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
-    let oldNumber: number | null = null;
-    let newNumber: number | null = null;
-    if (hunk) {
-      oldLine = Number(hunk[1]);
-      newLine = Number(hunk[2]);
-    } else if (oldLine !== null && newLine !== null && !line.startsWith("\\")) {
-      if (line.startsWith("+")) newNumber = newLine++;
-      else if (line.startsWith("-")) oldNumber = oldLine++;
-      else {
-        oldNumber = oldLine++;
-        newNumber = newLine++;
-      }
+  const key = attemptKey(experiment);
+  const label = attemptLabel(experiment);
+  const verdict = attemptVerdict(experiment);
+  const state = attemptState(experiment);
+  const [tab, setTab] = useState<ResearchTab>("diff");
+  const [overview, setOverview] = useState<RunAggregate | null>(null);
+  const [diff, setDiff] = useState<RunDiffPayload | null>(null);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null);
+  const [artifactDetail, setArtifactDetail] = useState<ArtifactDetailPayload | null>(null);
+  const [pending, setPending] = useState(false);
+  const [paneError, setPaneError] = useState("");
+
+  useEffect(() => {
+    setTab("diff");
+    setOverview(null);
+    setDiff(null);
+    setArtifacts([]);
+    setSelectedArtifact(null);
+    setArtifactDetail(null);
+    setPaneError("");
+  }, [key]);
+
+  useEffect(() => {
+    let live = true;
+    setPending(true);
+    setPaneError("");
+    const request = tab === "diff"
+      ? api<RunDiffPayload>(projectUrl(`/api/research/diff?attempt_id=${encodeURIComponent(key)}`, projectId))
+          .then((data) => { if (live) setDiff(data); })
+      : !experiment.run_id
+        ? Promise.resolve()
+        : tab === "run"
+          ? api<RunDetailPayload>(projectUrl(`/api/runs/${encodeURIComponent(experiment.run_id)}`, projectId))
+              .then((data) => {
+                if (!live) return;
+                setOverview(normalizeRunDetail(data, {
+                  run_id: experiment.run_id!,
+                  status: state === "failed" ? "failed" : state === "running" ? "running" : "success",
+                  source_snapshot_id: experiment.candidate_snapshot_id,
+                }));
+              })
+          : api<ArtifactListPayload>(projectUrl(`/api/runs/${encodeURIComponent(experiment.run_id)}/artifacts`, projectId))
+              .then((data) => {
+                if (!live) return;
+                const items = Array.isArray(data) ? data : data.artifacts || [];
+                setArtifacts(items);
+                setSelectedArtifact(items[0] || null);
+              });
+    request.catch((caught) => {
+      if (live) setPaneError(caught instanceof Error ? caught.message : String(caught));
+    }).finally(() => { if (live) setPending(false); });
+    return () => { live = false; };
+  }, [experiment.candidate_snapshot_id, experiment.run_id, key, projectId, state, tab]);
+
+  useEffect(() => {
+    if (tab !== "artifacts" || !experiment.run_id || !selectedArtifact) {
+      setArtifactDetail(null);
+      return;
     }
-    return { line, oldNumber, newNumber, sourceIndex };
-  });
-  const changed = numbered.filter(({ line }) =>
-    (line.startsWith("+") && !line.startsWith("+++")) ||
-    (line.startsWith("-") && !line.startsWith("---")),
-  );
+    let live = true;
+    setArtifactDetail(null);
+    setPending(true);
+    api<ArtifactDetailPayload>(projectUrl(
+      `/api/runs/${encodeURIComponent(experiment.run_id)}/artifacts/${encodeURIComponent(selectedArtifact.artifact_id)}`,
+      projectId,
+    )).then((data) => { if (live) setArtifactDetail(data); })
+      .catch((caught) => { if (live) setPaneError(caught instanceof Error ? caught.message : String(caught)); })
+      .finally(() => { if (live) setPending(false); });
+    return () => { live = false; };
+  }, [experiment.run_id, projectId, selectedArtifact, tab]);
+
+  const tabs: Array<{ id: ResearchTab; label: string; icon: LucideIcon }> = [
+    { id: "diff", label: "Diff", icon: GitBranch },
+    { id: "run", label: "Run", icon: FlaskConical },
+    { id: "artifacts", label: "Artifacts", icon: FolderOpen },
+  ];
+
   return (
-    <div className="editor-shell">
-      <div className="diffhead">
-        <div className="dt">
-          {experiment.tag} · {experiment.status}
-          {experiment.score === null ? "" : ` · ${objective.metric} ${formatScore(experiment.score)}`}
+    <aside className="card panel run-inspector research-inspector">
+      <div className="run-inspector-head">
+        <div className="inspector-title">
+          <span className="ic"><FlaskConical size={17} /></span>
+          <div>
+            <div className="inspector-id">{label} · {verdict || state}</div>
+            <div className="inspector-sub">{attemptHypothesis(experiment)}</div>
+          </div>
         </div>
-        <div className="dh">{experiment.hyp}</div>
+        <button className="btn ghost sm inspector-close" onClick={onClose} aria-label="Close research inspector"><X size={16} /></button>
       </div>
-      <div className="diff">
-        {changed.length ? changed.map(({ line, oldNumber, newNumber, sourceIndex }, index) => {
-          const className = line.startsWith("+") ? "add" : "del";
-          const separated = index > 0 && sourceIndex > changed[index - 1].sourceIndex + 1;
-          return <React.Fragment key={sourceIndex}>
-            {separated ? <div className="diff-gap" /> : null}
-            <div className={`dl ${className}`}>
-              <span className="diff-ln">{oldNumber ?? ""}</span>
-              <span className="diff-ln">{newNumber ?? ""}</span>
-              <span className="diff-code">{line || " "}</span>
-            </div>
-          </React.Fragment>;
-        }) : <div className="diff-empty">No source changes in this attempt.</div>}
+      <div className="attempt-summary">
+        <OverviewValue label="Base snapshot" value={experiment.base_snapshot_id} mono />
+        <OverviewValue label="Candidate snapshot" value={experiment.candidate_snapshot_id} mono />
+        <OverviewValue label="Run" value={experiment.run_id} mono />
+        <OverviewValue label={objective.metric} value={experiment.score === null ? null : formatScore(experiment.score)} />
+        <OverviewValue label="Best before" value={experiment.best_score_before === null || experiment.best_score_before === undefined ? null : formatScore(experiment.best_score_before)} />
+        <OverviewValue label="Improvement" value={experiment.improvement === null || experiment.improvement === undefined ? null : formatScore(experiment.improvement)} />
       </div>
-    </div>
+      <div className="inspector-tabs" role="tablist" aria-label="Research attempt inspector">
+        {tabs.map(({ id, label: tabLabel, icon: Icon }) => (
+          <button
+            key={id}
+            className={tab === id ? "active" : ""}
+            role="tab"
+            aria-selected={tab === id}
+            disabled={id !== "diff" && !experiment.run_id}
+            onClick={() => setTab(id)}
+          >
+            <Icon size={13} /> {tabLabel}
+          </button>
+        ))}
+      </div>
+      <div className="panel-body run-pane">
+        {paneError ? <div className="pane-error"><AlertTriangle size={14} /> {paneError}</div> : null}
+        {tab === "diff" ? diff ? <RunDiff data={diff} /> : pending ? <PaneLoading /> : null : null}
+        {tab === "run" ? experiment.run_id
+          ? overview ? <RunOverview data={overview} onNavigate={() => setTab("artifacts")} /> : pending ? <PaneLoading /> : null
+          : <Empty title="No immutable run yet">This attempt has not allocated a run.</Empty> : null}
+        {tab === "artifacts" ? experiment.run_id ? (
+          <ArtifactViewer
+            artifacts={artifacts}
+            selected={selectedArtifact}
+            detail={artifactDetail}
+            pending={pending}
+            projectId={projectId}
+            category={null}
+            label="Attempt artifacts"
+            onSelect={setSelectedArtifact}
+          />
+        ) : <Empty title="No run artifacts yet">This attempt has not allocated a run.</Empty> : null}
+      </div>
+    </aside>
   );
 }
 
@@ -2030,6 +2196,8 @@ function ArtifactViewer({
   detail,
   pending,
   projectId,
+  category = "output",
+  label = "Output artifacts",
   onSelect,
 }: {
   artifacts: Artifact[];
@@ -2037,16 +2205,18 @@ function ArtifactViewer({
   detail: ArtifactDetailPayload | null;
   pending: boolean;
   projectId: string;
+  category?: string | null;
+  label?: string;
   onSelect: (artifact: Artifact) => void;
 }) {
-  const outputs = artifacts.filter((item) => !item.category || item.category === "output");
-  if (!outputs.length && pending) return <PaneLoading />;
-  if (!outputs.length) return <Empty title="No output artifacts">This run did not produce indexed output files.</Empty>;
+  const visible = category ? artifacts.filter((item) => !item.category || item.category === category) : artifacts;
+  if (!visible.length && pending) return <PaneLoading />;
+  if (!visible.length) return <Empty title="No artifacts">This run did not produce indexed artifacts.</Empty>;
   return (
     <div className="artifact-layout">
       <div className="artifact-list">
-        <div className="list-label">Output artifacts · {outputs.length}</div>
-        {outputs.map((artifact) => (
+        <div className="list-label">{label} · {visible.length}</div>
+        {visible.map((artifact) => (
           <button
             key={artifact.artifact_id}
             className={selected?.artifact_id === artifact.artifact_id ? "active" : ""}

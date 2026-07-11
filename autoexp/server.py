@@ -81,7 +81,7 @@ class AutoexpHTTPServer(ThreadingHTTPServer):
 
 
 class AutoexpHandler(BaseHTTPRequestHandler):
-    server_version = "AutoexpHTTP/0.1"
+    server_version = "AutoexpHTTP/0.2"
 
     # ------------------------------------------------------------------
     #  Method entry points
@@ -215,11 +215,13 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             return self._json(report_instruction(root))
         if path == "/api/research":
             return self._json(self.server.research(root).state())
+        if path == "/api/research/preflight":
+            return self._json(self.server.research(root).preflight())
         if path == "/api/research/diff":
-            tag = query.get("tag", [""])[0]
-            if not tag:
-                return self._json({"error": "tag is required"}, 400)
-            return self._json(self.server.research(root).diff(tag))
+            attempt_id = query.get("attempt_id", query.get("tag", [""]))[0]
+            if not attempt_id:
+                return self._json({"error": "attempt_id is required"}, 400)
+            return self._json(self.server.research(root).diff(attempt_id))
         if path == "/api/research/file":
             rel = query.get("path", [""])[0]
             if not rel:
@@ -298,7 +300,18 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             return self._json(payload, 202 if ok else 409)
         if path == "/api/research/loop/start":
             root = self._project_root(body)
-            return self._json(self.server.research(root).start_loop(), 202)
+            research = self.server.research(root)
+            preflight = research.preflight()
+            if not preflight["ok"]:
+                failed = next(
+                    (item for item in preflight["checks"] if item["required"] and not item["ok"]),
+                    None,
+                )
+                return self._json({
+                    "error": (failed or {}).get("detail") or "research preflight failed",
+                    "preflight": preflight,
+                }, 422)
+            return self._json(research.start_loop(), 202)
         if path == "/api/research/loop/kill":
             root = self._project_root(body)
             return self._json(self.server.research(root).stop_loop(), 202)
@@ -339,6 +352,18 @@ class AutoexpHandler(BaseHTTPRequestHandler):
 
     def _put(self):
         path = urlparse(self.path).path
+
+        if path == "/api/research/file":
+            body = self._body({})
+            rel = body.get("path") if isinstance(body, dict) else None
+            text = body.get("text") if isinstance(body, dict) else None
+            if not isinstance(rel, str) or not rel:
+                return self._json({"error": "path is required"}, 400)
+            if not isinstance(text, str):
+                return self._json({"error": "text must be a string"}, 400)
+            return self._json(
+                self.server.research(self._project_root(body)).save_file(rel, text)
+            )
 
         if path == "/api/report/instruction":
             body = self._body({})

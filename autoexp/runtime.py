@@ -38,6 +38,7 @@ from .workspace import (
     ensure_within_project,
     is_project_root,
     project_entry,
+    project_mode,
     read_json,
     resolve_root,
     script_manifest,
@@ -399,6 +400,23 @@ def save_script_file(
     root = resolve_root(root)
     init_db(root)
     rel = ensure_within_project(path, "path must stay inside script/")
+    if project_mode(root) == "autoresearch":
+        from .autoresearch import (
+            ResearchConfig,
+            ensure_research_file_editable,
+            for_project as research_for_project,
+        )
+
+        ensure_research_file_editable(root, rel)
+        research_path = f"script/{rel.as_posix()}"
+        config = ResearchConfig.load(root)
+        if (
+            config.role_of(research_path) in {"human", "agent"}
+            and not source_run_id
+            and not source_snapshot_id
+            and not save_as
+        ):
+            return research_for_project(root).save_file(research_path, text)
     trigger = create_trigger(
         trigger_kind,
         root=root,
@@ -532,6 +550,42 @@ def doctor(root=None):
     add("index.sqlite", (root / "index.sqlite").is_file())
     add("private_git", (root / ".autoexp" / "git").is_dir())
 
+    conn = db(root)
+    broken_runs = conn.execute(
+        """select count(*) from runs r left join triggers t on t.trigger_id = r.trigger_id
+           where r.status in ('success', 'failed', 'canceled')
+             and coalesce(t.kind, '') != 'legacy'
+             and (r.source_snapshot_id is null or r.trigger_id is null or
+                  r.runner is null or r.runner_identity is null or
+                  r.started_at is null or r.ended_at is null or r.duration_ms is null)"""
+    ).fetchone()[0]
+    add(
+        "run_lifecycle_integrity",
+        broken_runs == 0,
+        "" if broken_runs == 0 else f"{broken_runs} terminal runs have incomplete lifecycle evidence",
+    )
+    if project_mode(root) == "autoresearch":
+        broken_attempts = conn.execute(
+            """select count(*) from research_attempts a
+               left join runs r on r.run_id = a.run_id
+               where a.run_id is not null and (
+                   r.run_id is null or r.source_snapshot_id is not a.candidate_snapshot_id
+               )"""
+        ).fetchone()[0]
+        incomplete_attempts = conn.execute(
+            """select count(*) from research_attempts
+               where status = 'scored' and (
+                   base_snapshot_id is null or candidate_snapshot_id is null or run_id is null
+               ) and metadata not like '%"legacy"%'"""
+        ).fetchone()[0]
+        add(
+            "research_attempt_integrity",
+            broken_attempts == 0 and incomplete_attempts == 0,
+            "" if not (broken_attempts or incomplete_attempts)
+            else f"{broken_attempts} run/snapshot mismatches; {incomplete_attempts} incomplete scored attempts",
+        )
+    conn.close()
+
     gitignore = root / ".gitignore"
     add("app.env_ignored", APP_ENV in gitignore.read_text() if gitignore.is_file() else False)
 
@@ -552,6 +606,20 @@ def doctor(root=None):
     else:
         ok, message = docker_ready()
         add("docker", ok, "" if ok else message, required=runner == "docker")
+
+    if project_mode(root) == "autoresearch":
+        from .autoresearch import for_project as research_for_project
+
+        preflight = research_for_project(root).preflight()
+        for item in preflight["checks"]:
+            if item["name"] in {"project", "git", "private_git", "runs_directory"}:
+                continue
+            add(
+                f"research_{item['name']}",
+                item["ok"],
+                item["detail"],
+                required=item["required"],
+            )
 
     overall_ok = all(item["ok"] or not item.get("required", True) for item in checks)
     return {"root": str(root), "ok": overall_ok, "checks": checks}

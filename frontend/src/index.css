@@ -126,7 +126,7 @@ input,select,textarea{font:inherit; color:inherit}
   transition:border-color .14s, color .14s, background .14s;
 }
 .icon-btn:hover{border-color:var(--line-2); color:var(--ink)}
-.icon-btn:focus-visible,.btn:focus-visible,.mode-switch button:focus-visible,select:focus-visible,input:focus-visible,.row:focus-visible{
+.icon-btn:focus-visible,.btn:focus-visible,.mode-switch button:focus-visible,select:focus-visible,input:focus-visible,.row:focus-visible,.ledger tbody tr:focus-visible{
   outline:2px solid var(--signal); outline-offset:2px;
 }
 
@@ -231,6 +231,7 @@ tr:hover .copy{opacity:1}
 .status.failed{color:var(--fail)} .status.failed .d{background:var(--fail)}
 .status.canceled{color:var(--soft)} .status.canceled .d{background:var(--faint)}
 .status.running{color:var(--signal)} .status.running .d{background:var(--signal); animation:pulse 1.6s infinite}
+.status.scored{color:var(--soft)} .status.scored .d{background:var(--faint)}
 
 .cell-btn{
   display:inline-flex; align-items:center; gap:7px; max-width:100%; height:30px; padding:0 11px;
@@ -530,3 +531,35 @@ tr.rev-row td:not(:first-child){opacity:.6}
 .research-ledger th:nth-child(4){width:14%}
 .research-ledger th:nth-child(5){width:32%}
 .research-ledger th:nth-child(6){width:16%}
+.contract-meta{margin-left:auto;font-family:var(--mono);font-size:10px!important;overflow-wrap:anywhere}
+
+.preflight-card.ready{border-color:color-mix(in srgb,var(--pass) 40%,var(--line))}
+.preflight-card.blocked{border-color:color-mix(in srgb,var(--fail) 40%,var(--line))}
+.preflight-state{margin-left:auto;display:inline-flex;align-items:center;gap:6px;padding:4px 8px;border-radius:999px;font-family:var(--mono);font-size:10px;text-transform:uppercase}
+.preflight-state.ok{color:var(--pass);background:var(--pass-wash)}
+.preflight-state.bad{color:var(--fail);background:var(--fail-wash)}
+.preflight-checks{display:grid;grid-template-columns:repeat(2,minmax(0,1fr))}
+.preflight-check{display:grid;grid-template-columns:20px minmax(0,1fr) auto;align-items:center;gap:7px;padding:9px 12px;border-right:1px solid var(--line);border-bottom:1px solid var(--line)}
+.preflight-check:nth-child(2n){border-right:0}.preflight-check:nth-last-child(-n+2){border-bottom:0}
+.preflight-check b,.preflight-check small{display:block}.preflight-check b{font-size:12px}.preflight-check small{font-size:10.5px;color:var(--faint)}
+.preflight-check em{font-family:var(--mono);font-size:8.5px;text-transform:uppercase;color:var(--faint);font-style:normal}
+.preflight-icon{display:grid;place-items:center;width:18px;height:18px;border-radius:50%;font-size:10px;font-weight:700}
+.preflight-check.ok .preflight-icon{color:var(--pass);background:var(--pass-wash)}
+.preflight-check.bad .preflight-icon{color:var(--fail);background:var(--fail-wash)}
+.preflight-check.warn .preflight-icon{color:var(--warn);background:var(--signal-wash)}
+.preflight-failure{display:flex;align-items:center;gap:7px;padding:9px 12px;color:var(--fail);background:var(--fail-wash);font-size:12px}
+
+.research-inspector .inspector-close{margin-left:auto}
+.attempt-summary{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));border-bottom:1px solid var(--line);background:var(--surface)}
+.attempt-summary .kv:nth-last-child(-n+2){border-bottom:0}
+.research-inspector .inspector-tabs button[disabled]{opacity:.4;cursor:not-allowed}
+
+@media (max-width:760px){
+  .shell{padding:10px 10px 28px}
+  .topbar{align-items:flex-start;flex-wrap:wrap}.bar-spacer{display:none}.bar-tools{width:100%;justify-content:flex-start}
+  .picker{max-width:100%}.picker select{max-width:48vw}
+  .band .actions{margin-left:0;width:100%}
+  .contract .crow{align-items:flex-start;flex-wrap:wrap}.crow .fmeta{margin-left:96px;max-width:calc(100% - 96px);flex-wrap:wrap}.crow .fhash{overflow-wrap:anywhere}
+  .preflight-checks{grid-template-columns:1fr}.preflight-check,.preflight-check:nth-child(2n),.preflight-check:nth-last-child(-n+2){border-right:0;border-bottom:1px solid var(--line)}.preflight-check:last-child{border-bottom:0}
+  .attempt-summary{grid-template-columns:1fr}.attempt-summary .kv,.attempt-summary .kv:nth-last-child(-n+2){border-right:0;border-bottom:1px solid var(--line)}.attempt-summary .kv:last-child{border-bottom:0}
+}

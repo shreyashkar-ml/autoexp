@@ -34,14 +34,15 @@ For reports, read the run's report bundle and active report instruction, then wr
 
 ## Autoresearch
 
-1. Read `script/program.md` and call `research_state`.
-2. If the user provided a reference training script and no attempts exist yet, adapt or copy it into the file marked `agent` as the baseline.
-3. Form one concrete hypothesis and edit only the file marked `agent`.
-4. Call `research_begin_attempt` with that hypothesis.
-5. Call `research_finish_attempt` with the returned attempt tag.
-6. Inspect the score, decision, and diff, then repeat within the user's stopping rule.
+1. Call `research_preflight`; do not start while a required check fails.
+2. Read `script/program.md` and call `research_state`.
+3. If the user provided a reference training script and no attempts exist yet, save it into the file marked `agent` as the baseline.
+4. Form one concrete hypothesis and save one focused edit to the file marked `agent`.
+5. Call `research_begin_attempt` with that hypothesis.
+6. Call `research_finish_attempt` with the returned attempt ID.
+7. Inspect the score, verdict, candidate diff, immutable run, and artifacts, then repeat within the user's stopping rule.
 
-Do not edit files marked `human` or `frozen`. Keep reverted attempts in the ledger; they are part of the research record.
+Do not edit files marked `human` or `frozen`. A deliberate evaluator change is a user-owned contract boundary, not an agent experiment. Keep reverted attempts in the ledger; their snapshots, runs, and artifacts are part of the research record.
 
 ## Boundaries
 

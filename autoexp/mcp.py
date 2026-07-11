@@ -269,6 +269,11 @@ TOOLS = {
         "schema": tool_schema(),
         "handler": lambda root, a: research_for_project(root).state(),
     },
+    "research_preflight": {
+        "description": "Validate the research contract, runner, files, objective, budget, and agent command.",
+        "schema": tool_schema(),
+        "handler": lambda root, a: research_for_project(root).preflight(),
+    },
     "research_diff": {
         "description": "Read the Git diff for one autoresearch attempt.",
         "schema": tool_schema({"tag": {"type": "string"}}, ["tag"]),
@@ -366,7 +371,7 @@ def handle(message):
     if method == "initialize":
         return {
             "protocolVersion": PROTOCOL_VERSION,
-            "serverInfo": {"name": "autoexp", "version": "0.1.0"},
+            "serverInfo": {"name": "autoexp", "version": "0.2.0"},
             "capabilities": {"resources": {}, "tools": {}, "prompts": {}},
         }
     if method in {"notifications/initialized", "notifications/cancelled"}:

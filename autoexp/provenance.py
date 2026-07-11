@@ -195,7 +195,7 @@ def _input_record(spec, environment, root):
     }
 
 
-def inventory_external_inputs(source_root, root=None):
+def inventory_external_inputs(source_root, root=None, environment_overrides=None):
     """Build a secret-safe input inventory before run allocation."""
     root = resolve_root(root)
     source_root = Path(source_root)
@@ -203,13 +203,8 @@ def inventory_external_inputs(source_root, root=None):
     if not isinstance(config, dict):
         raise ValueError("autoexp.json must contain a JSON object")
     env_file = app_env(root)
-    environment = env_file if config.get("runner") == "docker" else os.environ | env_file
-    if config.get("runner") == "docker":
-        environment |= {
-            name: os.environ[name]
-            for name in ("AUTOEXP_RESEARCH_TAG", "AUTOEXP_RESEARCH_BUDGET_SEC")
-            if name in os.environ
-        }
+    overrides = {str(key): str(value) for key, value in (environment_overrides or {}).items()}
+    environment = env_file | overrides if config.get("runner") == "docker" else os.environ | env_file | overrides
     records = {
         record["name"]: record
         for record in (_input_record(spec, environment, root) for spec in _declarations(config))
@@ -222,6 +217,17 @@ def inventory_external_inputs(source_root, root=None):
             "fingerprint": None,
             "version": None,
             "reproducibility_state": "unpinned",
+            "metadata": "{}",
+        })
+    for name, value in overrides.items():
+        secret = bool(SECRET_KEY.search(name))
+        records.setdefault(name, {
+            "name": name,
+            "kind": "secret" if secret else "env",
+            "present": 1,
+            "fingerprint": None if secret else hashlib.sha256(value.encode()).hexdigest(),
+            "version": None,
+            "reproducibility_state": "redacted" if secret else "pinned",
             "metadata": "{}",
         })
     return [records[name] for name in sorted(records)]

@@ -1,7 +1,7 @@
 [project]
 name = "autoexp"
-version = "0.1.0"
-description = "Git-backed sandbox/versioning runtime for black-box executable workflows"
+version = "0.2.0"
+description = "Local execution ledger for reproducible agent-led experiments"
 readme = "README.md"
 requires-python = ">=3.11"
 license = "Apache-2.0"

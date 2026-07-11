@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import platform
+import signal
 import shlex
 import shutil
 import subprocess
@@ -144,7 +145,22 @@ def find_duplicate_output_run(hashes, output_hash, root=None):
 #  Docker runner
 # ======================================================================
 
-def run_script(run_dir, root=None, source_root=None):
+def _wait(proc, timeout_sec=None):
+    try:
+        return proc.wait(timeout=timeout_sec)
+    except subprocess.TimeoutExpired:
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            else:
+                proc.kill()
+        except ProcessLookupError:
+            pass
+        proc.wait()
+        raise
+
+
+def run_script(run_dir, root=None, source_root=None, *, extra_env=None, timeout_sec=None):
     """Execute the experiment inside a docker sandbox; return the exit code."""
     root = resolve_root(root)
     source_root = root if source_root is None else Path(source_root)
@@ -156,8 +172,10 @@ def run_script(run_dir, root=None, source_root=None):
         workdir = f"/workspace/{workdir if workdir.startswith('script') else 'script'}"
 
     sandbox = cfg["sandbox"]
+    container_name = f"autoexp-{Path(run_dir).name}"
     cmd = [
         "docker", "run", "--rm",
+        "--name", container_name,
         "--network", sandbox.get("network", "none"),
         "--cpus", str(sandbox.get("cpus", "1")),
         "--memory", sandbox.get("memory", "512m"),
@@ -166,9 +184,8 @@ def run_script(run_dir, root=None, source_root=None):
     if app_env_path.exists():
         cmd += ["--env-file", str(app_env_path.resolve()),
                 "-v", f"{app_env_path.resolve()}:/workspace/app.env:ro"]
-    for key in ("AUTOEXP_RESEARCH_TAG", "AUTOEXP_RESEARCH_BUDGET_SEC"):
-        if key in os.environ:
-            cmd += ["-e", f"{key}={os.environ[key]}"]
+    for key, value in (extra_env or {}).items():
+        cmd += ["-e", f"{key}={value}"]
     cmd += [
         "-e", "AUTOEXP_OUTPUT_DIR=/workspace/run/output",
         "-e", "PYTHONDONTWRITEBYTECODE=1",
@@ -181,7 +198,17 @@ def run_script(run_dir, root=None, source_root=None):
     ]
     logs = Path(run_dir) / "logs"
     with (logs / "script.stdout.log").open("w") as stdout, (logs / "script.stderr.log").open("w") as stderr:
-        return subprocess.run(cmd, stdout=stdout, stderr=stderr).returncode
+        proc = subprocess.Popen(cmd, stdout=stdout, stderr=stderr, start_new_session=True)
+        try:
+            return _wait(proc, timeout_sec)
+        except subprocess.TimeoutExpired:
+            subprocess.run(
+                ["docker", "rm", "-f", container_name],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            raise
 
 
 def docker_ready():
@@ -242,7 +269,7 @@ def local_workdir(manifest, run_dir, source_root):
     return Path(source_root) / "script"
 
 
-def run_script_local(run_dir, root=None, source_root=None):
+def run_script_local(run_dir, root=None, source_root=None, *, extra_env=None, timeout_sec=None):
     """Execute the experiment directly on the host; return the exit code."""
     root = resolve_root(root)
     source_root = root if source_root is None else Path(source_root)
@@ -255,7 +282,7 @@ def run_script_local(run_dir, root=None, source_root=None):
             command = f"{shlex.quote(sys.executable)} {command.removeprefix(python_alias)}"
             break
 
-    env = os.environ | app_env(root) | {
+    env = os.environ | app_env(root) | (extra_env or {}) | {
         "AUTOEXP_RUN_DIR": str(Path(run_dir).resolve()),
         "AUTOEXP_SCRIPT_DIR": str((source_root / "script").resolve()),
         "AUTOEXP_OUTPUT_DIR": str((Path(run_dir) / "output").resolve()),
@@ -263,11 +290,13 @@ def run_script_local(run_dir, root=None, source_root=None):
     }
     logs = Path(run_dir) / "logs"
     with (logs / "script.stdout.log").open("w") as stdout, (logs / "script.stderr.log").open("w") as stderr:
-        return subprocess.run(
+        proc = subprocess.Popen(
             command,
             cwd=local_workdir(manifest, run_dir, source_root),
             env=env, shell=True, stdout=stdout, stderr=stderr,
-        ).returncode
+            start_new_session=True,
+        )
+        return _wait(proc, timeout_sec)
 
 
 def runner_type(root, source_root=None):

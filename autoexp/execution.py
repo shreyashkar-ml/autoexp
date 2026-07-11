@@ -1,6 +1,7 @@
 """The one synchronous execution lifecycle shared by every interface."""
 
 import shutil
+import subprocess
 import tempfile
 import time
 from pathlib import Path
@@ -114,6 +115,8 @@ def execute(
     session_id=None,
     request_id=None,
     metadata=None,
+    environment=None,
+    timeout_sec=None,
 ):
     """Execute current source, a snapshot, or a historical run as a new run."""
     root = resolve_root(root)
@@ -153,7 +156,7 @@ def execute(
         if preflight is None:
             preflight = require_preflight(root, temp_root)
         hashes = compute_hashes(temp_root)
-        input_records = inventory_external_inputs(temp_root, root)
+        input_records = inventory_external_inputs(temp_root, root, environment)
         hashes["capsule_hash"] = hash_json({
             "execution": hashes["capsule_hash"],
             "external_inputs": external_input_identity(input_records),
@@ -222,7 +225,13 @@ def execute(
     canceled = False
     try:
         adapter = run_script if running["runner"] == "docker" else run_script_local
-        code = adapter(run_dir, root=root, source_root=run_dir)
+        code = adapter(
+            run_dir,
+            root=root,
+            source_root=run_dir,
+            extra_env=environment,
+            timeout_sec=timeout_sec,
+        )
     except KeyboardInterrupt:
         canceled = True
     except Exception as exc:
@@ -262,6 +271,7 @@ def execute(
             "source_mutation" if source_error
             else "artifact_error" if evidence_errors
             else "report_bundle_error" if bundle_error
+            else "timeout" if isinstance(runner_error, subprocess.TimeoutExpired)
             else "runner_error"
         )
         run = finalize_failure(

@@ -125,8 +125,8 @@ def autoexp_git(args, root=None, capture=False, check=True):
         proc = subprocess.run(
             cmd,
             check=check,
-            stdout=subprocess.PIPE if capture else None,
-            stderr=subprocess.PIPE if capture else None,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
             text=True,
         )
     except FileNotFoundError:
@@ -320,6 +320,144 @@ def init_db(root=None):
             end;
 
             update schema_metadata set schema_version = 3;
+            commit;
+            """
+        )
+
+    if version[0] < 4:
+        conn.executescript(
+            """
+            begin;
+            create table research_contracts(
+                contract_id text primary key,
+                project_id text not null,
+                parent_contract_id text references research_contracts(contract_id),
+                status text not null check(status in ('active', 'superseded')),
+                contract_hash text not null,
+                metric text not null,
+                direction text not null check(direction in ('min', 'max')),
+                baseline_score real,
+                best_score real,
+                best_snapshot_id text references source_snapshots(snapshot_id),
+                evaluator_path text not null,
+                evaluator_hash text not null,
+                program_path text not null,
+                subject_path text not null,
+                budget_sec integer not null check(budget_sec > 0),
+                metric_source text not null check(json_valid(metric_source)),
+                agent_command text not null check(json_valid(agent_command)),
+                created_at text not null,
+                ended_at text
+            );
+            create unique index idx_research_contracts_active
+            on research_contracts(project_id) where status = 'active';
+
+            create table research_sessions(
+                session_id text primary key,
+                contract_id text not null references research_contracts(contract_id),
+                status text not null check(status in (
+                    'running', 'stopped', 'completed', 'failed', 'interrupted'
+                )),
+                phase text not null check(phase in ('idle', 'propose', 'train', 'score')),
+                attempt_id text,
+                pid integer,
+                log_path text not null,
+                started_at text not null,
+                ended_at text,
+                failure_message text,
+                check(
+                    (status = 'running' and ended_at is null) or
+                    (status != 'running' and ended_at is not null)
+                )
+            );
+            create unique index idx_research_sessions_running
+            on research_sessions(contract_id) where status = 'running';
+
+            create table research_attempts(
+                contract_id text not null references research_contracts(contract_id),
+                attempt_id text not null,
+                sequence integer not null check(sequence > 0),
+                session_id text references research_sessions(session_id),
+                status text not null check(status in ('running', 'scored', 'failed')),
+                hypothesis text not null check(length(trim(hypothesis)) > 0),
+                base_snapshot_id text references source_snapshots(snapshot_id),
+                candidate_snapshot_id text references source_snapshots(snapshot_id),
+                run_id text references runs(run_id),
+                score real,
+                verdict text check(verdict in ('kept', 'reverted')),
+                best_score_before real,
+                improvement real,
+                created_at text,
+                ended_at text,
+                failure_message text,
+                metadata text not null default '{}' check(json_valid(metadata)),
+                check(
+                    (status = 'running' and score is null and verdict is null and ended_at is null) or
+                    (status = 'scored' and score is not null and verdict is not null and ended_at is not null) or
+                    (status = 'failed' and verdict is null and ended_at is not null)
+                ),
+                primary key(contract_id, attempt_id),
+                unique(contract_id, sequence)
+            );
+            create unique index idx_research_attempts_run
+            on research_attempts(run_id) where run_id is not null;
+            create unique index idx_research_attempts_running
+            on research_attempts(contract_id) where status = 'running';
+
+            create trigger research_attempts_validate_transition
+            before update of status on research_attempts
+            when new.status != old.status and not (
+                old.status = 'running' and new.status in ('scored', 'failed')
+            )
+            begin
+                select raise(abort, 'invalid research attempt status transition');
+            end;
+
+            create trigger research_attempts_terminal_immutable
+            before update on research_attempts
+            when old.status in ('scored', 'failed')
+            begin
+                select raise(abort, 'terminal research attempt is immutable');
+            end;
+
+            create trigger research_attempts_terminal_no_delete
+            before delete on research_attempts
+            when old.status in ('scored', 'failed')
+            begin
+                select raise(abort, 'terminal research attempt is immutable');
+            end;
+
+            create trigger research_sessions_terminal_immutable
+            before update on research_sessions
+            when old.status in ('stopped', 'completed', 'failed', 'interrupted')
+            begin
+                select raise(abort, 'terminal research session is immutable');
+            end;
+
+            create trigger research_sessions_terminal_no_delete
+            before delete on research_sessions
+            when old.status in ('stopped', 'completed', 'failed', 'interrupted')
+            begin
+                select raise(abort, 'terminal research session is immutable');
+            end;
+
+            create trigger research_contracts_superseded_immutable
+            before update on research_contracts
+            when old.status = 'superseded'
+            begin
+                select raise(abort, 'superseded research contract is immutable');
+            end;
+
+            create trigger research_contracts_superseded_no_delete
+            before delete on research_contracts
+            when old.status = 'superseded'
+            begin
+                select raise(abort, 'superseded research contract is immutable');
+            end;
+
+            alter table schema_metadata add column
+                research_migration_complete integer not null default 0;
+            update schema_metadata set schema_version = 4;
             commit;
             """
         )

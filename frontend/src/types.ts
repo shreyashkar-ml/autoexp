@@ -181,22 +181,59 @@ export type ResearchFile = {
   hash?: string;
 };
 
+export type ResearchContract = {
+  contract_id: string;
+  status: string;
+  current_best_snapshot_id: string | null;
+  evaluator_hash: string | null;
+};
+
+export type ResearchPreflight = {
+  ok: boolean;
+  checks: Array<{
+    name: string;
+    ok: boolean;
+    detail: string;
+    required: boolean;
+  }>;
+};
+
 export type ResearchExperiment = {
-  tag: string;
-  status: "running" | "kept" | "reverted";
+  key?: string;
+  attempt_id?: string;
+  tag?: string;
+  contract_id?: string;
+  state?: "running" | "scored" | "failed";
+  verdict?: "kept" | "reverted" | null;
+  status?: "running" | "kept" | "reverted" | "failed";
   score: number | null;
-  hyp: string;
+  hypothesis?: string;
+  hyp?: string;
+  base_snapshot_id?: string | null;
+  candidate_snapshot_id?: string | null;
+  best_score_before?: number | null;
+  improvement?: number | null;
+  created_at?: string;
   commit?: string | null;
   has_diff?: boolean;
   diff?: string | null;
-  run_id?: string;
+  run_id?: string | null;
 };
 
 export type ResearchState = {
+  contract: ResearchContract;
   objective: ResearchObjective;
+  preflight: ResearchPreflight;
   files: ResearchFile[];
   experiments: ResearchExperiment[];
-  loop: { active: boolean; phase: string; tag: string | null };
+  loop: {
+    active: boolean;
+    phase: string;
+    tag: string | null;
+    session_id?: string | null;
+    status?: string;
+    failure_message?: string | null;
+  };
   can_import_baseline: boolean;
 };
 
@@ -205,4 +242,5 @@ export type ResearchFilePayload = {
   text: string;
   role: ResearchFile["role"];
   hash?: string;
+  snapshot?: SourceSnapshot;
 };

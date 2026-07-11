@@ -290,14 +290,16 @@ Use `"direction": "max"` when larger scores are better and `"direction": "min"` 
 
 Start the loop from the browser UI. For each attempt, the agent:
 
-1. reads the current research state
+1. checks research preflight and reads the current contract state
 2. proposes one hypothesis
-3. edits `script/train.py`
-4. runs the experiment
-5. reads the configured metric
-6. keeps an improvement or restores the previous best state
+3. saves a candidate snapshot from `script/train.py`
+4. executes that snapshot as a new immutable run
+5. reads the configured metric from indexed run artifacts
+6. advances the best snapshot only for an improvement
 
-The UI shows the metric over time, the best result against the baseline, kept and reverted attempts, hypotheses, and line-numbered source changes. The agent command is configurable; Autoexp does not require or display a specific agent identity.
+Autoexp persists the research contract, loop session, and every attempt in SQLite. Each attempt records its hypothesis, base and candidate snapshots, immutable run, score, and verdict. Reverted candidates remain inspectable through their Diff, Run, and Artifacts tabs; only the current-best pointer moves backward to the prior source.
+
+The evaluator is frozen within a contract. If you intentionally change `script/evaluate.py` outside the active loop, Autoexp starts a new contract boundary with a new evaluator fingerprint and attempt numbering while retaining the earlier contract's attempts. Start Loop stays disabled when research preflight finds a missing runner, file, objective, budget, or agent executable.
 
 ## Execution runners
 

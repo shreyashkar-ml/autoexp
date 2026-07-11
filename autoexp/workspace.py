@@ -23,6 +23,7 @@ This repository is an Autoexp workspace.
 - When MCP tools are available, use their live schemas. Start with `workspace` and `contract`; standard work uses `list_runs`, `read_*`, `write_*`, `run`, `diff_runs`, and `restore_run`; Autoresearch uses `research_state`, `research_begin_attempt`, `research_finish_attempt`, and `research_diff`.
 - MCP tool names are not shell commands. Without MCP, use the `autoexp` CLI and project files; do not run `autoexp mcp` manually.
 - In Autoresearch projects, `script/train.py` is the baseline implementation. If the user provides a reference training script, adapt or copy it into `script/train.py` before the first attempt.
+- In Autoresearch projects, call `research_preflight` before the loop, edit only the configured agent-owned candidate file, and finish every begun attempt through Autoexp. The frozen evaluator is read-only within a contract; reverted candidate snapshots and runs remain evidence.
 - Keep experiment source in `script/`.
 - Do not create ad-hoc experiment folders.
 - Do not hand-edit `runs/<run_id>/output/` or `runs/<run_id>/logs/`.

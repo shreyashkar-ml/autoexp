@@ -78,3 +78,9 @@ Generated output and logs must be written only to the paths provided by `${CTX}`
 - Do not edit generated files under `runs/` unless the user explicitly asks to inspect or repair artifacts.
 
 From the terminal, `autoexp run <run_id>` creates a child run from that run's pinned source snapshot. The parent row, outputs, logs, and report remain unchanged.
+
+## Autoresearch Projects
+
+When `autoexp.json` sets `mode` to `autoresearch`, call `research_preflight` and `research_state` before starting an attempt. Edit only the configured `agent` file for candidate work; `human` files hold user direction and the `frozen` evaluator is read-only within the active contract.
+
+Each research attempt must start with one explicit hypothesis. Save the candidate through Autoexp, call `research_begin_attempt`, then call `research_finish_attempt` with the returned attempt ID. Autoexp records the base snapshot, candidate snapshot, immutable run, indexed artifacts, score, and kept/reverted verdict. Reverted candidates remain historical evidence. An intentional evaluator change creates a new contract boundary instead of reinterpreting prior scores.
