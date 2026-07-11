@@ -1,13 +1,13 @@
 import json
 import sys
 
+from .artifacts import artifact_detail, list_artifacts, read_log
 from .autoresearch import for_project as research_for_project
 from .reports import (
     report_generation_instruction,
     set_report_instruction as set_project_report_instruction,
     write_report_instruction as write_project_report_instruction,
 )
-from .runs import get_run
 from .runtime import (
     diff_runs,
     list_runs,
@@ -17,6 +17,8 @@ from .runtime import (
     read_script_params,
     restore,
     run_autoexp,
+    run_diff,
+    run_overview,
     run_report,
     run_source,
     save_script_file,
@@ -58,6 +60,19 @@ def _run_id_schema():
     return tool_schema({"run_id": {"type": "string"}}, ["run_id"])
 
 
+def _read_logs(root, args):
+    stream = args.get("stream")
+    if not stream:
+        return read_logs(args["run_id"], root)
+    return read_log(
+        args["run_id"],
+        stream,
+        offset=int(args.get("offset", 0)),
+        limit=int(args.get("limit", 65536)),
+        root=root,
+    )
+
+
 # ======================================================================
 #  Tool registry: description, schema, and handler defined together
 # ======================================================================
@@ -90,9 +105,9 @@ TOOLS = {
         "handler": lambda root, a: {"runs": list_runs(int(a.get("limit", 20)), root)},
     },
     "read_run": {
-        "description": "Read a run metadata row.",
+        "description": "Read a run overview with lineage, provenance, and indexed evidence.",
         "schema": _run_id_schema(),
-        "handler": lambda root, a: get_run(a["run_id"], root),
+        "handler": lambda root, a: run_overview(a["run_id"], root),
     },
     "read_run_source": {
         "description": "Read copied source files for a run.",
@@ -103,6 +118,25 @@ TOOLS = {
         "description": "Read output artifacts for a run.",
         "schema": _run_id_schema(),
         "handler": lambda root, a: read_output_files(a["run_id"], root),
+    },
+    "list_artifacts": {
+        "description": "List indexed artifacts for a run.",
+        "schema": tool_schema(
+            {"run_id": {"type": "string"}, "category": {"type": "string"}},
+            ["run_id"],
+        ),
+        "handler": lambda root, a: {
+            "run_id": a["run_id"],
+            "artifacts": list_artifacts(a["run_id"], root=root, category=a.get("category")),
+        },
+    },
+    "read_artifact": {
+        "description": "Read safe metadata and preview detail for an indexed artifact.",
+        "schema": tool_schema(
+            {"run_id": {"type": "string"}, "artifact_id": {"type": "string"}},
+            ["run_id", "artifact_id"],
+        ),
+        "handler": lambda root, a: artifact_detail(a["run_id"], a["artifact_id"], root),
     },
     "read_final_report": {
         "description": "Read a generated report if present.",
@@ -115,9 +149,17 @@ TOOLS = {
         "handler": lambda root, a: read_report_bundle(a["run_id"], root),
     },
     "read_logs": {
-        "description": "Read run logs.",
-        "schema": _run_id_schema(),
-        "handler": lambda root, a: read_logs(a["run_id"], root),
+        "description": "Read actual stdout/stderr, optionally from a byte offset.",
+        "schema": tool_schema(
+            {
+                "run_id": {"type": "string"},
+                "stream": {"type": "string", "enum": ["stdout", "stderr"]},
+                "offset": {"type": "integer", "minimum": 0, "default": 0},
+                "limit": {"type": "integer", "minimum": 1, "maximum": 1048576, "default": 65536},
+            },
+            ["run_id"],
+        ),
+        "handler": _read_logs,
     },
     "report_instruction": {
         "description": "Read project report guidance joined with Autoexp's report contract.",
@@ -138,6 +180,7 @@ TOOLS = {
                 "run_id": {"type": "string"},
                 "snapshot_id": {"type": "string"},
                 "save_as": {"type": "string"},
+                "actor_name": {"type": "string"},
             },
             ["path", "content"],
         ),
@@ -148,12 +191,22 @@ TOOLS = {
             source_run_id=a.get("run_id"),
             save_as=a.get("save_as"),
             source_snapshot_id=a.get("snapshot_id"),
+            trigger_kind="mcp",
+            actor_name=a.get("actor_name") or "autoexp-mcp",
         ),
     },
     "write_script_params": {
         "description": "Write script/params.json.",
-        "schema": tool_schema({"params": {"type": "object"}}, ["params"]),
-        "handler": lambda root, a: write_script_params(a["params"], root),
+        "schema": tool_schema(
+            {"params": {"type": "object"}, "actor_name": {"type": "string"}},
+            ["params"],
+        ),
+        "handler": lambda root, a: write_script_params(
+            a["params"],
+            root,
+            trigger_kind="mcp",
+            actor_name=a.get("actor_name") or "autoexp-mcp",
+        ),
     },
     "set_report_instruction": {
         "description": "Configure project report instruction file.",
@@ -162,8 +215,44 @@ TOOLS = {
     },
     "run": {
         "description": "Run Autoexp through the same runtime path as the CLI.",
-        "schema": tool_schema({"run_id": {"type": "string"}}),
-        "handler": lambda root, a: run_autoexp(a.get("run_id"), root),
+        "schema": tool_schema({
+            "run_id": {"type": "string"},
+            "snapshot_id": {"type": "string"},
+            "actor_name": {"type": "string"},
+        }),
+        "handler": lambda root, a: run_autoexp(
+            a.get("run_id"),
+            root,
+            snapshot_id=a.get("snapshot_id"),
+            actor_name=a.get("actor_name") or "autoexp-mcp",
+        ),
+    },
+    "rerun": {
+        "description": "Create a child execution from a historical run's pinned snapshot.",
+        "schema": tool_schema(
+            {"run_id": {"type": "string"}, "actor_name": {"type": "string"}},
+            ["run_id"],
+        ),
+        "handler": lambda root, a: run_autoexp(
+            a["run_id"], root, actor_name=a.get("actor_name") or "autoexp-mcp"
+        ),
+    },
+    "diff_run": {
+        "description": "Diff a run snapshot against its parent lineage by default.",
+        "schema": tool_schema(
+            {
+                "run_id": {"type": "string"},
+                "base_run_id": {"type": "string"},
+                "base_snapshot_id": {"type": "string"},
+            },
+            ["run_id"],
+        ),
+        "handler": lambda root, a: run_diff(
+            a["run_id"],
+            root,
+            base_run_id=a.get("base_run_id"),
+            base_snapshot_id=a.get("base_snapshot_id"),
+        ),
     },
     "diff_runs": {
         "description": "Diff source/config between two runs.",
@@ -237,11 +326,16 @@ def resource_list():
 
 # Per-run section -> producer(run_id, root). "" means the run row itself.
 RUN_SECTIONS = {
-    "": lambda run_id, root: get_run(run_id, root),
+    "": lambda run_id, root: run_overview(run_id, root),
     "source": lambda run_id, root: run_source(run_id, root),
     "output": lambda run_id, root: read_output_files(run_id, root),
+    "artifacts": lambda run_id, root: {
+        "run_id": run_id,
+        "artifacts": list_artifacts(run_id, root=root),
+    },
     "report": lambda run_id, root: run_report(run_id, root),
     "logs": lambda run_id, root: read_logs(run_id, root),
+    "diff": lambda run_id, root: run_diff(run_id, root),
 }
 
 

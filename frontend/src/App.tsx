@@ -25,6 +25,7 @@ import {
   Bot,
   Upload,
   X,
+  type LucideIcon,
 } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
@@ -32,6 +33,9 @@ import remarkGfm from "remark-gfm";
 
 import { api } from "@/api";
 import type {
+  Artifact,
+  ArtifactDetailPayload,
+  ArtifactListPayload,
   InstructionPayload,
   ParamsPayload,
   Project,
@@ -41,23 +45,33 @@ import type {
   ResearchObjective,
   ResearchState,
   Run,
+  RunAggregate,
+  RunDetailPayload,
+  RunDiffPayload,
+  RunLogPayload,
   ScriptSavePayload,
   SourcePayload,
 } from "@/types";
 
 type Theme = "light" | "dark";
 type ProjectMode = "standard" | "autoresearch";
+type StandardTab = "overview" | "script" | "output" | "logs" | "report" | "diff";
 type Panel =
-  | { kind: "script"; run: Run; data: SourcePayload }
-  | { kind: "report"; run: Run; data: ReportPayload }
+  | { kind: "run"; run: Run; tab: StandardTab }
   | { kind: "instruction"; data: InstructionPayload }
   | { kind: "params"; data: ParamsPayload }
   | { kind: "program"; data: ResearchFilePayload }
   | { kind: "evaluator"; data: ResearchFilePayload }
   | { kind: "diff"; experiment: ResearchExperiment; objective: ResearchObjective }
   | { kind: "log" };
-type JobState = { active: boolean; job: { status?: string } | null };
+type JobState = {
+  active: boolean;
+  job: { status?: string; run_id?: string | null } | null;
+  run_id?: string | null;
+  run?: Run | null;
+};
 type Toast = { id: number; message: string; kind?: "ok" | "bad" };
+type RunRequestPayload = Run | { run?: Run | null; run_id?: string | null; job?: { run_id?: string | null } };
 
 const EMPTY_RESEARCH: ResearchState = {
   objective: { metric: "score", direction: "max", baseline: null, best: null, budget_sec: 300 },
@@ -119,6 +133,13 @@ function nextScriptPath(path: string, files: { path: string }[]) {
   return [...parts, `${base}_v${highest + 1}${suffix}`].filter(Boolean).join("/");
 }
 
+function requestedRun(data: RunRequestPayload): Run | null {
+  if ("run" in data && data.run?.run_id) return data.run;
+  const runId = data.run_id || ("job" in data ? data.job?.run_id : null);
+  if (!runId) return null;
+  return "status" in data ? data as Run : { run_id: runId, status: "queued" };
+}
+
 export default function App() {
   const [theme, setTheme] = useState<Theme>(() =>
     window.localStorage.getItem("autoexp-theme") === "dark" ? "dark" : "light",
@@ -137,6 +158,7 @@ export default function App() {
   const [toasts, setToasts] = useState<Toast[]>([]);
   const [research, setResearch] = useState<ResearchState | null>(null);
   const searchRef = useRef<HTMLInputElement>(null);
+  const pendingSelection = useRef(false);
 
   const project = projects.find((item) => item.project_id === projectId) || null;
   const isResearch = project?.mode === "autoresearch";
@@ -200,6 +222,22 @@ export default function App() {
     );
     setJob(data.run);
     setRuns(data.runs || []);
+    if (pendingSelection.current) {
+      const runId =
+        data.run.job?.run_id ||
+        data.run.run?.run_id ||
+        data.run.run_id;
+      if (runId) {
+        const allocated = data.runs.find((item) => item.run_id === runId) || {
+          run_id: runId,
+          status: data.run.job?.status || "queued",
+        };
+        pendingSelection.current = false;
+        openRun(allocated);
+      } else if (!data.run.active && data.run.job) {
+        pendingSelection.current = false;
+      }
+    }
   }
 
   async function loadResearch(id = projectId) {
@@ -233,6 +271,7 @@ export default function App() {
   useEffect(() => {
     setPanel(null);
     setSelectedRun("");
+    pendingSelection.current = false;
     setQuery("");
     setResearch(null);
     loadStatus(projectId).catch((caught) =>
@@ -262,6 +301,7 @@ export default function App() {
           else void startRun();
         }
       } else if (event.key === "Escape" && panel) {
+        pendingSelection.current = false;
         setPanel(null);
       }
     }
@@ -269,27 +309,86 @@ export default function App() {
     return () => window.removeEventListener("keydown", shortcut);
   }, [project, active, isResearch, panel]);
 
-  async function startRun(run?: Run) {
+  async function startRun() {
     if (!projectId) return;
-    if (run) setSelectedRun(run.run_id);
-    setLoading(run ? `trigger:${run.run_id}` : "start");
+    setLoading("start");
     setError("");
     try {
       const data = await api<JobState>("/api/run/start", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          project_id: projectId,
-          ...(run ? { run_id: run.run_id } : {}),
-        }),
+        body: JSON.stringify({ project_id: projectId }),
       });
       setJob(data);
       await loadStatus(projectId);
-      toast(run ? `Re-running ${run.run_id}` : "Run started");
+      toast("Run started");
     } catch (caught) {
       const message = caught instanceof Error ? caught.message : String(caught);
       setError(message);
       toast("Couldn't start the run", "bad");
+    } finally {
+      setLoading("");
+    }
+  }
+
+  function openRun(run: Run, tab: StandardTab = "overview") {
+    pendingSelection.current = false;
+    setSelectedRun(run.run_id);
+    setPanel({ kind: "run", run, tab });
+  }
+
+  async function rerun(run: Run) {
+    setLoading(`trigger:${run.run_id}`);
+    setError("");
+    pendingSelection.current = true;
+    try {
+      const data = await api<RunRequestPayload>(
+        projectPath(`/api/runs/${encodeURIComponent(run.run_id)}/rerun`),
+        {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ project_id: projectId }),
+        },
+      );
+      const next = requestedRun(data);
+      if (next) {
+        pendingSelection.current = false;
+        openRun(next);
+      }
+      await loadStatus(projectId);
+      toast(next?.run_id ? `Created child run ${next.run_id}` : `Re-running ${run.run_id}`);
+    } catch (caught) {
+      pendingSelection.current = false;
+      const message = caught instanceof Error ? caught.message : String(caught);
+      setError(message);
+      toast("Couldn't re-run the snapshot", "bad");
+    } finally {
+      setLoading("");
+    }
+  }
+
+  async function runSnapshot(snapshotId: string) {
+    setLoading(`snapshot:${snapshotId}`);
+    setError("");
+    pendingSelection.current = true;
+    try {
+      const data = await api<RunRequestPayload>(projectPath("/api/runs"), {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: projectId, snapshot_id: snapshotId }),
+      });
+      const next = requestedRun(data);
+      if (next) {
+        pendingSelection.current = false;
+        openRun(next);
+      }
+      await loadStatus(projectId);
+      toast(next ? `Running ${next.run_id}` : `Snapshot ${snapshotId} queued`);
+    } catch (caught) {
+      pendingSelection.current = false;
+      const message = caught instanceof Error ? caught.message : String(caught);
+      setError(message);
+      toast("Couldn't run the snapshot", "bad");
     } finally {
       setLoading("");
     }
@@ -315,40 +414,9 @@ export default function App() {
     }
   }
 
-  async function openScript(run: Run) {
-    setSelectedRun(run.run_id);
-    setLoading(`script:${run.run_id}`);
-    setError("");
-    try {
-      const data = await api<SourcePayload>(
-        projectPath(`/api/run/source?run_id=${encodeURIComponent(run.run_id)}`),
-      );
-      setPanel({ kind: "script", run, data });
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setLoading("");
-    }
-  }
-
-  async function openReport(run: Run) {
-    setSelectedRun(run.run_id);
-    setLoading(`report:${run.run_id}`);
-    setError("");
-    try {
-      const data = await api<ReportPayload>(
-        projectPath(`/api/run/report?run_id=${encodeURIComponent(run.run_id)}`),
-      );
-      setPanel({ kind: "report", run, data });
-    } catch (caught) {
-      setError(caught instanceof Error ? caught.message : String(caught));
-    } finally {
-      setLoading("");
-    }
-  }
-
   async function openInstruction() {
     if (!projectId) return;
+    pendingSelection.current = false;
     setLoading("instruction");
     setError("");
     try {
@@ -365,6 +433,7 @@ export default function App() {
 
   async function openParams() {
     if (!projectId) return;
+    pendingSelection.current = false;
     setLoading("params");
     setError("");
     try {
@@ -639,7 +708,7 @@ export default function App() {
                 </button>
               )}
               <button className="btn" onClick={() => setPanel({ kind: "log" })}>
-                <Terminal size={15} /> Live log
+                <Terminal size={15} /> Worker log
               </button>
               <button className="btn" onClick={openParams} disabled={!project.exists}>
                 <SlidersHorizontal size={15} /> Params
@@ -682,7 +751,7 @@ export default function App() {
                 <FileText size={15} /> program.md
               </button>
               <button className="btn" onClick={() => setPanel({ kind: "log" })}>
-                <Terminal size={15} /> Live log
+                <Terminal size={15} /> Agent log
               </button>
             </div>
           </section>
@@ -751,10 +820,8 @@ export default function App() {
               loading={loading}
               active={job.active}
               project={project}
-              onSelect={setSelectedRun}
-              onScript={openScript}
-              onReport={openReport}
-              onTrigger={startRun}
+              onOpen={openRun}
+              onTrigger={rerun}
               onCopy={(runId) => {
                 void navigator.clipboard?.writeText(runId);
                 toast("Run ID copied");
@@ -773,13 +840,28 @@ export default function App() {
           {panel ? (
             <SplitHandle value={leftColumn} onChange={setLeftColumn} />
           ) : null}
-          {panel ? (
-            <Viewer
-              panel={panel}
+          {panel ? panel.kind === "run" ? (
+            <StandardInspector
+              run={panel.run}
+              tab={panel.tab}
               theme={theme}
               projectId={projectId}
-              active={job.active}
+              rerunning={loading === `trigger:${panel.run.run_id}`}
+              runningSnapshot={loading.startsWith("snapshot:")}
+              onTab={(tab) => setPanel({ ...panel, tab })}
+              onRerun={rerun}
+              onRunSnapshot={runSnapshot}
               onSaveScript={saveScript}
+              onClose={() => {
+                pendingSelection.current = false;
+                setPanel(null);
+              }}
+            />
+          ) : (
+            <Viewer
+              panel={panel}
+              projectId={projectId}
+              active={job.active}
               onSaveInstruction={saveInstruction}
               onSaveParams={saveParams}
               onClose={() => setPanel(null)}
@@ -1251,7 +1333,7 @@ function ResearchViewer({
         ? `${panel.data.path} · ${panel.data.role}`
         : panel.kind === "diff"
           ? `${panel.experiment.tag} · experiment diff`
-          : "Live log";
+          : "Agent log";
   const Icon =
     panel.kind === "program"
       ? FileText
@@ -1270,7 +1352,7 @@ function ResearchViewer({
         ) : null}
         {panel.kind === "evaluator" ? <ResearchFileViewer data={panel.data} /> : null}
         {panel.kind === "diff" ? <DiffViewer experiment={panel.experiment} objective={panel.objective} /> : null}
-        {panel.kind === "log" ? <LogViewer projectId={projectId} active={active} /> : null}
+        {panel.kind === "log" ? <LogViewer projectId={projectId} active={active} kind="agent" /> : null}
       </div>
     </aside>
   );
@@ -1420,9 +1502,7 @@ function RunLedger({
   loading,
   active,
   project,
-  onSelect,
-  onScript,
-  onReport,
+  onOpen,
   onTrigger,
   onCopy,
 }: {
@@ -1431,9 +1511,7 @@ function RunLedger({
   loading: string;
   active: boolean;
   project: Project | null;
-  onSelect: (runId: string) => void;
-  onScript: (run: Run) => void;
-  onReport: (run: Run) => void;
+  onOpen: (run: Run, tab?: StandardTab) => void;
   onTrigger: (run: Run) => void;
   onCopy: (runId: string) => void;
 }) {
@@ -1473,7 +1551,14 @@ function RunLedger({
             <tr
               key={run.run_id}
               className={selected === run.run_id ? "sel" : ""}
-              onClick={() => onSelect(run.run_id)}
+              tabIndex={0}
+              aria-label={`Inspect run ${run.run_id}`}
+              onClick={() => onOpen(run)}
+              onKeyDown={(event) => {
+                if (event.target !== event.currentTarget || !["Enter", " "].includes(event.key)) return;
+                event.preventDefault();
+                onOpen(run);
+              }}
             >
               <td>
                 <div className="runid">
@@ -1504,14 +1589,12 @@ function RunLedger({
                   className="cell-btn"
                   onClick={(event) => {
                     event.stopPropagation();
-                    onScript(run);
+                    onOpen(run, "script");
                   }}
                 >
                   <Code2 size={14} />
                   <span className="t">
-                    {loading === `script:${run.run_id}`
-                      ? "loading…"
-                      : run.script_name || run.script || "script"}
+                    {run.script_name || run.script || "script"}
                   </span>
                 </button>
               </td>
@@ -1521,13 +1604,11 @@ function RunLedger({
                     className="cell-btn"
                     onClick={(event) => {
                       event.stopPropagation();
-                      onReport(run);
+                      onOpen(run, "report");
                     }}
                   >
                     <FileText size={14} />
-                    <span className="t">
-                      {loading === `report:${run.run_id}` ? "loading…" : "view report"}
-                    </span>
+                    <span className="t">view report</span>
                   </button>
                 ) : (
                   <span className="dash">—</span>
@@ -1535,12 +1616,17 @@ function RunLedger({
               </td>
               <td>
                 {run.output_files?.length ? (
-                  <span className="out" title={run.output_files.join("\n")}>
+                  <button
+                    className="out"
+                    title={run.output_files.join("\n")}
+                    onClick={(event) => {
+                      event.stopPropagation();
+                      onOpen(run, "output");
+                    }}
+                  >
                     {run.output_files[0].split("/").pop()}
-                    {run.output_files.length > 1 ? (
-                      <span className="more"> +{run.output_files.length - 1}</span>
-                    ) : null}
-                  </span>
+                    {run.output_files.length > 1 ? <span className="more"> +{run.output_files.length - 1}</span> : null}
+                  </button>
                 ) : (
                   <span className="dash">—</span>
                 )}
@@ -1566,20 +1652,88 @@ function RunLedger({
   );
 }
 
-function Viewer({
-  panel,
+const STANDARD_TABS: { id: StandardTab; label: string; icon: LucideIcon }[] = [
+  { id: "overview", label: "Overview", icon: FlaskConical },
+  { id: "script", label: "Script", icon: Code2 },
+  { id: "output", label: "Output", icon: FolderOpen },
+  { id: "logs", label: "Logs", icon: Terminal },
+  { id: "report", label: "Report", icon: FileText },
+  { id: "diff", label: "Diff", icon: GitBranch },
+];
+
+function projectUrl(path: string, projectId: string) {
+  if (!projectId || /^(data:|blob:)/.test(path)) return path;
+  const url = new URL(path, window.location.origin);
+  if (!url.searchParams.has("project_id")) url.searchParams.set("project_id", projectId);
+  return /^https?:/.test(path) ? url.toString() : `${url.pathname}${url.search}${url.hash}`;
+}
+
+function asRecord(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
+}
+
+function valueText(value: unknown): string {
+  if (value === null || value === undefined || value === "") return "not recorded";
+  if (typeof value === "boolean") return value ? "verified" : "not verified";
+  if (typeof value === "string" || typeof value === "number") return String(value);
+  if (Array.isArray(value)) return value.map(valueText).join(", ");
+  const record = asRecord(value);
+  if (!record) return String(value);
+  for (const key of ["status", "state", "value", "detail", "message", "version"]) {
+    if (record[key] !== undefined) return valueText(record[key]);
+  }
+  return Object.entries(record).map(([key, item]) => `${key}: ${valueText(item)}`).join(" · ");
+}
+
+function humanize(value: string) {
+  return value.replace(/_/g, " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function formatBytes(value?: number | null) {
+  if (value === null || value === undefined) return "size unknown";
+  if (value < 1024) return `${value} B`;
+  if (value < 1024 ** 2) return `${(value / 1024).toFixed(1)} KB`;
+  return `${(value / 1024 ** 2).toFixed(1)} MB`;
+}
+
+function normalizeRunDetail(payload: RunDetailPayload, fallback: Run): RunAggregate {
+  if ("run" in payload) return { ...payload, run: { ...fallback, ...payload.run } };
+  return {
+    run: { ...fallback, ...payload },
+    source_snapshot: payload.source_snapshot,
+    parent_run: payload.parent_run,
+    trigger: payload.trigger,
+    reproducibility: payload.reproducibility,
+    artifact_summary: payload.artifact_summary,
+    reproduction: payload.reproduction,
+    divergence: payload.divergence,
+  };
+}
+
+function StandardInspector({
+  run,
+  tab,
   theme,
   projectId,
-  active,
+  rerunning,
+  runningSnapshot,
+  onTab,
+  onRerun,
+  onRunSnapshot,
   onSaveScript,
-  onSaveInstruction,
-  onSaveParams,
   onClose,
 }: {
-  panel: Panel;
+  run: Run;
+  tab: StandardTab;
   theme: Theme;
   projectId: string;
-  active: boolean;
+  rerunning: boolean;
+  runningSnapshot: boolean;
+  onTab: (tab: StandardTab) => void;
+  onRerun: (run: Run) => Promise<void>;
+  onRunSnapshot: (snapshotId: string) => Promise<void>;
   onSaveScript: (
     runId: string,
     snapshotId: string | null,
@@ -1587,22 +1741,551 @@ function Viewer({
     text: string,
     saveAs: string,
   ) => Promise<ScriptSavePayload>;
+  onClose: () => void;
+}) {
+  const [overview, setOverview] = useState<RunAggregate | null>(null);
+  const [source, setSource] = useState<SourcePayload | null>(null);
+  const [artifacts, setArtifacts] = useState<Artifact[]>([]);
+  const [selectedArtifact, setSelectedArtifact] = useState<Artifact | null>(null);
+  const [artifactDetail, setArtifactDetail] = useState<ArtifactDetailPayload | null>(null);
+  const [report, setReport] = useState<ReportPayload | null>(null);
+  const [diff, setDiff] = useState<RunDiffPayload | null>(null);
+  const [derivedSnapshot, setDerivedSnapshot] = useState<string | null>(null);
+  const [pending, setPending] = useState(false);
+  const [paneError, setPaneError] = useState("");
+  const endpoint = useCallback(
+    (suffix: string) => projectUrl(`/api/runs/${encodeURIComponent(run.run_id)}${suffix}`, projectId),
+    [projectId, run.run_id],
+  );
+
+  useEffect(() => {
+    setOverview(null);
+    setSource(null);
+    setArtifacts([]);
+    setSelectedArtifact(null);
+    setArtifactDetail(null);
+    setReport(null);
+    setDiff(null);
+    setDerivedSnapshot(null);
+    setPaneError("");
+  }, [run.run_id]);
+
+  useEffect(() => {
+    let live = true;
+    let timer = 0;
+    const pull = async () => {
+      try {
+        const data = normalizeRunDetail(await api<RunDetailPayload>(endpoint("")), run);
+        if (!live) return;
+        setOverview(data);
+        if (!["success", "failed", "canceled"].includes(data.run.status)) {
+          timer = window.setTimeout(pull, 1000);
+        }
+      } catch (caught) {
+        if (live) setPaneError(caught instanceof Error ? caught.message : String(caught));
+      }
+    };
+    void pull();
+    return () => {
+      live = false;
+      window.clearTimeout(timer);
+    };
+  }, [endpoint, run.run_id]);
+
+  useEffect(() => {
+    if (tab === "overview" || tab === "logs") return;
+    let live = true;
+    setPending(true);
+    setPaneError("");
+    const request =
+      tab === "script"
+        ? api<SourcePayload>(endpoint("/source")).then((data) => { if (live) setSource(data); })
+        : tab === "output"
+          ? api<ArtifactListPayload>(endpoint("/artifacts")).then((data) => {
+              if (!live) return;
+              const items = Array.isArray(data) ? data : data.artifacts || [];
+              setArtifacts(items);
+              setSelectedArtifact(items.find((item) => !item.category || item.category === "output") || null);
+            })
+          : tab === "report"
+            ? api<ReportPayload | { report: ReportPayload }>(endpoint("/report")).then((data) => {
+                if (live) setReport("report" in data ? data.report : data);
+              })
+            : api<RunDiffPayload>(endpoint("/diff")).then((data) => { if (live) setDiff(data); });
+    request.catch((caught) => {
+      if (live) setPaneError(caught instanceof Error ? caught.message : String(caught));
+    }).finally(() => { if (live) setPending(false); });
+    return () => { live = false; };
+  }, [endpoint, overview?.run.status, tab]);
+
+  useEffect(() => {
+    if (!selectedArtifact) {
+      setArtifactDetail(null);
+      return;
+    }
+    let live = true;
+    setArtifactDetail(null);
+    setPending(true);
+    api<ArtifactDetailPayload>(endpoint(`/artifacts/${encodeURIComponent(selectedArtifact.artifact_id)}`))
+      .then((data) => { if (live) setArtifactDetail(data); })
+      .catch((caught) => {
+        if (live) setPaneError(caught instanceof Error ? caught.message : String(caught));
+      })
+      .finally(() => { if (live) setPending(false); });
+    return () => { live = false; };
+  }, [endpoint, selectedArtifact]);
+
+  return (
+    <aside className="card panel run-inspector">
+      <div className="run-inspector-head">
+        <div className="inspector-title">
+          <span className="ic"><FlaskConical size={17} /></span>
+          <div>
+            <div className="inspector-id">{run.run_id}</div>
+            <div className="inspector-sub">{statusLabel(overview?.run.status || run.status)} · immutable execution evidence</div>
+          </div>
+        </div>
+        <div className="inspector-actions">
+          {derivedSnapshot ? (
+            <button className="btn primary sm" onClick={() => onRunSnapshot(derivedSnapshot)} disabled={runningSnapshot}>
+              <Play size={13} fill="currentColor" /> {runningSnapshot ? "Starting…" : "Run snapshot"}
+            </button>
+          ) : null}
+          <button className="btn sm" onClick={() => onRerun(run)} disabled={rerunning}>
+            <Repeat2 size={14} /> {rerunning ? "Starting…" : "Re-run"}
+          </button>
+          <button className="btn ghost sm" onClick={onClose} aria-label="Close inspector"><X size={16} /></button>
+        </div>
+      </div>
+      <div className="inspector-tabs" role="tablist" aria-label="Run inspector">
+        {STANDARD_TABS.map(({ id, label, icon: Icon }) => (
+          <button
+            key={id}
+            className={tab === id ? "active" : ""}
+            role="tab"
+            aria-selected={tab === id}
+            onClick={() => onTab(id)}
+          >
+            <Icon size={13} /> {label}
+          </button>
+        ))}
+      </div>
+      <div className="panel-body run-pane">
+        {paneError ? <div className="pane-error"><AlertTriangle size={14} /> {paneError}</div> : null}
+        {tab === "overview" ? (
+          overview ? <RunOverview data={overview} onNavigate={onTab} /> : <PaneLoading />
+        ) : null}
+        {tab === "script" ? (
+          source ? (
+            <SourceEditor
+              data={source}
+              theme={theme}
+              onSave={async (snapshotId, path, text, saveAs) => {
+                const result = await onSaveScript(run.run_id, snapshotId, path, text, saveAs);
+                setDerivedSnapshot(result.snapshot.snapshot_id);
+                return result;
+              }}
+            />
+          ) : pending ? <PaneLoading /> : !paneError ? <Empty title="No source">This run has no pinned source.</Empty> : null
+        ) : null}
+        {tab === "output" ? (
+          <ArtifactViewer
+            artifacts={artifacts}
+            selected={selectedArtifact}
+            detail={artifactDetail}
+            pending={pending}
+            projectId={projectId}
+            onSelect={setSelectedArtifact}
+          />
+        ) : null}
+        {tab === "logs" ? <RunLogs run={overview?.run || run} projectId={projectId} /> : null}
+        {tab === "report" ? (
+          report ? <RunReport data={report} /> : pending ? <PaneLoading /> : !paneError ? <Empty title="No report yet">No report is attached to this run.</Empty> : null
+        ) : null}
+        {tab === "diff" ? (
+          diff ? <RunDiff data={diff} /> : pending ? <PaneLoading /> : !paneError ? <Empty title="No parent diff">This run has no source difference to show.</Empty> : null
+        ) : null}
+      </div>
+    </aside>
+  );
+}
+
+function PaneLoading() {
+  return <div className="empty"><div className="big">Loading evidence…</div></div>;
+}
+
+function RunOverview({ data, onNavigate }: { data: RunAggregate; onNavigate: (tab: StandardTab) => void }) {
+  const run = data.run;
+  const snapshot = data.source_snapshot || run.source_snapshot;
+  const parent = data.parent_run || run.parent_run;
+  const trigger = data.trigger || run.trigger;
+  const reproducibility = data.reproducibility || run.reproducibility;
+  const artifactSummary = data.artifact_summary || run.artifact_summary;
+  const triggerText = typeof trigger === "string"
+    ? trigger
+    : trigger
+      ? [trigger.kind, trigger.actor_name || trigger.actor].filter(Boolean).join(" · ")
+      : run.trigger_id || "not recorded";
+  const duration = run.duration_ms === null || run.duration_ms === undefined
+    ? "not recorded"
+    : run.duration_ms < 1000
+      ? `${run.duration_ms} ms`
+      : `${(run.duration_ms / 1000).toFixed(2)} s`;
+  const reproductionRecord = asRecord(data.reproduction || run.reproduction);
+  const reproduction = run.reproduces_run_id
+    ? `reproduces ${run.reproduces_run_id}`
+    : data.divergence || run.divergence || reproductionRecord?.state === "divergence"
+      ? "output diverged under the same capsule"
+      : reproductionRecord?.state === "reproduction"
+        ? `reproduces ${valueText(reproductionRecord.run_id)}`
+        : valueText(data.reproduction || run.reproduction);
+  const checks = reproducibility
+    ? Object.entries(reproducibility.checks || reproducibility).filter(([key]) => key !== "state")
+    : [];
+  const externalInputs = Array.isArray(reproducibility?.external_inputs)
+    ? reproducibility.external_inputs.map(asRecord).filter(Boolean) as Record<string, unknown>[]
+    : [];
+  const artifacts = artifactSummary ? Object.entries(artifactSummary).filter(([, value]) => typeof value === "number") : [];
+
+  return (
+    <div className="overview-grid">
+      <section className="evidence-section">
+        <h3>Run identity</h3>
+        <div className="kv-grid">
+          <OverviewValue label="Source snapshot" value={snapshot?.snapshot_id || run.source_snapshot_id} />
+          <OverviewValue label="Trigger" value={triggerText} />
+          <OverviewValue label="Capsule hash" value={run.capsule_hash} mono />
+          <OverviewValue label="Output hash" value={run.output_hash} mono />
+          <OverviewValue label="Runner" value={[run.runner, run.runner_identity].filter(Boolean).join(" · ")} />
+          <OverviewValue label="Duration / exit" value={`${duration} · exit ${run.exit_code ?? "—"}`} />
+          <OverviewValue label="Started" value={run.started_at} />
+          <OverviewValue label="Ended" value={run.ended_at} />
+        </div>
+      </section>
+
+      <section className="evidence-section">
+        <h3>Lineage</h3>
+        <div className="lineage-row">
+          <div className="lineage-node"><span>parent run</span><b>{parent?.run_id || run.parent_run_id || "root"}</b></div>
+          <span className="lineage-arrow">→</span>
+          <div className="lineage-node"><span>source snapshot</span><b>{snapshot?.snapshot_id || run.source_snapshot_id || "unknown"}</b></div>
+          <span className="lineage-arrow">→</span>
+          <div className="lineage-node current"><span>current run</span><b>{run.run_id}</b></div>
+        </div>
+      </section>
+
+      <section className="evidence-section">
+        <h3>Reproducibility</h3>
+        <div className="check-list">
+          {checks.length ? checks.map(([label, value]) => {
+            const text = valueText(value);
+            const warning = /not |unpin|redact|warn|missing|unknown/i.test(text);
+            return (
+              <div className={`check-row${warning ? " warn" : ""}`} key={label}>
+                <span className="check-icon">{warning ? "!" : "✓"}</span>
+                <span><b>{humanize(label)}</b><small>{text}</small></span>
+              </div>
+            );
+          }) : <div className="evidence-empty">No reproducibility summary recorded.</div>}
+          {externalInputs.map((input) => (
+            <div className={`check-row${input.reproducibility_state === "pinned" ? "" : " warn"}`} key={String(input.name)}>
+              <span className="check-icon">{input.reproducibility_state === "pinned" ? "✓" : "!"}</span>
+              <span>
+                <b>{String(input.name)}</b>
+                <small>{valueText(input.kind)} · {valueText(input.reproducibility_state)} · {input.present ? "present" : "missing"}</small>
+              </span>
+            </div>
+          ))}
+        </div>
+      </section>
+
+      <section className="evidence-section">
+        <h3>Artifacts &amp; reproduction</h3>
+        <div className="artifact-summary">
+          {artifacts.length ? artifacts.map(([label, value]) => {
+            const target = ({ output: "output", log: "logs", report: "report" } as const)[label as "output" | "log" | "report"];
+            return target ? (
+              <button key={label} onClick={() => onNavigate(target)}><b>{String(value)}</b>{humanize(label)}</button>
+            ) : (
+              <span key={label}><b>{String(value)}</b>{humanize(label)}</span>
+            );
+          }) : <span>No artifact summary recorded.</span>}
+        </div>
+        <div className={`reproduction-note${/diverg/i.test(reproduction) ? " warn" : ""}`}>{reproduction}</div>
+        {run.failure_message ? (
+          <div className="failure-note"><b>{run.failure_kind || "execution failure"}</b>{run.failure_message}</div>
+        ) : null}
+      </section>
+    </div>
+  );
+}
+
+function OverviewValue({ label, value, mono = false }: { label: string; value: unknown; mono?: boolean }) {
+  return <div className="kv"><span>{label}</span><b className={mono ? "mono-inline" : ""}>{valueText(value)}</b></div>;
+}
+
+function ArtifactViewer({
+  artifacts,
+  selected,
+  detail,
+  pending,
+  projectId,
+  onSelect,
+}: {
+  artifacts: Artifact[];
+  selected: Artifact | null;
+  detail: ArtifactDetailPayload | null;
+  pending: boolean;
+  projectId: string;
+  onSelect: (artifact: Artifact) => void;
+}) {
+  const outputs = artifacts.filter((item) => !item.category || item.category === "output");
+  if (!outputs.length && pending) return <PaneLoading />;
+  if (!outputs.length) return <Empty title="No output artifacts">This run did not produce indexed output files.</Empty>;
+  return (
+    <div className="artifact-layout">
+      <div className="artifact-list">
+        <div className="list-label">Output artifacts · {outputs.length}</div>
+        {outputs.map((artifact) => (
+          <button
+            key={artifact.artifact_id}
+            className={selected?.artifact_id === artifact.artifact_id ? "active" : ""}
+            onClick={() => onSelect(artifact)}
+          >
+            <FileText size={14} />
+            <span><b>{artifact.path.split("/").pop()}</b><small>{artifact.media_type || "unknown"} · {formatBytes(artifact.size_bytes)}</small></span>
+          </button>
+        ))}
+      </div>
+      <div className="artifact-preview">
+        {selected ? (
+          <div className="preview-head">
+            <span>{selected.path}</span>
+            <small>
+              {selected.media_type || "unknown"} · {formatBytes(selected.size_bytes)}
+              {detail?.content_url || selected.content_url ? (
+                <> · <a href={projectUrl(detail?.content_url || selected.content_url!, projectId)} target="_blank" rel="noreferrer">raw</a></>
+              ) : null}
+            </small>
+          </div>
+        ) : null}
+        {detail ? <ArtifactPreview artifact={selected!} detail={detail} projectId={projectId} /> : <PaneLoading />}
+      </div>
+    </div>
+  );
+}
+
+function ArtifactPreview({ artifact, detail, projectId }: { artifact: Artifact; detail: ArtifactDetailPayload; projectId: string }) {
+  const preview = asRecord(detail.preview);
+  const media = detail.artifact?.media_type || artifact.media_type || "";
+  const imageUrl = detail.data_url || detail.content_url || valueText(preview?.data_url || preview?.content_url);
+  const text = detail.text ?? detail.content ?? (typeof preview?.text === "string" ? preview.text : undefined) ?? (typeof detail.preview === "string" ? detail.preview : undefined);
+  const columns = detail.columns || (Array.isArray(preview?.columns) ? preview.columns.map(String) : undefined);
+  const rows = detail.rows || (Array.isArray(preview?.rows) ? preview.rows as unknown[][] : undefined);
+  const json = detail.json ?? preview?.json ?? preview?.value;
+
+  if (media.startsWith("image/") && imageUrl !== "not recorded") {
+    return <div className="image-preview"><img src={projectUrl(imageUrl, projectId)} alt={artifact.path} /></div>;
+  }
+  if (columns?.length && rows) {
+    return (
+      <div className="table-preview">
+        <table><thead><tr>{columns.map((column) => <th key={column}>{column}</th>)}</tr></thead>
+          <tbody>{rows.map((row, index) => (
+            <tr key={index}>{columns.map((column, cell) => <td key={column}>{valueText(Array.isArray(row) ? row[cell] : (row as Record<string, unknown>)[column])}</td>)}</tr>
+          ))}</tbody>
+        </table>
+        {detail.truncated || preview?.truncated ? <div className="preview-note">Bounded preview · additional rows omitted.</div> : null}
+      </div>
+    );
+  }
+  if (json !== undefined || (
+    detail.preview && typeof detail.preview === "object" && !preview?.rows && preview?.kind !== "binary"
+  )) {
+    return <pre className="raw-preview">{JSON.stringify(json ?? detail.preview, null, 2)}</pre>;
+  }
+  if (text !== undefined) return <pre className="raw-preview">{text}</pre>;
+  if (preview?.kind === "binary") {
+    return (
+      <div className="binary-preview">
+        <FileText size={28} />
+        <b>Preview unavailable</b>
+        <span>{media || "binary file"} · {formatBytes(artifact.size_bytes)}</span>
+        {artifact.metadata ? <pre>{JSON.stringify(artifact.metadata, null, 2)}</pre> : null}
+      </div>
+    );
+  }
+  return (
+    <div className="binary-preview">
+      <FileText size={28} />
+      <b>Preview unavailable</b>
+      <span>{media || "binary file"} · {formatBytes(artifact.size_bytes)}</span>
+      {detail.metadata ? <pre>{JSON.stringify(detail.metadata, null, 2)}</pre> : null}
+    </div>
+  );
+}
+
+function RunLogs({ run, projectId }: { run: Run; projectId: string }) {
+  const [stream, setStream] = useState<"stdout" | "stderr">("stdout");
+  const [buffers, setBuffers] = useState({ stdout: "", stderr: "" });
+  const [states, setStates] = useState({ stdout: false, stderr: false });
+  const [error, setError] = useState("");
+  const offsets = useRef({ stdout: 0, stderr: 0 });
+  const terminal = useRef({ stdout: false, stderr: false });
+  const viewRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    offsets.current = { stdout: 0, stderr: 0 };
+    terminal.current = { stdout: false, stderr: false };
+    setBuffers({ stdout: "", stderr: "" });
+    setStates({ stdout: false, stderr: false });
+    setError("");
+  }, [run.run_id]);
+
+  useEffect(() => {
+    let stopped = false;
+    let timer = 0;
+    const pull = async () => {
+      try {
+        const offset = offsets.current[stream];
+        const data = await api<RunLogPayload>(
+          projectUrl(`/api/runs/${encodeURIComponent(run.run_id)}/logs/${stream}?offset=${offset}`, projectId),
+        );
+        if (stopped) return;
+        if (data.text) setBuffers((current) => ({ ...current, [stream]: current[stream] + data.text }));
+        offsets.current[stream] = data.next_offset;
+        terminal.current[stream] = data.terminal;
+        setStates((current) => ({ ...current, [stream]: data.terminal }));
+        setError("");
+        if (!data.terminal) timer = window.setTimeout(pull, 1000);
+      } catch (caught) {
+        if (!stopped) setError(caught instanceof Error ? caught.message : String(caught));
+      }
+    };
+    if (!terminal.current[stream]) void pull();
+    return () => {
+      stopped = true;
+      window.clearTimeout(timer);
+    };
+  }, [projectId, run.run_id, stream]);
+
+  useEffect(() => {
+    if (viewRef.current) viewRef.current.scrollTop = viewRef.current.scrollHeight;
+  }, [buffers, stream]);
+
+  return (
+    <div className="log run-log">
+      <div className="logbar">
+        <div className="stream-tabs">
+          {(["stdout", "stderr"] as const).map((item) => (
+            <button key={item} className={stream === item ? "active" : ""} onClick={() => setStream(item)}>{item}</button>
+          ))}
+        </div>
+        <span className={states[stream] ? "idle" : "live"}><span className="d" />{states[stream] ? "terminal" : "polling by byte offset"}</span>
+      </div>
+      {error ? <div className="pane-error"><AlertTriangle size={14} /> {error}</div> : null}
+      <div className="logview" ref={viewRef}>
+        {buffers[stream] || <span className="dim">waiting for {stream}…</span>}
+        {!states[stream] ? <span className="cursor" /> : null}
+      </div>
+    </div>
+  );
+}
+
+function RunReport({ data }: { data: ReportPayload }) {
+  const [raw, setRaw] = useState(false);
+  return (
+    <div className="editor-shell">
+      <div className="ptools">
+        <span className="tool-label">{data.path || "report"}</span>
+        <div className="right"><button className="btn sm" onClick={() => setRaw(!raw)}>{raw ? "Rendered" : "Raw"}</button></div>
+      </div>
+      {raw ? <pre className="raw-preview report-raw">{data.text}</pre> : <MarkdownViewer path="" text={data.text} />}
+    </div>
+  );
+}
+
+function RunDiff({ data }: { data: RunDiffPayload }) {
+  const text = data.unified_diff || data.diff || "";
+  const summary = Array.isArray(data.summary)
+    ? data.summary.map((item, index) => [`change ${index + 1}`, item] as const)
+    : Object.entries(data.summary || data.changes || {});
+  return (
+    <div className="editor-shell">
+      <div className="diff-summary">
+        {summary.map(([label, value]) => (
+          <span key={label}>
+            <b>{humanize(label)}</b>
+            {typeof value === "boolean" ? (value ? "changed" : "unchanged") : valueText(value)}
+          </span>
+        ))}
+        {data.changed_files?.map((file) => <span key={file}><b>File</b>{file}</span>)}
+        {!summary.length && !data.changed_files?.length ? <span>Semantic summary unavailable.</span> : null}
+      </div>
+      <UnifiedDiff text={text} />
+    </div>
+  );
+}
+
+function UnifiedDiff({ text }: { text: string }) {
+  if (!text) return <Empty title="No source changes">The selected snapshot matches its parent.</Empty>;
+  let oldLine: number | null = null;
+  let newLine: number | null = null;
+  return (
+    <div className="diff">
+      {text.split("\n").map((line, index) => {
+        const hunk = line.match(/^@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+        let oldNumber: number | null = null;
+        let newNumber: number | null = null;
+        if (hunk) {
+          oldLine = Number(hunk[1]);
+          newLine = Number(hunk[2]);
+        } else if (oldLine !== null && newLine !== null && !line.startsWith("\\")) {
+          if (line.startsWith("+") && !line.startsWith("+++")) newNumber = newLine++;
+          else if (line.startsWith("-") && !line.startsWith("---")) oldNumber = oldLine++;
+          else if (!line.startsWith("---") && !line.startsWith("+++")) {
+            oldNumber = oldLine++;
+            newNumber = newLine++;
+          }
+        }
+        const kind = hunk || line.startsWith("---") || line.startsWith("+++")
+          ? "hunk"
+          : line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : "ctx";
+        return (
+          <div className={`dl ${kind}`} key={index}>
+            <span className="diff-ln">{oldNumber ?? ""}</span>
+            <span className="diff-ln">{newNumber ?? ""}</span>
+            <span className="diff-code">{line || " "}</span>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Viewer({
+  panel,
+  projectId,
+  active,
+  onSaveInstruction,
+  onSaveParams,
+  onClose,
+}: {
+  panel: Panel;
+  projectId: string;
+  active: boolean;
   onSaveInstruction: (text: string) => Promise<InstructionPayload>;
   onSaveParams: (params: Record<string, unknown>) => Promise<ParamsPayload>;
   onClose: () => void;
 }) {
   const title =
-    panel.kind === "script"
-      ? <><span className="muted">{panel.run.run_id}</span> / script</>
-      : panel.kind === "report"
-        ? <><span className="muted">{panel.run.run_id}</span> / report</>
-        : panel.kind === "instruction"
-          ? "Report instruction"
-          : panel.kind === "params"
-            ? "Params · script/params.json"
-            : "Live log";
+    panel.kind === "instruction"
+      ? "Report instruction"
+      : panel.kind === "params"
+        ? "Params · script/params.json"
+        : "Worker log";
   const Icon =
-    panel.kind === "report" || panel.kind === "instruction"
+    panel.kind === "instruction"
       ? FileText
       : panel.kind === "log"
         ? Terminal
@@ -1622,18 +2305,6 @@ function Viewer({
         </button>
       </div>
       <div className="panel-body">
-        {panel.kind === "script" ? (
-          <SourceEditor
-            data={panel.data}
-            theme={theme}
-            onSave={(snapshotId, path, text, saveAs) =>
-              onSaveScript(panel.run.run_id, snapshotId, path, text, saveAs)
-            }
-          />
-        ) : null}
-        {panel.kind === "report" ? (
-          <MarkdownViewer path={panel.data.path} text={panel.data.text} />
-        ) : null}
         {panel.kind === "instruction" ? (
           <TextEditor
             value={panel.data.text}
@@ -1645,7 +2316,7 @@ function Viewer({
           <ParamsEditor data={panel.data} onSave={onSaveParams} />
         ) : null}
         {panel.kind === "log" ? (
-          <LogViewer projectId={projectId} active={active} />
+          <LogViewer projectId={projectId} active={active} kind="worker" />
         ) : null}
       </div>
     </aside>
@@ -1938,9 +2609,11 @@ function MarkdownViewer({ path, text }: { path: string; text: string }) {
 function LogViewer({
   projectId,
   active,
+  kind,
 }: {
   projectId: string;
   active: boolean;
+  kind: "worker" | "agent";
 }) {
   const [log, setLog] = useState("");
   const viewRef = useRef<HTMLDivElement>(null);
@@ -1973,9 +2646,9 @@ function LogViewer({
     <div className="log">
       <div className="logbar">
         {active ? (
-          <span className="live"><span className="d" />active run · streaming stdout</span>
+          <span className="live"><span className="d" />active {kind} process · outer process log</span>
         ) : (
-          <span className="idle">no active run · showing the last job&apos;s output</span>
+          <span className="idle">no active {kind} process · showing its last outer log</span>
         )}
         <span className="log-project">{projectId}</span>
       </div>

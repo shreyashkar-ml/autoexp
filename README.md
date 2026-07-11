@@ -127,7 +127,7 @@ Common edits:
 
 Your experiment receives a JSON context file through `${CTX}`. Read paths such as `output_dir`, `logs_dir`, and `script_params_path` from that context instead of hardcoding locations.
 
-If the same inputs produce the same outputs again, Autoexp returns the existing run instead of adding a duplicate row. Rerunning an earlier run refreshes that run's outputs and logs in place.
+Every execution gets a new run ID. When the same pinned inputs produce the same output, Autoexp keeps both runs and links the newer run to the result it reproduces. Rerunning an earlier run creates a child run from its pinned source without changing the parent.
 
 ## Browser UI
 
@@ -318,7 +318,15 @@ or:
 "runner": "docker"
 ```
 
-`app.env` values are passed to the selected runner but remain local and excluded from Autoexp's saved source history. Report context exposes environment variable names, never their secret values.
+Declare versioned inputs that live outside the source snapshot when you have them:
+
+```json
+"external_inputs": [
+  {"name": "DATASET_PATH", "kind": "file", "path": "/data/eval.jsonl", "version": "eval-v3"}
+]
+```
+
+`app.env` values are passed to the selected runner but remain local and excluded from Autoexp's saved source history. Autoexp records key presence and declared versions or safe file fingerprints, never secret values. Undeclared or unversioned inputs appear as reproducibility warnings.
 
 ## Common commands
 

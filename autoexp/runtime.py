@@ -1,15 +1,27 @@
 import json
-import subprocess
-import sys
 import tempfile
+from collections import Counter
 from pathlib import Path
 
-from .reports import artifact_files, report_instruction, write_report_bundle
+from .artifacts import (
+    artifact_content,
+    index_report_artifacts,
+    list_artifacts,
+    read_log,
+)
+from .provenance import (
+    create_trigger,
+    get_trigger,
+    reproducibility_summary,
+    reproduction_state,
+)
+from .reports import report_instruction, write_report_bundle
 from .runner import docker_ready
 from .runs import get_run, source_root_for_run, restore_run_state, run_stage_commit
 from .snapshots import (
     capture_source_tree,
     capture_workspace,
+    diff_snapshots,
     get_snapshot,
     materialize_snapshot,
 )
@@ -28,7 +40,6 @@ from .workspace import (
     project_entry,
     read_json,
     resolve_root,
-    run_dir_for,
     script_manifest,
     source_paths,
     write_json,
@@ -54,38 +65,32 @@ def json_value(value):
 # ======================================================================
 
 def report_path_for_run(run, root):
-    """The run's report file: an explicit one, then known entry points, then any file."""
-    root = Path(root)
+    """The primary indexed report path, retaining the legacy project-relative shape."""
     path = run.get("report_path")
-    if path and (root / path).is_file():
+    if path:
         return path
-
-    report_dir = run_dir_for(run, root) / "report"
-    for candidate in ("report.md", "report.txt", "index.md"):
-        if (report_dir / candidate).is_file():
-            return (report_dir / candidate).relative_to(root).as_posix()
-
-    for item in sorted(report_dir.glob("*")):
-        if item.is_file() and item.name != "report_bundle.json":
-            return item.relative_to(root).as_posix()
-    return ""
+    reports = list_artifacts(run["run_id"], root=root, category="report")
+    artifact = _primary_report(reports)
+    return f"{run['run_dir'].rstrip('/')}/{artifact['path']}" if artifact else ""
 
 
 def output_files_for_run(run, root):
-    output_dir = run_dir_for(run, root) / "output"
-    if not output_dir.is_dir():
-        return []
-    return [
-        item.relative_to(output_dir).as_posix()
-        for item in sorted(output_dir.rglob("*"))
-        if item.is_file()
-    ]
+    return [item["path"] for item in list_artifacts(run["run_id"], root=root, category="output")]
+
+
+def _primary_report(artifacts):
+    preferred = ("report/report.md", "report/report.txt", "report/index.md")
+    by_path = {item["path"]: item for item in artifacts}
+    return next(
+        (by_path[path] for path in preferred if path in by_path),
+        next((item for item in artifacts if not item["path"].endswith("report_bundle.json")), None),
+    )
 
 
 def run_row(row, root):
     """Decorate a stored run row with its resolved report path and output listing."""
     run = dict(row)
-    run["stage_status"] = json_value(run["stage_status"])
+    run["stage_status"] = json_value(run.get("stage_status"))
     run["report_path"] = report_path_for_run(run, root)
     run["output_files"] = output_files_for_run(run, root)
     return run
@@ -93,45 +98,86 @@ def run_row(row, root):
 
 def list_runs(limit=20, root=None):
     root = resolve_root(root)
+    limit = max(1, min(int(limit), 200))
     conn = db(root)
-    rows = conn.execute("select * from runs order by created_at desc limit ?", (limit,)).fetchall()
+    rows = conn.execute(
+        "select * from runs order by created_at desc, rowid desc limit ?", (limit,)
+    ).fetchall()
     conn.close()
     return [run_row(row, root) for row in rows]
 
 
 def read_script_params(root=None):
     root = resolve_root(root)
-    schema_path = root / "script" / "params.schema.json"
-    params_path = root / "script" / "params.json"
+    schema_path = _safe_script_path(root / "script", "params.schema.json")
+    params_path = _safe_script_path(root / "script", "params.json")
     return {
         "schema": read_json(schema_path) if schema_path.exists() else None,
         "params": read_json(params_path) if params_path.exists() else None,
     }
 
 
-def write_script_params(params, root=None):
+def write_script_params(params, root=None, *, trigger_kind=None, actor_name=None):
     if not isinstance(params, dict):
         raise ValueError("params must be a JSON object")
     root = resolve_root(root)
     init_db(root)
-    write_json(root / "script" / "params.json", params)
-    snapshot = capture_workspace(root, label="Params update")
+    write_json(_safe_script_path(root / "script", "params.json"), params)
+    trigger = create_trigger(
+        trigger_kind,
+        root=root,
+        actor_name=actor_name,
+        metadata={"operation": "params_update"},
+    ) if trigger_kind else None
+    snapshot = capture_workspace(
+        root,
+        label="Params update",
+        created_by_trigger_id=trigger["trigger_id"] if trigger else None,
+    )
     return {**read_script_params(root), "snapshot": snapshot}
+
+
+def _safe_script_path(script_root, rel):
+    script_root = Path(script_root)
+    if script_root.is_symlink():
+        raise ValueError("script directory must not be a symlink")
+    resolved_root = script_root.resolve()
+    path = script_root / rel
+    cursor = script_root
+    for part in Path(rel).parts:
+        cursor /= part
+        if cursor.is_symlink():
+            raise ValueError(f"script path must not contain symlinks: {rel}")
+    if not path.resolve(strict=False).is_relative_to(resolved_root):
+        raise ValueError(f"script path must stay inside script/: {rel}")
+    return path
 
 
 def run_source(run_id, root=None):
     """List a run's source files (excluding manifest/params), with one selected."""
     root = resolve_root(root)
     run = get_run(run_id, root)
-    source_root = source_root_for_run(run, root)
-    base = source_root / "script"
-    skip = {"stage.json", "params.json", "params.schema.json"}
+    def read_files(source_root):
+        base = source_root / "script"
+        if base.is_symlink() or not base.is_dir():
+            raise ValueError("snapshot script directory is invalid")
+        skip = {"stage.json", "params.json", "params.schema.json"}
+        files = []
+        for item in sorted(base.rglob("*")):
+            rel = item.relative_to(base)
+            if item.is_symlink() or not item.is_file() or rel.as_posix() in skip:
+                continue
+            safe = _safe_script_path(base, rel)
+            files.append({"path": rel.as_posix(), "text": safe.read_text(errors="replace")})
+        return files
 
-    files = []
-    for item in sorted(base.rglob("*")):
-        rel = item.relative_to(base).as_posix()
-        if item.is_file() and rel not in skip:
-            files.append({"path": rel, "text": item.read_text(errors="replace")})
+    if run.get("source_snapshot_id"):
+        with tempfile.TemporaryDirectory(prefix="autoexp-run-source-") as tmp:
+            source_root = Path(tmp)
+            materialize_snapshot(run["source_snapshot_id"], source_root, root)
+            files = read_files(source_root)
+    else:
+        files = read_files(source_root_for_run(run, root))
 
     wanted = run.get("script_name") or ""
     selected = next((f["path"] for f in files if f["path"] == wanted), "")
@@ -142,31 +188,136 @@ def run_source(run_id, root=None):
 
 def run_report(run_id, root=None):
     root = resolve_root(root)
-    run = get_run(run_id, root)
-    path = report_path_for_run(run, root)
-    if not path:
-        return {"run_id": run_id, "path": "", "text": ""}
-    return {"run_id": run_id, "path": path, "text": (root / path).read_text(errors="replace")}
+    index_report_artifacts(run_id, root)
+    artifact = _primary_report(list_artifacts(run_id, root=root, category="report"))
+    if not artifact:
+        return {"run_id": run_id, "path": "", "artifact": None, "text": ""}
+    artifact, content = artifact_content(run_id, artifact["artifact_id"], root)
+    return {
+        "run_id": run_id,
+        "path": artifact["path"],
+        "artifact": artifact,
+        "text": content.decode(errors="replace"),
+    }
 
 
 def read_output_files(run_id, root=None):
     root = resolve_root(root)
-    run = get_run(run_id, root)
-    return {"run_id": run_id, "files": artifact_files(run_dir_for(run, root) / "output")}
+    return {"run_id": run_id, "files": list_artifacts(run_id, root=root, category="output")}
 
 
 def read_logs(run_id, root=None):
     root = resolve_root(root)
-    run = get_run(run_id, root)
-    return {"run_id": run_id, "files": artifact_files(run_dir_for(run, root) / "logs")}
+    streams = [read_log(run_id, stream, root=root) for stream in ("stdout", "stderr")]
+    return {
+        "run_id": run_id,
+        "streams": streams,
+        "files": [
+            {"path": f"script.{stream['stream']}.log", "text": stream["text"]}
+            for stream in streams
+        ],
+    }
 
 
 def read_report_bundle(run_id, root=None):
     root = resolve_root(root)
-    path = root / "runs" / run_id / "report" / "report_bundle.json"
-    if not path.is_file():
-        write_report_bundle(run_id, root)
-    return read_json(path)
+    return write_report_bundle(run_id, root)
+
+
+def _run_summary(run):
+    if not run:
+        return None
+    keys = (
+        "run_id", "status", "source_snapshot_id", "parent_run_id", "created_at",
+        "started_at", "ended_at", "output_hash", "capsule_hash",
+    )
+    return {key: run.get(key) for key in keys}
+
+
+def run_overview(run_id, root=None):
+    """Aggregate the indexed evidence needed by the run Overview."""
+    root = resolve_root(root)
+    run = run_row(get_run(run_id, root), root)
+    snapshot = get_snapshot(run["source_snapshot_id"], root) if run.get("source_snapshot_id") else None
+    parent = get_run(run["parent_run_id"], root) if run.get("parent_run_id") else None
+    trigger = get_trigger(run["trigger_id"], root) if run.get("trigger_id") else None
+    artifacts = list_artifacts(run_id, root=root)
+    counts = Counter(item["category"] for item in artifacts)
+    return {
+        "run": run,
+        "source_snapshot": snapshot,
+        "parent_run": _run_summary(parent),
+        "trigger": trigger,
+        "reproducibility": reproducibility_summary(run_id, root),
+        "artifact_summary": {
+            "total": len(artifacts),
+            "output": counts["output"],
+            "log": counts["log"],
+            "report": counts["report"],
+            "by_category": dict(counts),
+            "artifacts": artifacts,
+        },
+        "reproduction": reproduction_state(run_id, root),
+    }
+
+
+def run_diff(run_id, root=None, *, base_run_id=None, base_snapshot_id=None):
+    """Compare a run's pinned snapshot with an explicit or lineage-derived base."""
+    root = resolve_root(root)
+    run = get_run(run_id, root)
+    snapshot_id = run.get("source_snapshot_id")
+    if not snapshot_id:
+        raise ValueError(f"run {run_id} has no source snapshot")
+    snapshot = get_snapshot(snapshot_id, root)
+
+    if base_run_id:
+        base_snapshot_id = get_run(base_run_id, root).get("source_snapshot_id")
+    elif not base_snapshot_id and run.get("parent_run_id"):
+        base_run_id = run["parent_run_id"]
+        base_snapshot_id = get_run(base_run_id, root).get("source_snapshot_id")
+    elif not base_snapshot_id:
+        base_snapshot_id = snapshot.get("parent_snapshot_id")
+
+    if not base_snapshot_id:
+        return {
+            "run_id": run_id,
+            "snapshot_id": snapshot_id,
+            "base_run_id": base_run_id,
+            "base_snapshot_id": None,
+            "available": False,
+            "changed_files": [],
+            "changes": {
+                "code": False,
+                "params": False,
+                "manifest": False,
+                "runtime": False,
+            },
+            "diff": "",
+        }
+
+    base = get_snapshot(base_snapshot_id, root)
+    diff = diff_snapshots(base_snapshot_id, snapshot_id, root)
+    changed_files = autoexp_git(
+        ["diff", "--name-only", base["git_commit"], snapshot["git_commit"], "--", *source_paths(root)],
+        root=root,
+        capture=True,
+        check=False,
+    ).splitlines()
+    return {
+        "run_id": run_id,
+        "snapshot_id": snapshot_id,
+        "base_run_id": base_run_id,
+        "base_snapshot_id": base_snapshot_id,
+        "available": True,
+        "changed_files": changed_files,
+        "changes": {
+            "code": base["script_hash"] != snapshot["script_hash"],
+            "params": base["params_hash"] != snapshot["params_hash"],
+            "manifest": base["manifest_hash"] != snapshot["manifest_hash"],
+            "runtime": base["runtime_config_hash"] != snapshot["runtime_config_hash"],
+        },
+        "diff": diff,
+    }
 
 
 # ======================================================================
@@ -185,10 +336,14 @@ def next_script_version(source_root, rel):
             base = prefix
 
     highest = 1  # a bare `base` (no suffix) counts as version 1
-    for script in (Path(source_root) / "script").rglob("*"):
-        if not script.is_file():
+    script_root = Path(source_root) / "script"
+    if script_root.is_symlink() or not script_root.is_dir():
+        raise ValueError("snapshot script directory is invalid")
+    for script in script_root.rglob("*"):
+        if script.is_symlink() or not script.is_file():
             continue
-        existing = script.relative_to(Path(source_root) / "script")
+        existing = script.relative_to(script_root)
+        _safe_script_path(script_root, existing)
         if existing.parent != parent or existing.suffix != suffix:
             continue
         if existing.stem.startswith(f"{base}_v"):
@@ -199,11 +354,15 @@ def next_script_version(source_root, rel):
     return (parent / f"{base}_v{highest + 1}{suffix}").as_posix()
 
 
-def _source_snapshot(root, source_run_id=None, source_snapshot_id=None):
+def _source_snapshot(root, source_run_id=None, source_snapshot_id=None, trigger_id=None):
     if source_snapshot_id:
         return get_snapshot(source_snapshot_id, root)
     if not source_run_id:
-        return capture_workspace(root, label="Script edit base")
+        return capture_workspace(
+            root,
+            label="Script edit base",
+            created_by_trigger_id=trigger_id,
+        )
 
     run = get_run(source_run_id, root)
     if run.get("source_snapshot_id"):
@@ -214,6 +373,7 @@ def _source_snapshot(root, source_run_id=None, source_snapshot_id=None):
         root,
         parent_commit=run_stage_commit(run),
         label=f"Recovered source for run {source_run_id}",
+        created_by_trigger_id=trigger_id,
     )
     conn = db(root)
     conn.execute(
@@ -232,12 +392,21 @@ def save_script_file(
     source_run_id=None,
     save_as=None,
     source_snapshot_id=None,
+    trigger_kind=None,
+    actor_name=None,
 ):
     """Derive an edited source snapshot without creating an execution row."""
     root = resolve_root(root)
     init_db(root)
     rel = ensure_within_project(path, "path must stay inside script/")
-    base = _source_snapshot(root, source_run_id, source_snapshot_id)
+    trigger = create_trigger(
+        trigger_kind,
+        root=root,
+        actor_name=actor_name,
+        metadata={"operation": "script_edit"},
+    ) if trigger_kind else None
+    trigger_id = trigger["trigger_id"] if trigger else None
+    base = _source_snapshot(root, source_run_id, source_snapshot_id, trigger_id)
 
     with tempfile.TemporaryDirectory(prefix="autoexp-script-edit-") as tmp:
         source_root = Path(tmp)
@@ -247,20 +416,25 @@ def save_script_file(
             if save_as
             else Path(next_script_version(source_root, rel))
         )
-        source = source_root / "script" / rel
-        if not source.is_file():
+        script_root = source_root / "script"
+        source = _safe_script_path(script_root, rel)
+        if source.is_symlink() or not source.is_file():
             raise ValueError(f"unknown script file: {rel.as_posix()}")
+        edited = _safe_script_path(script_root, saved_rel)
         if saved_rel != rel:
             source.unlink()
-        edited = source_root / "script" / saved_rel
         edited.parent.mkdir(parents=True, exist_ok=True)
         edited.write_text(text)
-        _retarget_manifest(source_root / "script" / "stage.json", rel, saved_rel)
+        manifest = _safe_script_path(script_root, "stage.json")
+        if manifest.is_symlink() or not manifest.is_file():
+            raise ValueError("snapshot stage.json is invalid")
+        _retarget_manifest(manifest, rel, saved_rel)
         snapshot = capture_source_tree(
             source_root,
             root,
             parent_snapshot_id=base["snapshot_id"],
             label=f"Edited {saved_rel.as_posix()}",
+            created_by_trigger_id=trigger_id,
         )
     return {"path": saved_rel.as_posix(), "snapshot": snapshot}
 
@@ -268,6 +442,8 @@ def save_script_file(
 def _retarget_manifest(manifest_path, old_rel, new_rel):
     """Point stage.json's name/command at the newly saved script file."""
     manifest = read_json(manifest_path)
+    if not isinstance(manifest, dict):
+        raise ValueError("script/stage.json must contain a JSON object")
     command = manifest.get("command", "")
     for candidate in (old_rel.as_posix(), old_rel.name, str(manifest.get("name") or "")):
         if candidate and candidate in command:
@@ -297,20 +473,26 @@ def diff_runs(run_a, run_b, root=None):
     root = resolve_root(root)
     a = get_run(run_a, root)
     b = get_run(run_b, root)
+    if a.get("source_snapshot_id") and b.get("source_snapshot_id"):
+        return diff_snapshots(a["source_snapshot_id"], b["source_snapshot_id"], root)
     return autoexp_git(
         ["diff", run_stage_commit(a), run_stage_commit(b), "--", *source_paths(root)],
         root=root, capture=True, check=False,
     )
 
 
-def run_autoexp(run_id=None, root=None):
-    """Invoke `autoexp run` as a subprocess and return its result plus the run list."""
+def run_autoexp(run_id=None, root=None, *, snapshot_id=None, trigger_kind="mcp", actor_name="autoexp-mcp"):
+    """Execute synchronously through the shared lifecycle."""
+    from .execution import execute
+
     root = resolve_root(root)
-    proc = subprocess.run(
-        [sys.executable, "-m", "autoexp", "run", *([run_id] if run_id else [])],
-        cwd=root, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    return execute(
+        root=root,
+        run_id=run_id,
+        snapshot_id=snapshot_id,
+        trigger_kind=trigger_kind,
+        actor_name=actor_name,
     )
-    return {"returncode": proc.returncode, "stdout": proc.stdout, "stderr": proc.stderr, "runs": list_runs(root=root)}
 
 
 # ======================================================================

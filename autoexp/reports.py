@@ -21,10 +21,25 @@ Write generated report files under `runs/<run_id>/report/`. Prefer `runs/<run_id
 Do not assume access to secret values. The bundle intentionally includes environment variable names only. Base the report only on the bundled artifacts and the user's request."""
 
 
+def _safe_path(base, rel, message=INSIDE_PROJECT_MSG):
+    base = Path(base).resolve()
+    path = base / rel
+    if path.is_symlink() or not path.resolve().is_relative_to(base):
+        raise ValueError(message)
+    return path
+
+
+def _config(root):
+    config = read_json(_safe_path(root, PROJECT_CONFIG))
+    if not isinstance(config, dict):
+        raise ValueError("autoexp.json must contain a JSON object")
+    return config
+
+
 def app_env_keys(root=None):
     """Names of the variables declared in app.env (values are never returned)."""
     root = resolve_root(root)
-    path = root / APP_ENV
+    path = _safe_path(root, APP_ENV, "app.env must stay inside the autoexp project")
     if not path.exists():
         return []
     keys = []
@@ -38,9 +53,9 @@ def app_env_keys(root=None):
 def report_instruction(root=None):
     """Read the editable, project-specific report guidance."""
     root = resolve_root(root)
-    configured = read_json(root / PROJECT_CONFIG).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
+    configured = _config(root).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
     path = ensure_within_project(configured, INSIDE_PROJECT_MSG)
-    target = root / path
+    target = _safe_path(root, path)
     if not target.is_file():
         raise FileNotFoundError(f"missing report instruction file: {configured}")
     text = target.read_text().rstrip()
@@ -65,11 +80,12 @@ def set_report_instruction(path, root=None):
         except ValueError:
             raise ValueError(INSIDE_PROJECT_MSG)
     path = ensure_within_project(path, INSIDE_PROJECT_MSG)
-    if not (root / path).is_file():
+    if not _safe_path(root, path).is_file():
         raise FileNotFoundError(f"missing report instruction file: {path}")
-    cfg = read_json(root / PROJECT_CONFIG)
+    config_path = _safe_path(root, PROJECT_CONFIG)
+    cfg = _config(root)
     cfg["report_instruction_file"] = path.as_posix()
-    write_json(root / PROJECT_CONFIG, cfg)
+    write_json(config_path, cfg)
     return path.as_posix()
 
 
@@ -78,42 +94,19 @@ def write_report_instruction(text, root=None):
     if not isinstance(text, str):
         raise ValueError("text must be a string")
     root = resolve_root(root)
-    cfg = read_json(root / PROJECT_CONFIG)
+    config_path = _safe_path(root, PROJECT_CONFIG)
+    cfg = _config(root)
     path = ensure_within_project(
         cfg.get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS,
         INSIDE_PROJECT_MSG,
     )
-    target = root / path
+    target = _safe_path(root, path)
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(text)
     if cfg.get("report_instruction_file") != path.as_posix():
         cfg["report_instruction_file"] = path.as_posix()
-        write_json(root / PROJECT_CONFIG, cfg)
+        write_json(config_path, cfg)
     return report_instruction(root)
-
-
-def artifact_files(base):
-    """Every file under base, as {path, text} relative to base."""
-    base = Path(base)
-    if not base.exists():
-        return []
-    return [
-        {"path": item.relative_to(base).as_posix(), "text": item.read_text(errors="replace")}
-        for item in sorted(base.rglob("*"))
-        if item.is_file()
-    ]
-
-
-def artifact_paths(base, root):
-    """Every file under base, as project-relative path strings."""
-    base = Path(base)
-    if not base.exists():
-        return []
-    return [
-        item.relative_to(root).as_posix()
-        for item in sorted(base.rglob("*"))
-        if item.is_file()
-    ]
 
 
 def write_report_bundle(run_id, root=None):
@@ -124,10 +117,14 @@ def write_report_bundle(run_id, root=None):
     if not run_dir.exists():
         raise FileNotFoundError(f"missing run directory: {run_dir.relative_to(root)}")
     source_root = source_root_for_run(run, root)
-    params_path = source_root / "script" / "params.json"
-    report_dir = run_dir / "report"
-    bundle_path = report_dir / "report_bundle.json"
+    params_path = _safe_path(source_root, "script/params.json", "run params path is unsafe")
+    report_dir = _safe_path(run_dir, "report", "run report directory is unsafe")
+    bundle_path = _safe_path(report_dir, "report_bundle.json", "report bundle path is unsafe")
     report_dir.mkdir(parents=True, exist_ok=True)
+    from .artifacts import list_artifacts
+
+    indexed = list_artifacts(run_id, root)
+    run_prefix = run_dir.relative_to(root).as_posix()
     bundle = {
         "bundle_path": bundle_path.relative_to(root).as_posix(),
         "run_id": run_id,
@@ -139,8 +136,16 @@ def write_report_bundle(run_id, root=None):
         "script_params": params_path.relative_to(root).as_posix() if params_path.exists() else "",
         "run": {key: run.get(key) for key in ("status", "created_at", "output_hash", "capsule_hash")},
         "artifacts": {
-            "output": artifact_paths(run_dir / "output", root),
-            "logs": artifact_paths(run_dir / "logs", root),
+            "output": [
+                f"{run_prefix}/{item['path']}"
+                for item in indexed
+                if item["category"] == "output"
+            ],
+            "logs": [
+                f"{run_prefix}/{item['path']}"
+                for item in indexed
+                if item["category"] == "log"
+            ],
         },
     }
     write_json(bundle_path, bundle)

@@ -1,22 +1,20 @@
 import json
+import ipaddress
 import mimetypes
-import os
-import signal
-import subprocess
+import sqlite3
 import sys
-import threading
-import uuid
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
+from .artifacts import artifact_content, artifact_detail, list_artifacts, read_log
+from .jobs import RunManager, recover_stranded
 from .reports import report_instruction, write_report_instruction
 from .autoresearch import for_project as research_for_project
 from .store import init_db, require_autoexp_git_repo
 from .workspace import (
     is_project_root,
     list_registered_projects,
-    now,
     project_id,
     project_mode,
     register_project,
@@ -25,6 +23,8 @@ from .workspace import (
 from .runtime import (
     list_runs,
     read_script_params,
+    run_diff,
+    run_overview,
     run_report,
     run_source,
     save_script_file,
@@ -44,97 +44,11 @@ def clamp(raw, default=20, maximum=200):
         return default
 
 
-# ======================================================================
-#  Run lifecycle: one background `autoexp run` per project
-# ======================================================================
-
-class RunManager:
-    """Owns at most one running experiment subprocess for a single project."""
-
-    def __init__(self, workspace_root):
-        self.workspace_root = Path(workspace_root)
-        self.lock = threading.Lock()
-        self.job = None
-
-    def _payload(self):
-        """Snapshot of the current job, refreshing terminal status from the process."""
-        if not self.job:
-            return {"active": False, "job": None}
-
-        returncode = self.job["proc"].poll()
-        if returncode is not None and self.job["status"] in {"running", "canceling"}:
-            if self.job["status"] == "canceling":
-                self.job["status"] = "canceled"
-            else:
-                self.job["status"] = "success" if returncode == 0 else "failed"
-            self.job["returncode"] = returncode
-            self.job["ended_at"] = now()
-
-        public_keys = ("job_id", "pid", "status", "started_at", "ended_at", "returncode", "log_path")
-        return {
-            "active": self.job["status"] in {"running", "canceling"},
-            "job": {key: self.job[key] for key in public_keys},
-        }
-
-    def active(self):
-        with self.lock:
-            return self._payload()
-
-    def start(self, run_id=None):
-        with self.lock:
-            current = self._payload()
-            if current["active"]:
-                return False, current
-
-            job_id = uuid.uuid4().hex
-            job_dir = self.workspace_root / "server" / "jobs"
-            job_dir.mkdir(parents=True, exist_ok=True)
-            log_path = job_dir / f"{job_id}.log"
-            cmd = [sys.executable, "-m", "autoexp", "run", *([run_id] if run_id else [])]
-            with log_path.open("w") as log:
-                proc = subprocess.Popen(
-                    cmd, cwd=self.workspace_root, stdout=log, stderr=subprocess.STDOUT,
-                    start_new_session=True,
-                )
-            self.job = {
-                "job_id": job_id,
-                "pid": proc.pid,
-                "proc": proc,
-                "status": "running",
-                "started_at": now(),
-                "ended_at": None,
-                "returncode": None,
-                "log_path": str(log_path),
-            }
-            return True, self._payload()
-
-    def kill(self, force=False):
-        with self.lock:
-            current = self._payload()
-            if not current["active"]:
-                return False, current
-
-            sig = signal.SIGKILL if force else signal.SIGTERM
-            try:
-                if hasattr(os, "killpg"):
-                    os.killpg(os.getpgid(self.job["pid"]), sig)
-                else:
-                    self.job["proc"].send_signal(sig)
-            except ProcessLookupError:
-                return False, self._payload()
-
-            self.job["status"] = "canceling"
-            return True, self._payload()
-
-    def log(self, tail_bytes=65536):
-        with self.lock:
-            path = Path(self.job["log_path"]) if self.job else None
-        if not path or not path.exists():
-            return ""
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, handle.tell() - tail_bytes))
-            return handle.read().decode(errors="replace")
+def bounded_int(raw, default=0, minimum=0, maximum=1048576):
+    try:
+        return max(minimum, min(int(raw), maximum))
+    except (TypeError, ValueError):
+        return default
 
 
 class AutoexpHTTPServer(ThreadingHTTPServer):
@@ -198,6 +112,14 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             return
         try:
             handler()
+        except FileNotFoundError as exc:
+            self._json({"error": str(exc)}, 404)
+        except sqlite3.IntegrityError as exc:
+            self._json({"error": str(exc)}, 409)
+        except (TypeError, ValueError) as exc:
+            self._json({"error": str(exc)}, 400)
+        except SystemExit:
+            self._json({"error": "request could not be completed"}, 400)
         except Exception as exc:
             self._json({"error": str(exc)}, 500)
 
@@ -227,8 +149,64 @@ class AutoexpHandler(BaseHTTPRequestHandler):
 
         if path == "/api/workspace":
             return self._json(workspace(root))
+        if path == "/api/preflight":
+            from .execution import preflight_request
+
+            return self._json(preflight_request(
+                root,
+                run_id=query.get("run_id", [None])[0],
+                snapshot_id=query.get("snapshot_id", [None])[0],
+            ))
         if path == "/api/runs":
             return self._json({"runs": list_runs(limit, root)})
+        if path.startswith("/api/runs/"):
+            parts = [unquote(part) for part in path.removeprefix("/api/runs/").split("/")]
+            run_id = parts[0]
+            if not run_id:
+                return self._json({"error": "run_id is required"}, 400)
+            if len(parts) == 1:
+                return self._json(run_overview(run_id, root))
+            if parts[1:] == ["source"]:
+                return self._json(run_source(run_id, root))
+            if parts[1:] == ["artifacts"]:
+                category = query.get("category", [None])[0]
+                return self._json({
+                    "run_id": run_id,
+                    "artifacts": list_artifacts(run_id, root=root, category=category),
+                })
+            if len(parts) == 3 and parts[1] == "artifacts":
+                return self._json(artifact_detail(run_id, parts[2], root))
+            if len(parts) == 4 and parts[1] == "artifacts" and parts[3] == "content":
+                offset = bounded_int(query.get("offset", [0])[0], maximum=2**63 - 1)
+                size = bounded_int(
+                    query.get("limit", [16 * 1024 * 1024])[0],
+                    default=16 * 1024 * 1024,
+                    minimum=1,
+                    maximum=16 * 1024 * 1024,
+                )
+                artifact, content = artifact_content(
+                    run_id, parts[2], root, offset=offset, limit=size
+                )
+                return self._content(
+                    content,
+                    artifact.get("media_type") or "application/octet-stream",
+                    artifact.get("path"),
+                    truncated=offset + len(content) < artifact["size_bytes"],
+                )
+            if len(parts) == 3 and parts[1] == "logs":
+                offset = bounded_int(query.get("offset", [0])[0], maximum=2**63 - 1)
+                size = bounded_int(query.get("limit", [65536])[0], default=65536, minimum=1)
+                return self._json(read_log(run_id, parts[2], offset=offset, limit=size, root=root))
+            if parts[1:] == ["report"]:
+                return self._json(run_report(run_id, root))
+            if parts[1:] == ["diff"]:
+                return self._json(run_diff(
+                    run_id,
+                    root,
+                    base_run_id=query.get("base_run_id", [None])[0],
+                    base_snapshot_id=query.get("base_snapshot_id", [None])[0],
+                ))
+            return self._json({"error": "not found"}, 404)
         if path == "/api/status":
             return self._json({"run": manager.active(), "runs": list_runs(limit, root)})
         if path == "/api/script/params":
@@ -254,7 +232,7 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         if path == "/api/run/log":
             tail = clamp(query.get("tail_bytes", [65536])[0], default=65536, maximum=1048576)
             log = self.server.research(root).log(tail) if project_mode(root) == "autoresearch" else manager.log(tail)
-            return self._json({"log": log})
+            return self._json({"log": log, "kind": "agent" if project_mode(root) == "autoresearch" else "job"})
         self._static(path)
 
     def _run_scoped(self, query, root, fn):
@@ -271,12 +249,48 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         path = urlparse(self.path).path
         body = self._body({})
 
+        if path == "/api/runs":
+            if not isinstance(body, dict):
+                return self._json({"error": "body must be a JSON object"}, 400)
+            snapshot_id = body.get("snapshot_id")
+            if snapshot_id is not None and not isinstance(snapshot_id, str):
+                return self._json({"error": "snapshot_id must be a string"}, 400)
+            root = self._project_root(body)
+            if not self._execution_preflight(root, snapshot_id=snapshot_id):
+                return
+            ok, payload = self.server.manager(root).start(snapshot_id=snapshot_id)
+            return self._json(payload, 202 if ok else 409)
+        if path.startswith("/api/runs/"):
+            parts = [unquote(part) for part in path.removeprefix("/api/runs/").split("/")]
+            if len(parts) == 2 and parts[0] and parts[1] == "rerun":
+                if not isinstance(body, dict):
+                    return self._json({"error": "body must be a JSON object"}, 400)
+                root = self._project_root(body)
+                if not self._execution_preflight(root, run_id=parts[0]):
+                    return
+                ok, payload = self.server.manager(root).start(run_id=parts[0])
+                return self._json(payload, 202 if ok else 409)
+            if len(parts) == 2 and parts[0] and parts[1] == "cancel":
+                if not isinstance(body, dict):
+                    return self._json({"error": "body must be a JSON object"}, 400)
+                manager = self.server.manager(self._project_root(body))
+                current = manager.active()
+                if not current["active"] or current["job"].get("run_id") != parts[0]:
+                    return self._json({"error": "run is not active"}, 409)
+                ok, payload = manager.kill(bool(body.get("force")))
+                return self._json(payload, 202 if ok else 409)
+            return self._json({"error": "not found"}, 404)
         if path == "/api/run/start":
             root = self._project_root(body)
             run_id = body.get("run_id")
             if run_id is not None and not isinstance(run_id, str):
                 return self._json({"error": "run_id must be a string"}, 400)
-            ok, payload = self.server.manager(root).start(run_id)
+            snapshot_id = body.get("snapshot_id")
+            if snapshot_id is not None and not isinstance(snapshot_id, str):
+                return self._json({"error": "snapshot_id must be a string"}, 400)
+            if not self._execution_preflight(root, run_id=run_id, snapshot_id=snapshot_id):
+                return
+            ok, payload = self.server.manager(root).start(run_id, snapshot_id)
             return self._json(payload, 202 if ok else 409)
         if path == "/api/run/kill":
             root = self._project_root(body)
@@ -319,6 +333,8 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             source_run_id=run_id,
             save_as=save_as,
             source_snapshot_id=snapshot_id,
+            trigger_kind="ui",
+            actor_name="autoexp-view",
         ))
 
     def _put(self):
@@ -357,7 +373,12 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             return self._json({"error": "params must be a JSON object"}, 400)
 
         root_data = body if isinstance(body, dict) else {}
-        self._json(write_script_params(params, self._project_root(root_data)))
+        self._json(write_script_params(
+            params,
+            self._project_root(root_data),
+            trigger_kind="ui",
+            actor_name="autoexp-view",
+        ))
 
     # ------------------------------------------------------------------
     #  Shared helpers
@@ -376,10 +397,25 @@ class AutoexpHandler(BaseHTTPRequestHandler):
     def _project_root(self, data):
         return self.server.project_root(self._project_id_from(data) or None)
 
+    def _execution_preflight(self, root, run_id=None, snapshot_id=None):
+        from .execution import preflight_request
+
+        result = preflight_request(root, run_id=run_id, snapshot_id=snapshot_id)
+        if result["ok"]:
+            return True
+        failed = next((item for item in result["checks"] if not item["ok"]), None)
+        self._json({
+            "error": (failed or {}).get("detail") or "execution preflight failed",
+            "preflight": result,
+        }, 422)
+        return False
+
     def _body(self, default=None):
         length = int(self.headers.get("Content-Length", "0"))
         if length == 0:
             return default
+        if length > 16 * 1024 * 1024:
+            raise ValueError("request body is too large")
         try:
             return json.loads(self.rfile.read(length).decode())
         except json.JSONDecodeError as exc:
@@ -387,8 +423,26 @@ class AutoexpHandler(BaseHTTPRequestHandler):
 
     def _origin_allowed(self):
         origin = self.headers.get("Origin")
-        host = self.headers.get("Host")
-        return not origin or (host and origin == f"http://{host}") or origin in self.server.allow_origins
+        if not origin or origin in self.server.allow_origins:
+            return True
+        parsed = urlparse(origin)
+        try:
+            port = parsed.port
+        except ValueError:
+            return False
+        if parsed.scheme != "http" or port != self.server.server_port:
+            return False
+        hostname = parsed.hostname or ""
+        if hostname == "localhost":
+            return True
+        try:
+            address = ipaddress.ip_address(hostname)
+            bound = ipaddress.ip_address(self.server.server_address[0])
+        except ValueError:
+            return False
+        return address.is_loopback or (
+            not bound.is_unspecified and address == bound
+        )
 
     def _json(self, payload, status=200):
         body = json.dumps(payload, indent=2).encode()
@@ -399,8 +453,22 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def _content(self, body, content_type, path=None, *, truncated=False):
+        self.send_response(200)
+        self._headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
+        self.send_header("X-Content-Truncated", "true" if truncated else "false")
+        if content_type.split(";", 1)[0].lower() in {"text/html", "application/xhtml+xml"}:
+            filename = Path(path or "artifact").name.replace('"', "").replace("\r", "").replace("\n", "")
+            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
     def _headers(self):
         self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
         origin = self.headers.get("Origin")
         if origin and self._origin_allowed():
             self.send_header("Access-Control-Allow-Origin", origin)
@@ -410,7 +478,7 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         rel = "index.html" if path in {"", "/"} else path.lstrip("/")
         target = (UI_DIR / rel).resolve()
 
-        if not str(target).startswith(str(UI_DIR.resolve())) or not target.is_file():
+        if not target.is_relative_to(UI_DIR.resolve()) or not target.is_file():
             target = UI_DIR / "index.html"
         if not target.is_file():
             return self._json({"error": "not found"}, 404)
@@ -445,6 +513,7 @@ def view(host, port, allow_origins=None, project=None):
             root = Path(item["path"])
             require_autoexp_git_repo(root)
             init_db(root)
+            recover_stranded(root)
 
     server = AutoexpHTTPServer(
         (host, port),

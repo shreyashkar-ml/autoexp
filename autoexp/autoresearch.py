@@ -195,7 +195,16 @@ class AutoResearch:
             "AUTOEXP_RESEARCH_BUDGET_SEC": str(self.cfg.objective.budget_sec),
         }
         proc = subprocess.run(
-            [sys.executable, "-m", "autoexp", "run"],
+            [
+                sys.executable,
+                "-m",
+                "autoexp",
+                "run",
+                "--trigger-kind",
+                "autoresearch",
+                "--actor-name",
+                "autoexp-autoresearch",
+            ],
             cwd=self.dir, env=env, capture_output=True, text=True,
         )
         match = re.search(r"^run_id: (.+)$", proc.stdout, re.MULTILINE)

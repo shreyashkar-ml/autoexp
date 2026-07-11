@@ -100,7 +100,20 @@ def resolve_root(root=None):
 
 def run_dir_for(run, root):
     """On-disk location of a run, honoring an explicit run_dir or the default layout."""
-    return Path(root) / (run.get("run_dir") or f"runs/{run['run_id']}")
+    root = Path(root).resolve()
+    runs_root = (root / "runs").resolve()
+    raw = Path(run.get("run_dir") or f"runs/{run['run_id']}")
+    path = (root / raw).resolve()
+    if (
+        raw.is_absolute()
+        or ".." in raw.parts
+        or len(raw.parts) < 2
+        or raw.parts[0] != "runs"
+        or not runs_root.is_relative_to(root)
+        or not path.is_relative_to(runs_root)
+    ):
+        raise ValueError("run directory must stay inside the project's runs directory")
+    return path
 
 
 def is_within_project(path):

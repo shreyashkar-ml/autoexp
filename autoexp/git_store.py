@@ -5,7 +5,7 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .store import AUTOEXP_GIT_DIR, autoexp_git
+from .store import AUTOEXP_GIT_DIR, autoexp_git, require_autoexp_git_repo
 from .workspace import resolve_root, source_paths
 
 
@@ -34,7 +34,10 @@ def _temporary_index(root):
 def materialize_commit(commit, destination, root=None):
     """Materialize a private-Git commit without changing its checkout or index."""
     root = resolve_root(root)
+    require_autoexp_git_repo(root)
     destination = Path(destination)
+    if destination.is_symlink():
+        raise ValueError(f"snapshot destination must not be a symlink: {destination}")
     destination.mkdir(parents=True, exist_ok=True)
     if any(destination.iterdir()):
         raise ValueError(f"snapshot destination is not empty: {destination}")
@@ -51,6 +54,7 @@ def materialize_commit(commit, destination, root=None):
 def commit_source_tree(source_root, parent_commit, message, root=None):
     """Commit a complete source tree without touching the active workspace."""
     root = resolve_root(root)
+    require_autoexp_git_repo(root)
     source_root = Path(source_root)
     index = _temporary_index(root)
     env = os.environ | {"GIT_INDEX_FILE": str(index)}
@@ -65,4 +69,5 @@ def commit_source_tree(source_root, parent_commit, message, root=None):
 
 
 def preserve_snapshot_ref(snapshot_id, commit, root=None):
+    require_autoexp_git_repo(root)
     autoexp_git(["update-ref", f"refs/autoexp/snapshots/{snapshot_id}", commit], root=root)

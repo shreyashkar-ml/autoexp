@@ -1,6 +1,7 @@
 import hashlib
 import json
 import os
+import platform
 import shlex
 import shutil
 import subprocess
@@ -44,8 +45,12 @@ def hash_dir(path):
     """Hash a directory's tracked files (name + bytes), skipping .gitignored ones."""
     digest = hashlib.sha256()
     root = path.parent
+    if (root / ".gitignore").is_symlink():
+        raise ValueError(".gitignore must not be a symlink")
     patterns = gitignore_patterns(root)
     for item in sorted(path.rglob("*")):
+        if item.is_symlink():
+            raise ValueError(f"source contains unsupported symlink: {item.relative_to(path)}")
         if not item.is_file():
             continue
         rel = item.relative_to(path).as_posix()
@@ -63,12 +68,15 @@ def compute_hashes(root=None):
     """The capsule: a hash of script + environment + runtime that identifies a run's inputs."""
     root = resolve_root(root)
     cfg = read_json(root / PROJECT_CONFIG)
+    if not isinstance(cfg, dict):
+        raise ValueError("autoexp.json must contain a JSON object")
     manifest = script_manifest(root)
+    sandbox = cfg.get("sandbox") if isinstance(cfg.get("sandbox"), dict) else {}
     data = {
         "script_hash": hash_dir(root / "script"),
         "script_env_hash": hash_json({
             "runner": cfg.get("runner", "local"),
-            "image": manifest.get("image", cfg["sandbox"]["image"]),
+            "image": manifest.get("image") or sandbox.get("image"),
         }),
         "runtime_context_hash": hash_json(cfg.get("runtime", {})),
     }
@@ -77,13 +85,17 @@ def compute_hashes(root=None):
 
 
 def hash_path(digest, path, base):
+    if path.is_symlink():
+        raise ValueError(f"output contains unsupported symlink: {path.relative_to(base)}")
     digest.update(path.relative_to(base).as_posix().encode())
     digest.update(b"\0")
     if path.is_dir():
         digest.update(b"dir\0")
     else:
         digest.update(b"file\0")
-        digest.update(path.read_bytes())
+        with path.open("rb") as handle:
+            while chunk := handle.read(1024 * 1024):
+                digest.update(chunk)
         digest.update(b"\0")
 
 
@@ -92,6 +104,8 @@ def hash_run_output(run_dir):
     digest = hashlib.sha256()
     path = Path(run_dir) / "output"
     digest.update(b"output\0")
+    if path.is_symlink():
+        raise ValueError("run output directory must not be a symlink")
     if not path.exists():
         digest.update(b"missing\0")
     elif path.is_file():
@@ -108,15 +122,21 @@ def find_duplicate_output_run(hashes, output_hash, root=None):
     root = resolve_root(root)
     conn = db(root)
     rows = conn.execute(
-        "select * from runs where capsule_hash = ? and status = 'success' order by created_at desc",
+        """select * from runs where capsule_hash = ? and status = 'success'
+           order by created_at desc, rowid desc""",
         (hashes["capsule_hash"],),
     ).fetchall()
     conn.close()
     for row in rows:
         run = dict(row)
         run_dir = run_dir_for(run, root)
-        if run_dir.exists() and (run.get("output_hash") or hash_run_output(run_dir)) == output_hash:
-            return run
+        if run_dir.exists():
+            try:
+                prior_hash = run.get("output_hash") or hash_run_output(run_dir)
+            except ValueError:
+                continue
+            if prior_hash == output_hash:
+                return run
     return None
 
 
@@ -151,6 +171,7 @@ def run_script(run_dir, root=None, source_root=None):
             cmd += ["-e", f"{key}={os.environ[key]}"]
     cmd += [
         "-e", "AUTOEXP_OUTPUT_DIR=/workspace/run/output",
+        "-e", "PYTHONDONTWRITEBYTECODE=1",
         "-v", f"{(source_root / 'script').resolve()}:/workspace/script:ro",
         "-v", f"{Path(run_dir).resolve()}:/workspace/run:rw",
         "-w", workdir,
@@ -238,6 +259,7 @@ def run_script_local(run_dir, root=None, source_root=None):
         "AUTOEXP_RUN_DIR": str(Path(run_dir).resolve()),
         "AUTOEXP_SCRIPT_DIR": str((source_root / "script").resolve()),
         "AUTOEXP_OUTPUT_DIR": str((Path(run_dir) / "output").resolve()),
+        "PYTHONDONTWRITEBYTECODE": "1",
     }
     logs = Path(run_dir) / "logs"
     with (logs / "script.stdout.log").open("w") as stdout, (logs / "script.stderr.log").open("w") as stderr:
@@ -248,9 +270,10 @@ def run_script_local(run_dir, root=None, source_root=None):
         ).returncode
 
 
-def runner_type(root):
+def runner_type(root, source_root=None):
     """Resolve the effective runner, failing if docker is requested but unavailable."""
-    requested = read_json(Path(root) / PROJECT_CONFIG).get("runner", "local")
+    source_root = Path(root) if source_root is None else Path(source_root)
+    requested = read_json(source_root / PROJECT_CONFIG).get("runner", "local")
     if requested not in {"docker", "local"}:
         die("autoexp.json runner must be one of: docker, local")
     if requested == "local":
@@ -259,3 +282,14 @@ def runner_type(root):
     if not ok:
         die(message)
     return "docker"
+
+
+def runner_identity(root, runner=None, source_root=None):
+    """Return the concrete local runtime or configured container identity."""
+    source_root = Path(root) if source_root is None else Path(source_root)
+    runner = runner or runner_type(root, source_root)
+    if runner == "docker":
+        cfg = read_json(source_root / PROJECT_CONFIG)
+        manifest = script_manifest(source_root)
+        return f"docker:{manifest.get('image', cfg['sandbox']['image'])}"
+    return f"{sys.implementation.name}:{platform.python_version()}:{Path(sys.executable).resolve()}"
