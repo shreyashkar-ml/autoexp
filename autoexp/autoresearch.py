@@ -18,6 +18,14 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
 
+from .workspace import (
+    EXPERIMENT_DIR,
+    PARAMS_FILE,
+    PARAMS_SCHEMA_FILE,
+    PROJECT_CONFIG,
+    STAGE_MANIFEST,
+)
+
 
 Role = Literal["human", "agent", "frozen"]
 Direction = Literal["min", "max"]
@@ -54,7 +62,7 @@ class ResearchConfig:
 
     @classmethod
     def load(cls, project_dir: Path):
-        config = json.loads((project_dir / "autoexp.json").read_text())
+        config = json.loads((project_dir / PROJECT_CONFIG).read_text())
         research = config["autoresearch"]
         return cls(
             objective=Objective(**research["objective"]),
@@ -117,7 +125,7 @@ class AutoResearch:
     def _require_config(self):
         config = self._load_config()
         if config is None:
-            raise ValueError("autoexp.json contains an invalid autoresearch configuration")
+            raise ValueError(f"{PROJECT_CONFIG} contains an invalid autoresearch configuration")
         return config
 
     def _configured_path(self, path):
@@ -161,7 +169,7 @@ class AutoResearch:
         add(
             "research_config",
             config is not None,
-            "autoexp.json contains an invalid autoresearch configuration",
+            f"{PROJECT_CONFIG} contains an invalid autoresearch configuration",
         )
         evaluator_hash = None
         if config:
@@ -738,7 +746,11 @@ class AutoResearch:
                 actor_name="autoexp-autoresearch",
                 session_id=session["session_id"] if session else None,
                 request_id=key,
-                metadata={"contract_id": contract["contract_id"], "attempt_id": attempt_id},
+                metadata={
+                    "contract_id": contract["contract_id"],
+                    "attempt_id": attempt_id,
+                    "title": hypothesis[:80],
+                },
                 environment={
                     "AUTOEXP_RESEARCH_TAG": attempt_id,
                     "AUTOEXP_RESEARCH_BUDGET_SEC": str(contract["budget_sec"]),
@@ -1093,7 +1105,7 @@ class AutoResearch:
 
         if not self.can_import_baseline():
             raise ValueError(
-                "baseline import is only available before attempts and before train.py is edited"
+                "baseline import is only available before attempts and before candidate.py is edited"
             )
         result = self.save_file(self._require_config().subject_path, text)
         contract = self._resolve_contract()
@@ -1114,27 +1126,31 @@ def ensure_research_file_editable(root, script_path):
         config = ResearchConfig.load(Path(root))
     except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
         return
-    project_path = f"script/{Path(script_path).as_posix()}"
+    project_path = f"{EXPERIMENT_DIR}/{Path(script_path).as_posix()}"
     if config.role_of(project_path) == "frozen":
         raise ValueError("the evaluator is frozen for the active research contract")
 
 
 PROGRAM_TEXT = """# Autoresearch program
 
-Improve the objective by editing only `script/train.py`.
+Improve the objective by editing only `experiment/candidate.py`.
 
 If you have an existing training or experiment script, use it as the starting
-point for `script/train.py` before beginning the first attempt.
+point for `experiment/candidate.py` before beginning the first attempt.
 
 The loop:
 
 1. Read the current research state with the `research_state` MCP tool.
-2. Form one concrete hypothesis and edit `script/train.py`.
+2. Form one concrete hypothesis and edit `experiment/candidate.py`.
 3. Call `research_begin_attempt` with the hypothesis. It runs the experiment.
 4. Call `research_finish_attempt` with the returned attempt tag.
 5. Study kept and reverted attempts, then repeat until stopped.
 
-`script/evaluate.py` is the fixed evaluator. Do not edit it.
+Mark only a new best, surprising failure, or decision-changing result with
+`mark_milestone`. Before concluding, read `project_summary` and write one
+end-to-end synthesis with `write_project_report`.
+
+`experiment/evaluate.py` is the fixed evaluator. Do not edit it.
 The experiment budget is available as `AUTOEXP_RESEARCH_BUDGET_SEC`.
 Keep each attempt focused so its diff and result remain understandable.
 """
@@ -1176,6 +1192,7 @@ print(f"score: {metrics['score']}")
 def config_block():
     return {
         "mode": "autoresearch",
+        "source": {"root": EXPERIMENT_DIR, "editable": ["candidate.py"]},
         "autoresearch": {
             "objective": {
                 "metric": "score",
@@ -1185,17 +1202,17 @@ def config_block():
             },
             "files": [
                 {
-                    "path": "script/program.md",
+                    "path": "experiment/program.md",
                     "role": "human",
                     "desc": "research directions and loop rules",
                 },
                 {
-                    "path": "script/train.py",
+                    "path": "experiment/candidate.py",
                     "role": "agent",
                     "desc": "the implementation the agent improves",
                 },
                 {
-                    "path": "script/evaluate.py",
+                    "path": "experiment/evaluate.py",
                     "role": "frozen",
                     "desc": "the fixed evaluator",
                 },
@@ -1205,7 +1222,7 @@ def config_block():
                 "cmd": [
                     "codex",
                     "exec",
-                    "Read script/program.md and run the autoresearch loop using the Autoexp MCP tools.",
+                    "Read experiment/program.md and run the autoresearch loop using the Autoexp MCP tools.",
                 ],
             },
         },
@@ -1213,21 +1230,21 @@ def config_block():
 
 
 def scaffold(root, write_json):
-    script = root / "script"
+    script = root / EXPERIMENT_DIR
     (script / "program.md").write_text(PROGRAM_TEXT)
-    (script / "train.py").write_text(TRAIN_TEXT)
+    (script / "candidate.py").write_text(TRAIN_TEXT)
     (script / "evaluate.py").write_text(EVALUATE_TEXT)
     write_json(
-        script / "stage.json",
+        root / STAGE_MANIFEST,
         {
-            "name": "train.py",
-            "command": "python train.py --ctx ${CTX} && python evaluate.py --ctx ${CTX}",
-            "working_dir": "script",
+            "name": "candidate.py",
+            "command": "python candidate.py --ctx ${CTX} && python evaluate.py --ctx ${CTX}",
+            "working_dir": EXPERIMENT_DIR,
             "interface_version": "1",
         },
     )
-    write_json(script / "params.json", {})
-    write_json(script / "params.schema.json", {"type": "object", "properties": {}})
+    write_json(root / PARAMS_FILE, {})
+    write_json(root / PARAMS_SCHEMA_FILE, {"type": "object", "properties": {}})
 
 
 def for_project(root):

@@ -201,7 +201,7 @@ def inventory_external_inputs(source_root, root=None, environment_overrides=None
     source_root = Path(source_root)
     config = read_json(source_root / PROJECT_CONFIG)
     if not isinstance(config, dict):
-        raise ValueError("autoexp.json must contain a JSON object")
+        raise ValueError(f"{PROJECT_CONFIG} must contain a JSON object")
     env_file = app_env(root)
     overrides = {str(key): str(value) for key, value in (environment_overrides or {}).items()}
     environment = env_file | overrides if config.get("runner") == "docker" else os.environ | env_file | overrides
@@ -270,7 +270,7 @@ def record_external_inputs(run_id, records, root=None):
 
 
 def capture_external_inputs(run_id, source_root, root=None):
-    """Record declared inputs and app.env key presence, never their values."""
+    """Record declared inputs and .env key presence, never their values."""
     root = resolve_root(root)
     return record_external_inputs(
         run_id,

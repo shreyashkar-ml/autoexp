@@ -7,6 +7,7 @@ from pathlib import Path
 
 from .store import autoexp_git, db, git_status, insert_run, require_autoexp_git_repo
 from .workspace import (
+    EXPERIMENT_DIR,
     PROJECT_CONFIG,
     die,
     now,
@@ -81,19 +82,19 @@ def run_stage_commit(run):
 
 
 def copy_run_source(src_root, run_root):
-    """Snapshot script/ plus the rest of the source set into a run directory."""
+    """Copy the experiment plus managed configuration into a run directory."""
     src_root = Path(src_root)
     run_root = Path(run_root)
     run_root.mkdir(parents=True, exist_ok=True)
-    script_target = run_root / "script"
-    if (src_root / "script").is_symlink() or script_target.is_symlink():
-        raise ValueError("script directory must not be a symlink")
-    if any(path.is_symlink() for path in (src_root / "script").rglob("*")):
-        raise ValueError("script source must not contain symlinks")
+    script_target = run_root / EXPERIMENT_DIR
+    if (src_root / EXPERIMENT_DIR).is_symlink() or script_target.is_symlink():
+        raise ValueError("experiment directory must not be a symlink")
+    if any(path.is_symlink() for path in (src_root / EXPERIMENT_DIR).rglob("*")):
+        raise ValueError("experiment source must not contain symlinks")
     if script_target.exists():
         shutil.rmtree(script_target)
-    shutil.copytree(src_root / "script", script_target, symlinks=True)
-    for path in source_paths(src_root)[1:]:  # [0] is "script", already copied above
+    shutil.copytree(src_root / EXPERIMENT_DIR, script_target, symlinks=True)
+    for path in source_paths(src_root)[1:]:  # experiment/ was copied above
         source = src_root / path
         target = run_root / path
         if (
@@ -111,7 +112,7 @@ def source_root_for_run(run, root=None):
     """Where this run's source lives: its own snapshot if intact, else the project."""
     root = resolve_root(root)
     run_root = run_dir_for(run, root)
-    has_snapshot = (run_root / "script").is_dir() and (run_root / PROJECT_CONFIG).is_file()
+    has_snapshot = (run_root / EXPERIMENT_DIR).is_dir() and (run_root / PROJECT_CONFIG).is_file()
     return run_root if has_snapshot else root
 
 

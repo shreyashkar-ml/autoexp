@@ -19,15 +19,15 @@ Autoexp has two workflows:
 
 An Autoexp project is just a local folder with a few conventions:
 
-- Put the experiment implementation under `script/`.
-- Keep secrets in `app.env`.
-- Tune regular inputs in `script/params.json`.
-- Tune report generation in `report.txt`.
+- Put the experiment implementation under `experiment/`.
+- Keep secrets in `.env`.
+- Tune regular inputs through the Parameters UI or MCP tools.
+- Tune report generation through the Report Guidance UI or MCP tools.
 - Run experiments through Autoexp so each result is recorded.
 - Open the browser UI to review runs, outputs, diffs, reports, and project state.
 - Open the project in a coding agent to let it use Autoexp through MCP.
 
-If your work has a clear metric such as accuracy, loss, latency, cost, reward, or benchmark score, use Autoresearch. It adds `script/program.md`, where you describe the objective and constraints the agent should follow while optimizing that metric.
+If your work has a clear metric such as accuracy, loss, latency, cost, reward, or benchmark score, use Autoresearch. It adds `experiment/program.md`, where you describe the objective and constraints the agent should follow while optimizing that metric.
 
 ## Install
 
@@ -54,20 +54,22 @@ Initialization creates the workspace, starter files, agent instructions, and MCP
 
 Open this folder in your preferred coding agent. Claude users get `CLAUDE.md`; other agents can read `AGENTS.md`. Both files tell the agent how to use Autoexp, and `.mcp.json` lets MCP-aware clients start the Autoexp tools automatically. If your client does not read `.mcp.json`, configure a stdio MCP server that runs `autoexp mcp` from the project folder.
 
+Codex also gets a project-scoped `.codex/config.toml` declaring the same Autoexp MCP server. Codex loads project configuration for trusted projects when a new session starts from that project directory.
+
 Example prompt:
 
 ```text
 Try three prompt variants for the classifier evaluation, compare the error patterns, and write a short report recommending the best variant.
 ```
 
-If the experiment needs secrets or machine-specific values, put them in `app.env`:
+If the experiment needs secrets or machine-specific values, put them in `.env`:
 
 ```bash
 OPENAI_API_KEY=...
 DATASET_PATH=/path/to/local/data
 ```
 
-For normal non-secret inputs, edit `script/params.json`. To tune how generated reports should read, edit `report.txt`.
+For normal non-secret inputs, use the Parameters interface. Use Report Guidance to tune how generated reports should read. Their backing files live under `.autoexp/`.
 
 You can also run the current experiment yourself:
 
@@ -90,7 +92,7 @@ autoexp init metric_lab --autoresearch
 cd metric_lab
 ```
 
-Then edit `script/program.md` with the research objective and ask your agent to run the Autoresearch loop through Autoexp MCP.
+Then edit `experiment/program.md` with the research objective and ask your agent to run the Autoresearch loop through Autoexp MCP.
 
 Example Autoresearch prompt:
 
@@ -106,24 +108,22 @@ A new project starts with this shape:
 
 ```text
 demo_eval/
-├── script/
-│   ├── stage.json          # command Autoexp runs
-│   ├── params.json         # editable, non-secret inputs
-│   ├── params.schema.json  # parameter descriptions for tools and UI
-│   └── script.py           # experiment implementation
-├── autoexp.json            # project and runner settings
-├── report.txt              # project-specific report guidance
-├── app.env                 # local environment values and secrets
-└── runs/                   # run outputs, logs, and reports
+├── experiment/
+│   └── main.py             # experiment implementation
+├── runs/                   # run outputs, logs, and reports
+├── AGENTS.md               # agent guidance
+├── CLAUDE.md               # Claude guidance
+├── .env                    # local environment values and secrets
+└── .autoexp/               # managed settings, parameters, state, and history
 ```
 
 Common edits:
 
-- To change the experiment command, edit `script/stage.json`.
-- To tune non-secret inputs, edit `script/params.json`.
-- To change the experiment itself, edit `script/script.py`.
-- To tune report generation, edit `report.txt` with the audience, structure, depth, and what the report should explain.
-- To keep local secrets or machine-specific values, use `app.env`.
+- To change the experiment itself, edit files under `experiment/`.
+- To tune non-secret inputs, use Parameters in the UI or MCP.
+- To tune report generation, use Report Guidance in the UI or MCP.
+- To keep local secrets or machine-specific values, use `.env`.
+- Autoexp-managed backing files live under `.autoexp/` and are not exposed in the script editor.
 
 Your experiment receives a JSON context file through `${CTX}`. Read paths such as `output_dir`, `logs_dir`, and `script_params_path` from that context instead of hardcoding locations.
 
@@ -145,13 +145,21 @@ The UI lets you:
 
 Projects may live in completely separate directories. Once initialized or opened, they remain available from the same project picker.
 
-Standard project view:
+#### Standard workspace at initialization:
 
-![Autoexp standard empty project view](https://github.com/user-attachments/assets/6b030ab6-5c54-44d2-ac1e-b52df3c55bb0)
+![Autoexp Standard workspace at initialization](assets/autoexp_start.png)
 
-Autoresearch project view:
+#### Standard workspace with completed experiments, artifacts, and reports:
 
-![Autoexp Autoresearch empty project view](https://github.com/user-attachments/assets/d8dad830-3ce6-4088-b7d0-a563df03f02f)
+![Autoexp Standard experiment workflow](assets/autoexp_demo.png)
+
+#### Autoresearch workspace at initialization:
+
+![Autoexp Autoresearch workspace at initialization](assets/autoresearch_start.png)
+
+#### Autoresearch workspace with the optimization ratchet and attempt ledger:
+
+![Autoexp Autoresearch optimization workflow](assets/autoresearch_demo.png)
 
 ## Reports
 
@@ -175,13 +183,27 @@ The preferred main report is:
 runs/<run_id>/report/report.md
 ```
 
-To tune report generation, edit `report.txt` from the project or browser UI. Keep that file focused on what the report should say: subject matter, depth, audience, analysis, and structure. Autoexp adds the standard artifact-handling and secret-safety instructions internally.
+To tune report generation, use Report Guidance in the browser UI or MCP. Its backing file is `.autoexp/report-instructions.md`. Keep it focused on what the report should say: subject matter, depth, audience, analysis, and structure. Autoexp adds the standard artifact-handling and secret-safety instructions internally.
 
 If you want to point the project at a different report guidance file, use `autoexp report-instruction <path>`.
+
+Both Standard and Autoresearch projects also have one central synthesis at
+`.autoexp/project-report.md`. An agent can fetch `project_summary`, inspect the
+milestones and linked run reports, then publish that end-to-end report with
+`write_project_report`. The browser's Project Report control displays it.
+
+Agents can call `mark_milestone` for a decision-changing result, surprising
+failure, or new best, and `list_milestones` later exposes those remarkable
+parts without requiring a user to browse every run. Routine runs should not be
+marked.
 
 ## Coding agents and MCP
 
 MCP is how a coding agent talks to Autoexp directly instead of guessing shell commands and file paths.
+
+Use Standard mode for software, qualitative, comparative, or multi-variant
+experiments. Use Autoresearch only when one stable numeric metric and a frozen
+evaluator can automatically decide whether each candidate is kept or reverted.
 
 ### Optional Claude Code or Codex plugin
 
@@ -209,6 +231,7 @@ The plugin is optional. Projects created with `autoexp init` still include their
 CLAUDE.md
 AGENTS.md
 .mcp.json
+.codex/config.toml
 ```
 
 Claude Code reads `CLAUDE.md`. Other coding agents can read `AGENTS.md`. The generated `.mcp.json` starts the MCP server with:
@@ -257,15 +280,15 @@ autoexp view
 
 An Autoresearch project starts with three clear file roles:
 
-- `script/program.md` — your objective, research directions, and loop rules
-- `script/train.py` — the implementation the coding agent improves
-- `script/evaluate.py` — the stable evaluator that produces the metric
+- `experiment/program.md` — your objective, research directions, and loop rules
+- `experiment/candidate.py` — the implementation the coding agent improves
+- `experiment/evaluate.py` — the stable evaluator that produces the metric
 
-On a fresh Autoresearch project, the browser view can import an existing Python script as the starting `script/train.py`.
+On a fresh Autoresearch project, the browser view can import an existing Python script as the starting `experiment/candidate.py`.
 
-Edit `script/program.md` to change the research direction, constraints, allowed strategies, or stopping criteria. The agent reads this file before proposing and finishing attempts.
+Edit `experiment/program.md` to change the research direction, constraints, allowed strategies, or stopping criteria. The agent reads this file before proposing and finishing attempts.
 
-Configure the metric direction and agent command in the `autoresearch` section of `autoexp.json`:
+Configure the metric direction and agent command in the `autoresearch` section of `.autoexp/project.json`:
 
 ```json
 {
@@ -281,7 +304,7 @@ Configure the metric direction and agent command in the `autoresearch` section o
     "key": "score"
   },
   "agent": {
-    "cmd": ["codex", "exec", "Read script/program.md and run the autoresearch loop using the Autoexp MCP tools."]
+    "cmd": ["codex", "exec", "Read experiment/program.md and run the autoresearch loop using the Autoexp MCP tools."]
   }
 }
 ```
@@ -292,23 +315,23 @@ Start the loop from the browser UI. For each attempt, the agent:
 
 1. checks research preflight and reads the current contract state
 2. proposes one hypothesis
-3. saves a candidate snapshot from `script/train.py`
+3. saves a candidate snapshot from `experiment/candidate.py`
 4. executes that snapshot as a new immutable run
 5. reads the configured metric from indexed run artifacts
 6. advances the best snapshot only for an improvement
 
 Autoexp persists the research contract, loop session, and every attempt in SQLite. Each attempt records its hypothesis, base and candidate snapshots, immutable run, score, and verdict. Reverted candidates remain inspectable through their Diff, Run, and Artifacts tabs; only the current-best pointer moves backward to the prior source.
 
-The evaluator is frozen within a contract. If you intentionally change `script/evaluate.py` outside the active loop, Autoexp starts a new contract boundary with a new evaluator fingerprint and attempt numbering while retaining the earlier contract's attempts. Start Loop stays disabled when research preflight finds a missing runner, file, objective, budget, or agent executable.
+The evaluator is frozen within a contract. If you intentionally change `experiment/evaluate.py` outside the active loop, Autoexp starts a new contract boundary with a new evaluator fingerprint and attempt numbering while retaining the earlier contract's attempts. Start Loop stays disabled when research preflight finds a missing runner, file, objective, budget, or agent executable.
 
 ## Execution runners
 
 During initialization, Autoexp checks whether Docker and its daemon are available.
 
-- With Docker available, new projects use the Docker runner and the limits in `autoexp.json`.
+- With Docker available, new projects use the Docker runner and the limits in `.autoexp/project.json`.
 - Without Docker, new projects use the local runner and print instructions for enabling Docker later.
 
-To change an existing project, edit the runner setting in `autoexp.json`:
+To change an existing project, edit the runner setting through Project Settings or `.autoexp/project.json`:
 
 ```json
 "runner": "local"
@@ -328,7 +351,7 @@ Declare versioned inputs that live outside the source snapshot when you have the
 ]
 ```
 
-`app.env` values are passed to the selected runner but remain local and excluded from Autoexp's saved source history. Autoexp records key presence and declared versions or safe file fingerprints, never secret values. Undeclared or unversioned inputs appear as reproducibility warnings.
+`.env` values are passed to the selected runner but remain local and excluded from Autoexp's saved source history. Autoexp records key presence and declared versions or safe file fingerprints, never secret values. Undeclared or unversioned inputs appear as reproducibility warnings.
 
 ## Common commands
 

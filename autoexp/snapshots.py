@@ -16,6 +16,9 @@ from .store import (
     require_autoexp_git_repo,
 )
 from .workspace import (
+    EXPERIMENT_DIR,
+    PARAMS_FILE,
+    STAGE_MANIFEST,
     PROJECT_CONFIG,
     ensure_within_project,
     now,
@@ -39,14 +42,13 @@ def _hash_file(path):
 
 def _hash_script_source(script_dir):
     digest = hashlib.sha256()
-    excluded = {"stage.json", "params.json", "params.schema.json"}
     if script_dir.is_symlink():
         raise ValueError("script directory must not be a symlink")
     if script_dir.is_dir():
         for path in sorted(script_dir.rglob("*")):
             if path.is_symlink():
                 raise ValueError(f"source contains unsupported symlink: {path.relative_to(script_dir)}")
-            if not path.is_file() or path.relative_to(script_dir).as_posix() in excluded:
+            if not path.is_file():
                 continue
             digest.update(path.relative_to(script_dir).as_posix().encode())
             digest.update(b"\0")
@@ -72,19 +74,19 @@ def snapshot_hashes(source_root):
     """Return semantic hashes for the execution-relevant source categories."""
     source_root = Path(source_root)
     if (source_root / PROJECT_CONFIG).is_symlink():
-        raise ValueError("autoexp.json must not be a symlink")
+        raise ValueError(f"{PROJECT_CONFIG} must not be a symlink")
     config = read_json(source_root / PROJECT_CONFIG)
     if not isinstance(config, dict):
-        raise ValueError("autoexp.json must contain a JSON object")
+        raise ValueError(f"{PROJECT_CONFIG} must contain a JSON object")
     runtime_config = {
         key: config.get(key)
         for key in ("runner", "sandbox", "runtime")
         if key in config
     }
     hashes = {
-        "script_hash": _hash_script_source(source_root / "script"),
-        "params_hash": _hash_file(source_root / "script" / "params.json"),
-        "manifest_hash": _hash_file(source_root / "script" / "stage.json"),
+        "script_hash": _hash_script_source(source_root / EXPERIMENT_DIR),
+        "params_hash": _hash_file(source_root / PARAMS_FILE),
+        "manifest_hash": _hash_file(source_root / STAGE_MANIFEST),
         "runtime_config_hash": _hash_bytes(
             json.dumps(runtime_config, sort_keys=True, separators=(",", ":")).encode()
         ),
@@ -311,7 +313,7 @@ def migrate_legacy_run_snapshots(root=None):
             snapshot = dict(existing)
         else:
             base_commit = run.get("stage_commit") or head
-            if (run_dir / "script").is_dir() and (run_dir / PROJECT_CONFIG).is_file():
+            if (run_dir / EXPERIMENT_DIR).is_dir() and (run_dir / PROJECT_CONFIG).is_file():
                 commit = commit_source_tree(
                     run_dir,
                     base_commit,

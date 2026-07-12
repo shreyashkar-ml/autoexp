@@ -8,26 +8,42 @@ import time
 from pathlib import Path
 
 
-PROJECT_CONFIG = "autoexp.json"
-PROJECT_INSTRUCTIONS = "autoexp.md"
-PROJECT_REPORT_INSTRUCTIONS = "report.txt"
-APP_ENV = "app.env"
-SOURCE_PATHS = ("script", PROJECT_CONFIG, PROJECT_INSTRUCTIONS, ".gitignore")
+AUTOEXP_DIR = ".autoexp"
+EXPERIMENT_DIR = "experiment"
+PROJECT_CONFIG = f"{AUTOEXP_DIR}/project.json"
+PROJECT_INSTRUCTIONS = f"{AUTOEXP_DIR}/instructions.md"
+PROJECT_REPORT_INSTRUCTIONS = f"{AUTOEXP_DIR}/report-instructions.md"
+PROJECT_REPORT = f"{AUTOEXP_DIR}/project-report.md"
+STAGE_MANIFEST = f"{AUTOEXP_DIR}/stage.json"
+PARAMS_FILE = f"{AUTOEXP_DIR}/params.json"
+PARAMS_SCHEMA_FILE = f"{AUTOEXP_DIR}/params.schema.json"
+APP_ENV = ".env"
+SOURCE_PATHS = (
+    EXPERIMENT_DIR, PROJECT_CONFIG, PROJECT_INSTRUCTIONS,
+    PROJECT_REPORT_INSTRUCTIONS, STAGE_MANIFEST, PARAMS_FILE,
+    PARAMS_SCHEMA_FILE, ".gitignore",
+)
 INSTRUCTION_FILE = Path(__file__).with_name("instruction.txt")
 BUILTIN_REPORT_INSTRUCTIONS = Path(__file__).with_name("report.txt")
 AGENTS_TEXT = """# Autoexp Workspace
 
 This repository is an Autoexp workspace.
 
-- Read `autoexp.md` before changing experiment behavior.
+- Read `.autoexp/instructions.md` before changing experiment behavior.
 - When MCP tools are available, use their live schemas. Start with `workspace` and `contract`; standard work uses `list_runs`, `read_*`, `write_*`, `run`, `diff_runs`, and `restore_run`; Autoresearch uses `research_state`, `research_begin_attempt`, `research_finish_attempt`, and `research_diff`.
+- Choose Standard mode for qualitative, multi-variant, or software experiments whose result needs comparison and interpretation. Choose Autoresearch only when one stable numeric metric and a frozen evaluator can decide whether each candidate is kept or reverted.
 - MCP tool names are not shell commands. Without MCP, use the `autoexp` CLI and project files; do not run `autoexp mcp` manually.
-- In Autoresearch projects, `script/train.py` is the baseline implementation. If the user provides a reference training script, adapt or copy it into `script/train.py` before the first attempt.
+- In Autoresearch projects, `experiment/candidate.py` is the baseline implementation. If the user provides a reference script, adapt or copy it there before the first attempt.
 - In Autoresearch projects, call `research_preflight` before the loop, edit only the configured agent-owned candidate file, and finish every begun attempt through Autoexp. The frozen evaluator is read-only within a contract; reverted candidate snapshots and runs remain evidence.
-- Keep experiment source in `script/`.
+- Keep experiment source and domain files in `experiment/`.
+- Before the first recorded run, replace generic `main.py` or `candidate.py` names with a concise domain-specific filename when the project purpose makes one obvious; do not leave a generic filename once the task is understood. Keep the configured stage command and editable-source declaration aligned.
+- Give every MCP-triggered run a short title that states the variant or hypothesis being tested, such as `SQLite warm-cache pass`; do not use IDs or generic labels such as `Run 1`.
+- When an experiment has distinct variants or phases that need separate reports and insights, prefer separate descriptively named scripts for those parts instead of one large parameter-switched script. Run and report each part independently; share only genuinely common helpers.
+- When the user's request specifies the report audience, questions, comparisons, or structure, read the existing report guidance and append those requirements through the report-guidance capability before running. Preserve existing guidance instead of replacing it.
 - Do not create ad-hoc experiment folders.
 - Do not hand-edit `runs/<run_id>/output/` or `runs/<run_id>/logs/`.
 - Generated reports belong under `runs/<run_id>/report/`.
+- Mark only decision-changing results, surprising failures, and new best results as milestones; do not mark every run. At the end, use `project_summary` and write one central `.autoexp/project-report.md` that synthesizes the whole project.
 """
 DEFAULT_SCRIPT = """import argparse
 import json
@@ -40,7 +56,7 @@ ctx = json.loads(Path(parser.parse_args().ctx).read_text())
 params = json.loads(Path(ctx["script_params_path"]).read_text())
 result = {
     "message": os.environ.get("AUTOEXP_MESSAGE", params["message"]),
-    "source": "app.env" if "AUTOEXP_MESSAGE" in os.environ else "script params",
+    "source": ".env" if "AUTOEXP_MESSAGE" in os.environ else "experiment params",
 }
 
 Path(ctx["output_dir"]).mkdir(parents=True, exist_ok=True)
@@ -78,7 +94,7 @@ def write_json(path, data):
 def is_project_root(path):
     """True when path has the directory/file shape Autoexp expects of a project."""
     path = Path(path)
-    has_dirs = (path / "script").is_dir() and (path / "runs").is_dir()
+    has_dirs = (path / EXPERIMENT_DIR).is_dir() and (path / "runs").is_dir()
     has_files = all(
         (path / name).is_file()
         for name in (PROJECT_CONFIG, PROJECT_INSTRUCTIONS, ".gitignore")
@@ -273,20 +289,20 @@ def ignored(rel, patterns):
 # ======================================================================
 
 def source_paths(root=None):
-    """The tracked source set: script/, config, contract, .gitignore, and report instruction."""
+    """The tracked execution source plus Autoexp-managed configuration."""
     root = resolve_root(root)
     paths = list(SOURCE_PATHS)
     configured = read_json(root / PROJECT_CONFIG).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
     report_path = Path(configured)
     if is_within_project(report_path):
-        paths.insert(-1, report_path.as_posix())
-    return tuple(paths)
+        paths.append(report_path.as_posix())
+    return tuple(dict.fromkeys(paths))
 
 
 def script_manifest(root=None):
-    """Read and validate script/stage.json."""
+    """Read and validate the Autoexp-managed stage manifest."""
     root = resolve_root(root)
-    path = root / "script" / "stage.json"
+    path = root / STAGE_MANIFEST
     if not path.exists():
         die(f"missing {path}")
     manifest = read_json(path)
@@ -301,7 +317,7 @@ def script_manifest(root=None):
 # ======================================================================
 
 def write_default_project(root, title, runner, autoresearch=False):
-    for name in ("script", "runs", ".autoexp"):
+    for name in (EXPERIMENT_DIR, "runs", AUTOEXP_DIR):
         (root / name).mkdir(parents=True)
 
     config = {
@@ -311,6 +327,7 @@ def write_default_project(root, title, runner, autoresearch=False):
         "sandbox": {"image": "python:3.12-slim", "network": "none", "cpus": "1", "memory": "512m"},
         "runtime": {},
         "report_instruction_file": PROJECT_REPORT_INSTRUCTIONS,
+        "source": {"root": EXPERIMENT_DIR, "editable": ["main.py"]},
     }
     if autoresearch:
         from .autoresearch import config_block, scaffold
@@ -320,31 +337,39 @@ def write_default_project(root, title, runner, autoresearch=False):
     if autoresearch:
         scaffold(root, write_json)
     else:
-        write_json(root / "script" / "stage.json", {
-            "name": "script",
-            "command": "python script.py --ctx ${CTX}",
-            "working_dir": "script",
+        write_json(root / STAGE_MANIFEST, {
+            "name": "main.py",
+            "command": "python main.py --ctx ${CTX}",
+            "working_dir": EXPERIMENT_DIR,
             "interface_version": "1",
         })
-        write_json(root / "script" / "params.json", {"message": "hello from script params"})
-        write_json(root / "script" / "params.schema.json", {
+        write_json(root / PARAMS_FILE, {"message": "hello from experiment params"})
+        write_json(root / PARAMS_SCHEMA_FILE, {
             "type": "object",
             "properties": {"message": {"type": "string", "title": "Message", "default": "hello from script params"}},
             "required": ["message"],
         })
-        (root / "script" / "script.py").write_text(DEFAULT_SCRIPT)
+        (root / EXPERIMENT_DIR / "main.py").write_text(DEFAULT_SCRIPT)
     (root / PROJECT_INSTRUCTIONS).write_text(INSTRUCTION_FILE.read_text())
     (root / PROJECT_REPORT_INSTRUCTIONS).write_text(BUILTIN_REPORT_INSTRUCTIONS.read_text())
     (root / "AGENTS.md").write_text(AGENTS_TEXT)
     (root / "CLAUDE.md").write_text(AGENTS_TEXT)
-    write_json(root / ".mcp.json", {"mcpServers": {"autoexp": {"command": "autoexp", "args": ["mcp"]}}})
+    mcp_command = sys.executable
+    mcp_args = ["-m", "autoexp", "mcp"]
+    write_json(root / ".mcp.json", {"mcpServers": {"autoexp": {"command": mcp_command, "args": mcp_args}}})
+    codex = root / ".codex"
+    codex.mkdir()
+    (codex / "config.toml").write_text(
+        f"[mcp_servers.autoexp]\ncommand = {json.dumps(mcp_command)}\n"
+        f"args = {json.dumps(mcp_args)}\n"
+    )
     (root / APP_ENV).write_text(
         "# Project-local environment for Autoexp runs.\n"
         "# Values here are passed to the runner and remain outside Autoexp history.\n"
-        "AUTOEXP_MESSAGE=hello from app.env\n"
+        "AUTOEXP_MESSAGE=hello from .env\n"
     )
     (root / ".gitignore").write_text(
-        "/.autoexp/\n/app.env\n/index.sqlite\n/runs/\n/server/\n__pycache__/\n*.pyc\n"
+        "/.autoexp/\n/.env\n/runs/\n/server/\n__pycache__/\n*.pyc\n"
     )
 
 
@@ -358,11 +383,11 @@ def create_project(root, title, runner="local", autoresearch=False):
     write_default_project(root, title, runner, autoresearch)
     autoexp_git(["init", "-b", "main"], root=root)
     require_autoexp_git_repo(root)
-    (root / AUTOEXP_GIT_DIR / "info" / "exclude").write_text("/.mcp.json\n/AGENTS.md\n/CLAUDE.md\n")
+    (root / AUTOEXP_GIT_DIR / "info" / "exclude").write_text("/.mcp.json\n/.codex/\n/AGENTS.md\n/CLAUDE.md\n/.env\n/runs/\n")
     for key, value in (("user.name", "Autoexp"), ("user.email", "autoexp@local")):
         if not autoexp_git(["config", key], root=root, capture=True, check=False):
             autoexp_git(["config", key, value], root=root)
     init_db(root)
-    autoexp_git(["add", *source_paths(root)], root=root)
+    autoexp_git(["add", "-f", *source_paths(root)], root=root)
     autoexp_git(["commit", "-m", "autoexp init"], root=root)
     return root

@@ -33,8 +33,12 @@ from .store import (
 )
 from .workspace import (
     APP_ENV,
+    EXPERIMENT_DIR,
+    PARAMS_FILE,
+    PARAMS_SCHEMA_FILE,
     PROJECT_CONFIG,
     PROJECT_INSTRUCTIONS,
+    STAGE_MANIFEST,
     ensure_within_project,
     is_project_root,
     project_entry,
@@ -94,7 +98,25 @@ def run_row(row, root):
     run["stage_status"] = json_value(run.get("stage_status"))
     run["report_path"] = report_path_for_run(run, root)
     run["output_files"] = output_files_for_run(run, root)
+    trigger = get_trigger(run["trigger_id"], root) if run.get("trigger_id") else None
+    metadata = (trigger or {}).get("metadata") or {}
+    run["title"] = metadata.get("title") or _report_title(run, root)
     return run
+
+
+def _report_title(run, root):
+    """Best-effort short title for older runs that predate explicit run titles."""
+    path = run.get("report_path")
+    if path:
+        target = Path(root) / path
+        if target.is_file() and target.resolve().is_relative_to(Path(root).resolve()):
+            for line in target.read_text(errors="replace").splitlines()[:20]:
+                heading = line.removeprefix("+").strip()
+                if heading.startswith("# "):
+                    title = heading[2:].strip()
+                    return title.removesuffix(" report")[:80]
+    name = Path(run.get("script_name") or "run").stem.replace("_", " ").replace("-", " ")
+    return name.capitalize()
 
 
 def list_runs(limit=20, root=None):
@@ -102,16 +124,36 @@ def list_runs(limit=20, root=None):
     limit = max(1, min(int(limit), 200))
     conn = db(root)
     rows = conn.execute(
-        "select * from runs order by created_at desc, rowid desc limit ?", (limit,)
+        """select r.*, s.params_hash, s.manifest_hash,
+                  s.runtime_config_hash as snapshot_runtime_hash
+           from runs r left join source_snapshots s on s.snapshot_id = r.source_snapshot_id
+           order by r.created_at desc, r.rowid desc limit ?""",
+        (limit,),
     ).fetchall()
     conn.close()
-    return [run_row(row, root) for row in rows]
+    runs = [run_row(row, root) for row in rows]
+    for index, run in enumerate(runs):
+        previous = runs[index + 1] if index + 1 < len(runs) else None
+        changes = []
+        if previous:
+            if run.get("script_hash") != previous.get("script_hash"):
+                changes.append("code")
+            if run.get("params_hash") != previous.get("params_hash"):
+                changes.append("params")
+            if run.get("manifest_hash") != previous.get("manifest_hash"):
+                changes.append("stage")
+            if run.get("snapshot_runtime_hash") != previous.get("snapshot_runtime_hash"):
+                changes.append("runtime")
+            if not changes and run.get("capsule_hash") == previous.get("capsule_hash") and run.get("output_hash") != previous.get("output_hash"):
+                changes.append("output drift")
+        run["changes"] = changes or (["baseline"] if previous is None else ["same inputs"])
+    return runs
 
 
 def read_script_params(root=None):
     root = resolve_root(root)
-    schema_path = _safe_script_path(root / "script", "params.schema.json")
-    params_path = _safe_script_path(root / "script", "params.json")
+    schema_path = _safe_project_path(root, PARAMS_SCHEMA_FILE)
+    params_path = _safe_project_path(root, PARAMS_FILE)
     return {
         "schema": read_json(schema_path) if schema_path.exists() else None,
         "params": read_json(params_path) if params_path.exists() else None,
@@ -123,7 +165,7 @@ def write_script_params(params, root=None, *, trigger_kind=None, actor_name=None
         raise ValueError("params must be a JSON object")
     root = resolve_root(root)
     init_db(root)
-    write_json(_safe_script_path(root / "script", "params.json"), params)
+    write_json(_safe_project_path(root, PARAMS_FILE), params)
     trigger = create_trigger(
         trigger_kind,
         root=root,
@@ -138,20 +180,31 @@ def write_script_params(params, root=None, *, trigger_kind=None, actor_name=None
     return {**read_script_params(root), "snapshot": snapshot}
 
 
-def _safe_script_path(script_root, rel):
-    script_root = Path(script_root)
-    if script_root.is_symlink():
-        raise ValueError("script directory must not be a symlink")
-    resolved_root = script_root.resolve()
-    path = script_root / rel
-    cursor = script_root
+def _safe_project_path(project_root, rel):
+    project_root = Path(project_root)
+    resolved_root = project_root.resolve()
+    path = project_root / rel
+    cursor = project_root
     for part in Path(rel).parts:
         cursor /= part
         if cursor.is_symlink():
-            raise ValueError(f"script path must not contain symlinks: {rel}")
+            raise ValueError(f"project path must not contain symlinks: {rel}")
     if not path.resolve(strict=False).is_relative_to(resolved_root):
-        raise ValueError(f"script path must stay inside script/: {rel}")
+        raise ValueError(f"path must stay inside the project: {rel}")
     return path
+
+
+def _safe_script_path(script_root, rel):
+    script_root = Path(script_root)
+    if script_root.is_symlink():
+        raise ValueError("experiment directory must not be a symlink")
+    return _safe_project_path(script_root, rel)
+
+
+def _editable_source_files(source_root):
+    config = read_json(_safe_project_path(source_root, PROJECT_CONFIG))
+    source = config.get("source") if isinstance(config.get("source"), dict) else {}
+    return tuple(source.get("editable") or ())
 
 
 def run_source(run_id, root=None):
@@ -159,14 +212,14 @@ def run_source(run_id, root=None):
     root = resolve_root(root)
     run = get_run(run_id, root)
     def read_files(source_root):
-        base = source_root / "script"
+        base = source_root / EXPERIMENT_DIR
         if base.is_symlink() or not base.is_dir():
-            raise ValueError("snapshot script directory is invalid")
-        skip = {"stage.json", "params.json", "params.schema.json"}
+            raise ValueError("snapshot experiment directory is invalid")
+        editable = set(_editable_source_files(source_root))
         files = []
         for item in sorted(base.rglob("*")):
             rel = item.relative_to(base)
-            if item.is_symlink() or not item.is_file() or rel.as_posix() in skip:
+            if item.is_symlink() or not item.is_file() or rel.as_posix() not in editable:
                 continue
             safe = _safe_script_path(base, rel)
             files.append({"path": rel.as_posix(), "text": safe.read_text(errors="replace")})
@@ -337,7 +390,7 @@ def next_script_version(source_root, rel):
             base = prefix
 
     highest = 1  # a bare `base` (no suffix) counts as version 1
-    script_root = Path(source_root) / "script"
+    script_root = Path(source_root) / EXPERIMENT_DIR
     if script_root.is_symlink() or not script_root.is_dir():
         raise ValueError("snapshot script directory is invalid")
     for script in script_root.rglob("*"):
@@ -399,7 +452,7 @@ def save_script_file(
     """Derive an edited source snapshot without creating an execution row."""
     root = resolve_root(root)
     init_db(root)
-    rel = ensure_within_project(path, "path must stay inside script/")
+    rel = ensure_within_project(path, "path must stay inside experiment/")
     if project_mode(root) == "autoresearch":
         from .autoresearch import (
             ResearchConfig,
@@ -408,7 +461,7 @@ def save_script_file(
         )
 
         ensure_research_file_editable(root, rel)
-        research_path = f"script/{rel.as_posix()}"
+        research_path = f"{EXPERIMENT_DIR}/{rel.as_posix()}"
         config = ResearchConfig.load(root)
         if (
             config.role_of(research_path) in {"human", "agent"}
@@ -430,11 +483,13 @@ def save_script_file(
         source_root = Path(tmp)
         materialize_snapshot(base["snapshot_id"], source_root, root)
         saved_rel = (
-            ensure_within_project(save_as, "save_as must stay inside script/")
+            ensure_within_project(save_as, "save_as must stay inside experiment/")
             if save_as
             else Path(next_script_version(source_root, rel))
         )
-        script_root = source_root / "script"
+        script_root = source_root / EXPERIMENT_DIR
+        if rel.as_posix() not in _editable_source_files(source_root):
+            raise ValueError(f"file is not editable in the script interface: {rel.as_posix()}")
         source = _safe_script_path(script_root, rel)
         if source.is_symlink() or not source.is_file():
             raise ValueError(f"unknown script file: {rel.as_posix()}")
@@ -443,10 +498,15 @@ def save_script_file(
             source.unlink()
         edited.parent.mkdir(parents=True, exist_ok=True)
         edited.write_text(text)
-        manifest = _safe_script_path(script_root, "stage.json")
+        manifest = _safe_project_path(source_root, STAGE_MANIFEST)
         if manifest.is_symlink() or not manifest.is_file():
             raise ValueError("snapshot stage.json is invalid")
         _retarget_manifest(manifest, rel, saved_rel)
+        config_path = _safe_project_path(source_root, PROJECT_CONFIG)
+        config = read_json(config_path)
+        editable = config.setdefault("source", {}).setdefault("editable", [])
+        config["source"]["editable"] = [saved_rel.as_posix() if item == rel.as_posix() else item for item in editable]
+        write_json(config_path, config)
         snapshot = capture_source_tree(
             source_root,
             root,
@@ -461,7 +521,7 @@ def _retarget_manifest(manifest_path, old_rel, new_rel):
     """Point stage.json's name/command at the newly saved script file."""
     manifest = read_json(manifest_path)
     if not isinstance(manifest, dict):
-        raise ValueError("script/stage.json must contain a JSON object")
+        raise ValueError(f"{STAGE_MANIFEST} must contain a JSON object")
     command = manifest.get("command", "")
     for candidate in (old_rel.as_posix(), old_rel.name, str(manifest.get("name") or "")):
         if candidate and candidate in command:
@@ -499,17 +559,21 @@ def diff_runs(run_a, run_b, root=None):
     )
 
 
-def run_autoexp(run_id=None, root=None, *, snapshot_id=None, trigger_kind="mcp", actor_name="autoexp-mcp"):
+def run_autoexp(run_id=None, root=None, *, snapshot_id=None, trigger_kind="mcp", actor_name="autoexp-mcp", title=None):
     """Execute synchronously through the shared lifecycle."""
     from .execution import execute
 
     root = resolve_root(root)
+    title = str(title or "").strip()
+    if len(title) > 80:
+        raise ValueError("run title must be 80 characters or fewer")
     return execute(
         root=root,
         run_id=run_id,
         snapshot_id=snapshot_id,
         trigger_kind=trigger_kind,
         actor_name=actor_name,
+        metadata={"title": title} if title else None,
     )
 
 
@@ -526,8 +590,8 @@ def doctor(root=None):
         checks.append({"name": name, "ok": bool(ok), "detail": detail, "required": bool(required)})
 
     add("project_root", is_project_root(root), str(root))
-    add("autoexp.md", (root / PROJECT_INSTRUCTIONS).is_file())
-    add("script/stage.json", (root / "script" / "stage.json").is_file())
+    add(PROJECT_INSTRUCTIONS, (root / PROJECT_INSTRUCTIONS).is_file())
+    add(STAGE_MANIFEST, (root / STAGE_MANIFEST).is_file())
 
     runner = "local"
     try:
@@ -547,8 +611,8 @@ def doctor(root=None):
         add("stage_manifest_keys", False, str(exc))
 
     init_db(root)
-    add("index.sqlite", (root / "index.sqlite").is_file())
-    add("private_git", (root / ".autoexp" / "git").is_dir())
+    add("state.sqlite", (root / ".autoexp" / "state.sqlite").is_file())
+    add("private_git", (root / ".autoexp" / "repository").is_dir())
 
     conn = db(root)
     broken_runs = conn.execute(
@@ -587,7 +651,7 @@ def doctor(root=None):
     conn.close()
 
     gitignore = root / ".gitignore"
-    add("app.env_ignored", APP_ENV in gitignore.read_text() if gitignore.is_file() else False)
+    add(".env_ignored", APP_ENV in gitignore.read_text() if gitignore.is_file() else False)
 
     try:
         require_autoexp_git_repo(root)

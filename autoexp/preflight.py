@@ -6,8 +6,10 @@ from pathlib import Path
 from .runner import docker_ready, runner_identity
 from .workspace import (
     APP_ENV,
+    EXPERIMENT_DIR,
     PROJECT_CONFIG,
     PROJECT_REPORT_INSTRUCTIONS,
+    STAGE_MANIFEST,
     ensure_within_project,
     is_project_root,
     read_json,
@@ -43,10 +45,10 @@ def standard_preflight(root=None, source_root=None):
 
     add("project", is_project_root(root), f"invalid Autoexp project: {root}")
     add("git", shutil.which("git") is not None, "required command not found: git")
-    git_dir = root / ".autoexp" / "git"
+    git_dir = root / ".autoexp" / "repository"
     add(
         "private_git",
-        git_dir.is_dir() and safe_path(root, ".autoexp/git"),
+        git_dir.is_dir() and safe_path(root, ".autoexp/repository"),
         f"{root} is missing its Autoexp git repository",
     )
     add(
@@ -60,9 +62,9 @@ def standard_preflight(root=None, source_root=None):
             not (root / APP_ENV).exists()
             and not (root / APP_ENV).is_symlink()
         ) or safe_path(root, APP_ENV),
-        "app.env must stay inside the autoexp project",
+        ".env must stay inside the autoexp project",
     )
-    script_dir = source_root / "script"
+    script_dir = source_root / EXPERIMENT_DIR
     source_symlinks = (
         [path for path in script_dir.rglob("*") if path.is_symlink()]
         if script_dir.is_dir() and not script_dir.is_symlink()
@@ -70,7 +72,7 @@ def standard_preflight(root=None, source_root=None):
     )
     add(
         "source_paths",
-        safe_path(source_root, "script")
+        safe_path(source_root, EXPERIMENT_DIR)
         and safe_path(source_root, PROJECT_CONFIG)
         and safe_path(source_root, ".gitignore")
         and not source_symlinks,
@@ -80,26 +82,26 @@ def standard_preflight(root=None, source_root=None):
     config = None
     try:
         if not safe_path(source_root, PROJECT_CONFIG):
-            raise ValueError("autoexp.json must stay inside the source snapshot")
+            raise ValueError(f"{PROJECT_CONFIG} must stay inside the source snapshot")
         config = read_json(source_root / PROJECT_CONFIG)
-        add("config", isinstance(config, dict), "autoexp.json must contain a JSON object")
+        add("config", isinstance(config, dict), f"{PROJECT_CONFIG} must contain a JSON object")
     except (OSError, ValueError) as exc:
         add("config", False, exc)
 
     manifest = None
     try:
-        if not safe_path(source_root, "script/stage.json"):
-            raise ValueError("script/stage.json must stay inside the source snapshot")
-        manifest = read_json(source_root / "script" / "stage.json")
+        if not safe_path(source_root, STAGE_MANIFEST):
+            raise ValueError(f"{STAGE_MANIFEST} must stay inside the source snapshot")
+        manifest = read_json(source_root / STAGE_MANIFEST)
         if not isinstance(manifest, dict):
-            add("manifest", False, "script/stage.json must contain a JSON object")
+            add("manifest", False, f"{STAGE_MANIFEST} must contain a JSON object")
             manifest = None
         else:
             missing = [
                 key for key in ("name", "command", "working_dir", "interface_version")
                 if key not in manifest
             ]
-            add("manifest", not missing, f"script/stage.json missing: {', '.join(missing)}")
+            add("manifest", not missing, f"{STAGE_MANIFEST} missing: {', '.join(missing)}")
     except (OSError, TypeError, ValueError) as exc:
         add("manifest", False, exc)
 

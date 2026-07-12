@@ -85,6 +85,11 @@ class RunManager:
             self.job["status"] = "canceled" if canceled else ("success" if returncode == 0 else "failed")
             self.job["returncode"] = returncode
             self.job["ended_at"] = now()
+            print(
+                f"[autoexp] run {self.job.get('run_id') or self.job['job_id']} "
+                f"{self.job['status']}",
+                flush=True,
+            )
 
         public_keys = (
             "job_id", "run_id", "pid", "status", "started_at", "ended_at",
@@ -141,6 +146,10 @@ class RunManager:
                 "returncode": None,
                 "log_path": str(log_path),
             }
+            action = f"re-run of {run_id}" if run_id else (
+                f"snapshot {snapshot_id}" if snapshot_id else "new run"
+            )
+            print(f"[autoexp] started {action}", flush=True)
             return True, self._payload()
 
     def kill(self, force=False):

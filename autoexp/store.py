@@ -6,7 +6,8 @@ from pathlib import Path
 from .workspace import die, resolve_root, source_paths
 
 
-AUTOEXP_GIT_DIR = ".autoexp/git"
+AUTOEXP_GIT_DIR = ".autoexp/repository"
+AUTOEXP_DB = ".autoexp/state.sqlite"
 
 
 IMMUTABILITY_TRIGGERS = """
@@ -118,7 +119,7 @@ end;
 # ======================================================================
 
 def autoexp_git(args, root=None, capture=False, check=True):
-    """Run git against the project's private .autoexp/git store."""
+    """Run git against the project's private snapshot repository."""
     root = resolve_root(root)
     cmd = ["git", "--git-dir", str(root / AUTOEXP_GIT_DIR), "--work-tree", str(root), *args]
     try:
@@ -160,7 +161,7 @@ def git_status(paths, root=None):
 def git_commit_source(message, root=None):
     """Stage and commit the source set; return (commit, changed?)."""
     paths = source_paths(root)
-    autoexp_git(["add", *paths], root=root)
+    autoexp_git(["add", "-f", *paths], root=root)
     staged = autoexp_git(["diff", "--cached", "--name-only", "--", *paths], root=root, capture=True)
     if not staged:
         return current_autoexp_commit(root), False
@@ -174,7 +175,7 @@ def git_commit_source(message, root=None):
 
 def db(root=None):
     root = resolve_root(root)
-    conn = sqlite3.connect(root / "index.sqlite")
+    conn = sqlite3.connect(root / AUTOEXP_DB)
     conn.row_factory = sqlite3.Row
     conn.execute("pragma foreign_keys = on")
     return conn
@@ -458,6 +459,26 @@ def init_db(root=None):
             alter table schema_metadata add column
                 research_migration_complete integer not null default 0;
             update schema_metadata set schema_version = 4;
+            commit;
+            """
+        )
+
+    if version[0] < 5:
+        conn.executescript(
+            """
+            begin;
+            create table milestones(
+                milestone_id text primary key,
+                target_kind text not null check(target_kind in ('run', 'attempt')),
+                target_id text not null,
+                title text not null check(length(trim(title)) > 0),
+                significance text not null check(length(trim(significance)) > 0),
+                actor_name text,
+                created_at text not null,
+                unique(target_kind, target_id)
+            );
+            create index idx_milestones_created on milestones(created_at desc);
+            update schema_metadata set schema_version = 5;
             commit;
             """
         )

@@ -29,7 +29,7 @@ def init_cmd(args):
         print("mode: autoresearch")
     if not docker:
         print(
-            'sandboxing: install Docker, then set "runner": "docker" in autoexp.json',
+            'sandboxing: install Docker, then set "runner": "docker" in .autoexp/project.json',
             file=sys.stderr,
         )
 

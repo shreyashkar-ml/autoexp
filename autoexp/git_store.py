@@ -61,7 +61,7 @@ def commit_source_tree(source_root, parent_commit, message, root=None):
     try:
         _git(root, ["read-tree", parent_commit], env=env)
         paths = source_paths(source_root)
-        _git(root, [f"--work-tree={source_root}", "add", "-A", "--", *paths], env=env)
+        _git(root, [f"--work-tree={source_root}", "add", "-f", "-A", "--", *paths], env=env)
         tree = _git(root, ["write-tree"], env=env)
         return _git(root, ["commit-tree", tree, "-p", parent_commit, "-m", message], env=env)
     finally:

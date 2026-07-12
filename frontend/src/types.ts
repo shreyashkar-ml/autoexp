@@ -3,6 +3,8 @@ export type Run = {
   status: string;
   script_name?: string;
   script?: string;
+  title?: string;
+  changes?: string[];
   report_path?: string;
   output_files?: string[];
   created_at?: string;
@@ -141,6 +143,12 @@ export type ReportPayload = {
   run_id: string;
   path: string;
   text: string;
+};
+
+export type ProjectReportPayload = {
+  path: string;
+  text: string;
+  exists: boolean;
 };
 
 export type InstructionPayload = {

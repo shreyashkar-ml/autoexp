@@ -25,11 +25,18 @@ import {
   Bot,
   Upload,
   X,
+  ZoomIn,
+  ZoomOut,
   type LucideIcon,
 } from "lucide-react";
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
+import hljs from "highlight.js/lib/core";
+import ini from "highlight.js/lib/languages/ini";
+import jsonLanguage from "highlight.js/lib/languages/json";
+import markdown from "highlight.js/lib/languages/markdown";
+import python from "highlight.js/lib/languages/python";
 
 import { api } from "@/api";
 import type {
@@ -39,6 +46,7 @@ import type {
   InstructionPayload,
   ParamsPayload,
   Project,
+  ProjectReportPayload,
   ReportPayload,
   ResearchExperiment,
   ResearchFilePayload,
@@ -53,6 +61,11 @@ import type {
   SourcePayload,
 } from "@/types";
 
+hljs.registerLanguage("ini", ini);
+hljs.registerLanguage("json", jsonLanguage);
+hljs.registerLanguage("markdown", markdown);
+hljs.registerLanguage("python", python);
+
 type Theme = "light" | "dark";
 type ProjectMode = "standard" | "autoresearch";
 type StandardTab = "overview" | "script" | "output" | "logs" | "report" | "diff";
@@ -64,6 +77,8 @@ type Panel =
   | { kind: "program"; data: ResearchFilePayload }
   | { kind: "evaluator"; data: ResearchFilePayload }
   | { kind: "attempt"; experiment: ResearchExperiment; objective: ResearchObjective }
+  | { kind: "preflight"; data: ResearchState }
+  | { kind: "project-report"; data: ProjectReportPayload }
   | { kind: "log" };
 type JobState = {
   active: boolean;
@@ -73,20 +88,6 @@ type JobState = {
 };
 type Toast = { id: number; message: string; kind?: "ok" | "bad" };
 type RunRequestPayload = Run | { run?: Run | null; run_id?: string | null; job?: { run_id?: string | null } };
-
-const EMPTY_RESEARCH: ResearchState = {
-  contract: { contract_id: "preview", status: "draft", current_best_snapshot_id: null, evaluator_hash: null },
-  objective: { metric: "score", direction: "max", baseline: null, best: null, budget_sec: 300 },
-  preflight: { ok: false, checks: [] },
-  files: [
-    { path: "script/program.md", role: "human", desc: "research directions and loop rules" },
-    { path: "script/train.py", role: "agent", desc: "the implementation the agent improves" },
-    { path: "script/evaluate.py", role: "frozen", desc: "the stable evaluator" },
-  ],
-  experiments: [],
-  loop: { active: false, phase: "idle", tag: null },
-  can_import_baseline: false,
-};
 
 function statusLabel(status: string) {
   return status === "success" ? "completed" : status || "unknown";
@@ -98,12 +99,6 @@ function formatScore(score: number | null) {
   if (magnitude >= 1000) return score.toLocaleString(undefined, { maximumFractionDigits: 2 });
   if (magnitude > 0 && magnitude < 0.001) return score.toExponential(2);
   return score.toFixed(4);
-}
-
-function formatBudget(seconds: number) {
-  if (seconds < 60) return `${seconds} sec`;
-  if (seconds % 60 === 0) return `${seconds / 60} min`;
-  return `${Math.floor(seconds / 60)}m ${seconds % 60}s`;
 }
 
 function attemptKey(attempt: ResearchExperiment) {
@@ -170,6 +165,14 @@ function requestedRun(data: RunRequestPayload): Run | null {
   return "status" in data ? data as Run : { run_id: runId, status: "queued" };
 }
 
+function normalizeMarkdown(text: string) {
+  const lines = text.split("\n");
+  const content = lines.filter((line) => line.length > 0);
+  return content.length > 0 && content.every((line) => line.startsWith("+"))
+    ? lines.map((line) => line.startsWith("+") ? line.slice(1) : line).join("\n")
+    : text;
+}
+
 export default function App() {
   const [theme, setTheme] = useState<Theme>(() =>
     window.localStorage.getItem("autoexp-theme") === "dark" ? "dark" : "light",
@@ -197,7 +200,7 @@ export default function App() {
     projectMode === "autoresearch" ? item.mode === "autoresearch" : item.mode !== "autoresearch",
   );
   const hasAvailableProjects = filteredProjects.some((item) => item.exists);
-  const displayedResearch = researchView ? (project ? research : EMPTY_RESEARCH) : null;
+  const displayedResearch = researchView && project ? research : null;
   const active = isResearch ? Boolean(research?.loop.active) : job.active;
   const researchReady = !isResearch || Boolean(research?.preflight.ok);
 
@@ -242,6 +245,34 @@ export default function App() {
     setProjectId(next?.project_id || "");
   }
 
+  async function openProjectPath() {
+    if (!projectId) return;
+    try {
+      await api<{ ok: boolean; path: string }>("/api/open-path", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ project_id: projectId }),
+      });
+      toast("Opened project path", "ok");
+    } catch (caught) {
+      toast(caught instanceof Error ? caught.message : String(caught), "bad");
+    }
+  }
+
+  async function openProjectReport() {
+    if (!projectId) return;
+    setLoading("project-report");
+    setError("");
+    try {
+      const data = await api<ProjectReportPayload>(projectPath("/api/project-report"));
+      setPanel({ kind: "project-report", data });
+    } catch (caught) {
+      setError(caught instanceof Error ? caught.message : String(caught));
+    } finally {
+      setLoading("");
+    }
+  }
+
   async function loadStatus(id = projectId) {
     if (!id) {
       setJob({ active: false, job: null });
@@ -276,6 +307,7 @@ export default function App() {
     const data = await api<ResearchState>(projectPath("/api/research", id));
     setResearch(data);
     setPanel((current) => {
+      if (current?.kind === "preflight") return { kind: "preflight", data };
       if (current?.kind !== "attempt") return current;
       const updated = data.experiments.find((item) => attemptKey(item) === attemptKey(current.experiment));
       return updated ? { ...current, experiment: updated, objective: data.objective } : current;
@@ -612,7 +644,7 @@ export default function App() {
       const data = await api<ResearchFilePayload>("/api/research/file", {
         method: "PUT",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ project_id: projectId, path: "script/train.py", text }),
+        body: JSON.stringify({ project_id: projectId, path: "experiment/candidate.py", text }),
       });
       await loadResearch(projectId);
       setPanel({ kind: "program", data });
@@ -628,7 +660,7 @@ export default function App() {
 
   const filteredRuns = runs.filter((run) => {
     const text =
-      `${run.run_id} ${run.status} ${run.script_name || ""} ${run.report_path || ""} ${(run.output_files || []).join(" ")}`.toLowerCase();
+      `${run.title || ""} ${run.run_id} ${run.status} ${(run.changes || []).join(" ")} ${run.script_name || ""} ${run.report_path || ""} ${(run.output_files || []).join(" ")}`.toLowerCase();
     return text.includes(query.toLowerCase());
   });
   const metrics = {
@@ -641,6 +673,7 @@ export default function App() {
   return (
     <>
       <div className="shell">
+        <div className="sticky-stack">
         <header className="topbar">
           <div className="wordmark">
             <div className="logo-lockup">
@@ -674,6 +707,7 @@ export default function App() {
               <span className="lbl">project</span>
               <select
                 value={projectId}
+                title={project ? `${project.path} · runner ${project.runner || "local"}` : "Select a project"}
                 onChange={(event) => setProjectId(event.target.value)}
                 disabled={!hasAvailableProjects}
               >
@@ -692,6 +726,16 @@ export default function App() {
               </select>
               <ChevronDown className="chev" size={15} />
             </label>
+            {project ? (
+              <button className="btn open-path" onClick={openProjectPath} title={project.path}>
+                <FolderOpen size={14} /> Open path
+              </button>
+            ) : null}
+            {project ? (
+              <button className="btn open-path" onClick={openProjectReport} title="Project report">
+                <FileText size={14} /> Project report
+              </button>
+            ) : null}
             <span className={`lamp${active ? " live" : ""}`}>
               <span className="dot" />
               {active
@@ -700,6 +744,37 @@ export default function App() {
                   : `run ${job.job?.status || "running"}`
                 : "idle"}
             </span>
+            {project ? <span className="bar-divider" /> : null}
+            {project && !isResearch ? (
+              <div className="quick-actions">
+                {job.active ? (
+                  <button className="btn danger" onClick={stopRun} disabled={loading === "stop"}>
+                    <Square size={14} fill="currentColor" /> Stop
+                  </button>
+                ) : (
+                  <button className="btn primary" onClick={() => startRun()} disabled={loading === "start" || !project.exists} title="Run current experiment · ⌘↵">
+                    <Play size={14} fill="currentColor" /> Run
+                  </button>
+                )}
+                <button className="icon-btn" onClick={() => setPanel({ kind: "log" })} title="Worker log" aria-label="Worker log"><Terminal size={15} /></button>
+                <button className="icon-btn" onClick={openParams} disabled={!project.exists} title="Parameters" aria-label="Parameters"><SlidersHorizontal size={15} /></button>
+                <button className="icon-btn" onClick={openInstruction} disabled={!project.exists} title="Report guidance" aria-label="Report guidance"><FileText size={15} /></button>
+              </div>
+            ) : null}
+            {project && isResearch && research ? (
+              <div className="quick-actions">
+                {research.loop.active ? (
+                  <button className="btn danger" onClick={stopResearchLoop} disabled={loading === "research-loop"}><Square size={14} fill="currentColor" /> Stop</button>
+                ) : (
+                  <button className="btn primary" onClick={startResearchLoop} disabled={loading === "research-loop" || !research.preflight.ok} title="Start Autoresearch loop · ⌘↵"><Repeat2 size={14} /> Start loop</button>
+                )}
+                <button className="icon-btn" onClick={() => openResearchFile("experiment/program.md")} title="Research program" aria-label="Research program"><FileText size={15} /></button>
+                <button className={`icon-btn readiness${research.preflight.ok ? " ready" : " blocked"}`} onClick={() => setPanel({ kind: "preflight", data: research })} title="Preflight checks" aria-label="Preflight checks">
+                  {research.preflight.ok ? <Check size={15} /> : <AlertTriangle size={15} />}
+                </button>
+                <button className="icon-btn" onClick={() => setPanel({ kind: "log" })} title="Agent log" aria-label="Agent log"><Terminal size={15} /></button>
+              </div>
+            ) : null}
             <button className="icon-btn" onClick={refresh} title="Refresh" aria-label="Refresh">
               <RefreshCw size={16} />
             </button>
@@ -714,85 +789,7 @@ export default function App() {
           </div>
         </header>
 
-        {project && !isResearch ? (
-          <section className="band">
-            <div className="meta">
-              <span className="title">{project.title}</span>
-              <span className="path">{project.path}</span>
-            </div>
-            <span className="runner">runner · {project.runner || "local"}</span>
-            <div className="actions">
-              {job.active ? (
-                <button className="btn danger" onClick={stopRun} disabled={loading === "stop"}>
-                  <Square size={15} fill="currentColor" /> Stop run
-                </button>
-              ) : (
-                <button
-                  className="btn primary"
-                  onClick={() => startRun()}
-                  disabled={loading === "start" || !project.exists}
-                  title="Run the current script with current params · ⌘↵"
-                >
-                  <Play size={14} fill="currentColor" /> Run
-                </button>
-              )}
-              <button className="btn" onClick={() => setPanel({ kind: "log" })}>
-                <Terminal size={15} /> Worker log
-              </button>
-              <button className="btn" onClick={openParams} disabled={!project.exists}>
-                <SlidersHorizontal size={15} /> Params
-              </button>
-              <button className="btn" onClick={openInstruction} disabled={!project.exists}>
-                <FileText size={15} /> Report instruction
-              </button>
-            </div>
-          </section>
-        ) : null}
-
-        {project && isResearch && research ? (
-          <section className="band">
-            <div className="meta">
-              <span className="title">{project.title}</span>
-              <span className="path">{project.path}</span>
-            </div>
-            <div className="research-chips">
-              <span className="chip">
-                <Target size={14} /> {research.objective.metric}
-                <span className="dir">{research.objective.direction === "min" ? "↓ min" : "↑ max"}</span>
-              </span>
-              <span className="chip best">
-                <FlaskConical size={13} /> best <b>{formatScore(research.objective.best)}</b>
-                <span className="from">/ baseline {formatScore(research.objective.baseline)}</span>
-              </span>
-              <span className="chip"><Repeat2 size={13} /> {formatBudget(research.objective.budget_sec)}/exp</span>
-              {research.contract.current_best_snapshot_id ? (
-                <span className="chip"><GitCommit size={13} /> best source <b>{research.contract.current_best_snapshot_id}</b></span>
-              ) : null}
-            </div>
-            <div className="actions">
-              {research.loop.active ? (
-                <button className="btn danger" onClick={stopResearchLoop} disabled={loading === "research-loop"}>
-                  <Square size={15} fill="currentColor" /> Stop loop
-                </button>
-              ) : (
-                <button
-                  className="btn primary"
-                  onClick={startResearchLoop}
-                  disabled={loading === "research-loop" || !research.preflight.ok}
-                  title={research.preflight.ok ? "Start the Autoresearch loop · ⌘↵" : "Resolve required preflight checks before starting"}
-                >
-                  <Repeat2 size={15} /> Start loop
-                </button>
-              )}
-              <button className="btn" onClick={() => openResearchFile("script/program.md")}>
-                <FileText size={15} /> program.md
-              </button>
-              <button className="btn" onClick={() => setPanel({ kind: "log" })}>
-                <Terminal size={15} /> Agent log
-              </button>
-            </div>
-          </section>
-        ) : null}
+        </div>
 
         {error ? (
           <div className="err-banner">
@@ -820,6 +817,22 @@ export default function App() {
           />
         ) : null}
 
+        {researchView && !project ? (
+          <>
+            <section className="strip compact-strip">
+              <Stat label="Experiments" value={0} tone="runs" />
+              <Stat label="Kept" value={0} tone="pass" />
+              <Stat label="Reverted" value={0} tone="rep" />
+              <div className="stat pass"><span className="k">Improvement</span><span className="v">—</span></div>
+            </section>
+            <section className="card research-empty-state">
+              <Target size={22} />
+              <div><h2>No Autoresearch project</h2><p>Create one to establish a baseline and begin the ratchet.</p></div>
+              <span className="cmd"><b>autoexp init</b> metric_lab --autoresearch</span>
+            </section>
+          </>
+        ) : null}
+
         {!researchView ? <>
         <section className="strip">
           <Stat label="Runs" value={metrics.total} tone="runs" />
@@ -834,11 +847,11 @@ export default function App() {
         >
           <div className="card">
             <div className="card-head">
-              <div>
+              <div className="card-head-copy">
                 <div className="eyebrow">ledger</div>
                 <h2>Recent runs</h2>
+                {project ? <span className="sub">Immutable source, parameters, output, and report for every run.</span> : null}
               </div>
-              {project ? <span className="sub">Each run pins the script and config that produced it</span> : null}
               <div className="search">
                 <Search className="si" size={15} />
                 <input
@@ -1008,21 +1021,18 @@ function ResearchDashboard({
         <BaselineImport onImport={onImportBaseline} disabled={importing} />
       ) : null}
 
-      <div className="card">
-        <div className="card-head">
+      <div className="card contract-card">
+        <div
+          className="card-head contract-bar"
+          title={`${research.contract.contract_id} · ${research.contract.status} · evaluator ${research.contract.evaluator_hash || "unavailable"}`}
+        >
           <div>
             <div className="eyebrow">contract</div>
             <h2>Files &amp; ownership</h2>
           </div>
-          <span className="sub">The human directs, the agent edits, and the evaluator stays fixed</span>
-          <span className="sub contract-meta">
-            {research.contract.contract_id} · {research.contract.status} · evaluator {research.contract.evaluator_hash || "unavailable"}
-          </span>
+          <ResearchContract files={research.files} onOpen={onOpenFile} disabled={preview} />
         </div>
-        <ResearchContract files={research.files} onOpen={onOpenFile} disabled={preview} />
       </div>
-
-      {!preview ? <ResearchPreflight research={research} /> : null}
 
       <section
         className={`work${panel ? " split" : ""}`}
@@ -1081,6 +1091,11 @@ function RatchetChart({
   emptyText?: string;
 }) {
   const chronological = [...experiments].reverse();
+  const fullMax = Math.max(chronological.length - 1, 1);
+  const [domain, setDomain] = useState<[number, number]>([0, fullMax]);
+  const [hovered, setHovered] = useState<number | null>(null);
+  const drag = useRef<{ x: number; start: number; end: number } | null>(null);
+  useEffect(() => setDomain([0, fullMax]), [fullMax]);
   const scored = chronological.filter(
     (item): item is ResearchExperiment & { score: number } => item.score !== null,
   );
@@ -1094,25 +1109,27 @@ function RatchetChart({
 
   const baseline = objective.baseline ?? scored[0].score;
   const best = objective.best ?? baseline;
-  const values = scored.map((item) => item.score);
+  const visible = chronological.filter((item, index) => item.score !== null && index >= domain[0] && index <= domain[1]);
+  const values = visible.length ? visible.map((item) => item.score as number) : scored.map((item) => item.score);
   const low = Math.min(...values, baseline, best);
   const high = Math.max(...values, baseline, best);
   const padding = (high - low) * 0.18 || Math.max(Math.abs(high) * 0.02, 0.01);
   const min = low - padding;
   const max = high + padding;
-  const width = 720;
-  const height = 210;
-  const left = 56;
-  const right = 18;
-  const top = 14;
-  const bottom = 28;
+  const width = 820;
+  const height = 270;
+  const left = 68;
+  const right = 24;
+  const top = 18;
+  const bottom = 42;
+  const plotWidth = width - left - right;
+  const plotHeight = height - top - bottom;
   const x = (index: number) =>
-    left +
-    (chronological.length <= 1
-      ? 0
-      : (index / (chronological.length - 1)) * (width - left - right));
+    chronological.length === 1
+      ? left + plotWidth / 2
+      : left + ((index - domain[0]) / Math.max(domain[1] - domain[0], 1)) * plotWidth;
   const y = (value: number) =>
-    top + ((max - value) / (max - min)) * (height - top - bottom);
+    top + ((max - value) / (max - min)) * plotHeight;
 
   let currentBest: number | null = objective.baseline;
   const step: [number, number][] = [];
@@ -1125,7 +1142,7 @@ function RatchetChart({
             ? Math.min(currentBest, item.score)
             : Math.max(currentBest, item.score);
     }
-    if (currentBest !== null) step.push([x(index), y(currentBest)]);
+    if (currentBest !== null && index >= domain[0] && index <= domain[1]) step.push([x(index), y(currentBest)]);
   });
   const path = step
     .map((point, index) =>
@@ -1134,31 +1151,116 @@ function RatchetChart({
         : `L ${point[0]} ${step[index - 1][1]} L ${point[0]} ${point[1]}`,
     )
     .join(" ");
-  const ticks = [max, (max + min) / 2, min];
+  const ticks = Array.from({ length: 5 }, (_, index) => max - ((max - min) * index) / 4);
+  const firstAttempt = Math.max(0, Math.ceil(domain[0]));
+  const lastAttempt = Math.min(chronological.length - 1, Math.floor(domain[1]));
+  const xStep = Math.max(1, Math.ceil((lastAttempt - firstAttempt + 1) / 6));
+  const xTicks = Array.from(
+    { length: Math.max(0, Math.floor((lastAttempt - firstAttempt) / xStep) + 1) },
+    (_, index) => firstAttempt + index * xStep,
+  );
+  if (lastAttempt >= firstAttempt && xTicks[xTicks.length - 1] !== lastAttempt) xTicks.push(lastAttempt);
   const lastStep = step[step.length - 1];
+  const scorePath = chronological
+    .map((item, index) => item.score === null || index < domain[0] || index > domain[1] ? null : [x(index), y(item.score)] as const)
+    .filter((point): point is readonly [number, number] => point !== null)
+    .map((point, index) => `${index ? "L" : "M"} ${point[0]} ${point[1]}`)
+    .join(" ");
+
+  function updateDomain(start: number, end: number) {
+    const span = Math.min(fullMax, Math.max(Math.min(2, fullMax), end - start));
+    const nextStart = Math.max(0, Math.min(start, fullMax - span));
+    setDomain([nextStart, nextStart + span]);
+  }
+
+  function zoom(factor: number, center = (domain[0] + domain[1]) / 2) {
+    const span = domain[1] - domain[0];
+    const nextSpan = span * factor;
+    const ratio = span ? (center - domain[0]) / span : 0.5;
+    updateDomain(center - nextSpan * ratio, center + nextSpan * (1 - ratio));
+  }
+
+  const hoveredItem = hovered === null ? null : chronological[hovered];
+  const hoverX = hovered === null ? 0 : x(hovered);
+  const hoverY = hoveredItem?.score === null || hoveredItem?.score === undefined ? 0 : y(hoveredItem.score);
+  const tooltipX = Math.min(width - right - 238, Math.max(left + 8, hoverX + (hoverX > width * 0.65 ? -246 : 12)));
+  const tooltipY = Math.min(height - bottom - 88, Math.max(top + 8, hoverY - 42));
 
   return (
     <div className="chart-wrap">
-      <svg className="ratchet" viewBox={`0 0 ${width} ${height}`} role="img" aria-label="Objective score and best-so-far by attempt">
+      <div className="chart-toolbar">
+        <span>Wheel to zoom · drag to pan · hover for details</span>
+        <div>
+          <button onClick={() => zoom(0.72)} disabled={domain[1] - domain[0] <= Math.min(2, fullMax)} aria-label="Zoom in"><ZoomIn size={14} /></button>
+          <button onClick={() => zoom(1.38)} disabled={domain[0] === 0 && domain[1] === fullMax} aria-label="Zoom out"><ZoomOut size={14} /></button>
+          <button onClick={() => setDomain([0, fullMax])} disabled={domain[0] === 0 && domain[1] === fullMax}>Reset</button>
+        </div>
+      </div>
+      <svg
+        className={`ratchet${drag.current ? " panning" : ""}`}
+        viewBox={`0 0 ${width} ${height}`}
+        role="img"
+        aria-label="Interactive objective score and best-so-far by attempt"
+        onWheel={(event) => {
+          event.preventDefault();
+          const box = event.currentTarget.getBoundingClientRect();
+          const pointer = ((event.clientX - box.left) / box.width) * width;
+          const ratio = Math.max(0, Math.min(1, (pointer - left) / plotWidth));
+          zoom(event.deltaY > 0 ? 1.18 : 0.82, domain[0] + ratio * (domain[1] - domain[0]));
+        }}
+        onPointerDown={(event) => {
+          drag.current = { x: event.clientX, start: domain[0], end: domain[1] };
+          event.currentTarget.setPointerCapture(event.pointerId);
+        }}
+        onPointerMove={(event) => {
+          if (!drag.current) return;
+          const box = event.currentTarget.getBoundingClientRect();
+          const shift = ((event.clientX - drag.current.x) / box.width) * (drag.current.end - drag.current.start);
+          updateDomain(drag.current.start - shift, drag.current.end - shift);
+        }}
+        onPointerUp={() => { drag.current = null; }}
+        onPointerCancel={() => { drag.current = null; }}
+        onPointerLeave={() => setHovered(null)}
+      >
+        <defs>
+          <clipPath id="ratchet-plot"><rect x={left} y={top} width={plotWidth} height={plotHeight} rx="4" /></clipPath>
+          <linearGradient id="ratchet-area" x1="0" y1="0" x2="0" y2="1">
+            <stop offset="0" stopColor="var(--pass)" stopOpacity=".16" />
+            <stop offset="1" stopColor="var(--pass)" stopOpacity="0" />
+          </linearGradient>
+        </defs>
+        <rect className="plot-bg" x={left} y={top} width={plotWidth} height={plotHeight} rx="4" />
         {ticks.map((tick) => (
           <g key={tick}>
             <line className="gl" x1={left} y1={y(tick)} x2={width - right} y2={y(tick)} />
             <text className="tick" x={left - 8} y={y(tick) + 3} textAnchor="end">{formatScore(tick)}</text>
           </g>
         ))}
-        <line className="base" x1={left} y1={y(baseline)} x2={width - right} y2={y(baseline)} />
-        <text className="tick" x={width - right} y={y(baseline) - 5} textAnchor="end">
+        {xTicks.map((index) => (
+          <g key={index}>
+            <line className="xgl" x1={x(index)} y1={top} x2={x(index)} y2={height - bottom} />
+            <text className="tick" x={x(index)} y={height - bottom + 18} textAnchor="middle">{attemptLabel(chronological[index])}</text>
+          </g>
+        ))}
+        <g clipPath="url(#ratchet-plot)">
+          <line className="base" x1={left} y1={y(baseline)} x2={width - right} y2={y(baseline)} />
+          {lastStep && path ? <path className="step-area" d={`${path} L ${lastStep[0]} ${height - bottom} L ${step[0][0]} ${height - bottom} Z`} /> : null}
+          <path className="score-line" d={scorePath} />
+          <path className="step" d={path} />
+        </g>
+        <text className="baseline-label" x={width - right - 5} y={Math.max(top + 11, y(baseline) - 6)} textAnchor="end">
           baseline {formatScore(baseline)}
         </text>
-        <path className="step" d={path} />
         {chronological.map((item, index) =>
           item.score === null ? null : (
             <circle
               key={attemptKey(item)}
-              className={attemptVerdict(item) === "kept" ? "kept" : "rev"}
+              className={`point ${attemptVerdict(item) === "kept" ? "kept" : "rev"}${hovered === index ? " hovered" : ""}`}
               cx={x(index)}
               cy={y(item.score)}
-              r={attemptVerdict(item) === "kept" ? 3.6 : 3.2}
+              r={hovered === index ? 6 : attemptVerdict(item) === "kept" ? 4.5 : 4}
+              visibility={index >= domain[0] && index <= domain[1] ? "visible" : "hidden"}
+              onPointerEnter={(event) => { event.stopPropagation(); setHovered(index); }}
             />
           ),
         )}
@@ -1167,8 +1269,17 @@ function RatchetChart({
             best {formatScore(best)}
           </text>
         ) : null}
-        <text className="tick" x={left} y={height - 8}>a01</text>
-        <text className="tick" x={width - right} y={height - 8} textAnchor="end">attempt →</text>
+        <text className="axis-label" x={(left + width - right) / 2} y={height - 5} textAnchor="middle">Attempt</text>
+        <text className="axis-label" transform={`translate(14 ${(top + height - bottom) / 2}) rotate(-90)`} textAnchor="middle">{objective.metric}</text>
+        {hoveredItem?.score !== null && hoveredItem?.score !== undefined ? (
+          <g className="chart-tooltip" transform={`translate(${tooltipX} ${tooltipY})`} pointerEvents="none">
+            <rect width="238" height="80" rx="7" />
+            <text x="12" y="18" className="tooltip-title">{attemptLabel(hoveredItem)} · {attemptVerdict(hoveredItem) || attemptState(hoveredItem)}</text>
+            <text x="12" y="37">Score <tspan>{formatScore(hoveredItem.score)}</tspan></text>
+            <text x="126" y="37">Change <tspan>{hoveredItem.improvement == null ? "—" : `${hoveredItem.improvement > 0 ? "+" : ""}${formatScore(hoveredItem.improvement)}`}</tspan></text>
+            <text x="12" y="59" className="tooltip-hypothesis">{attemptHypothesis(hoveredItem).slice(0, 48)}</text>
+          </g>
+        ) : null}
       </svg>
     </div>
   );
@@ -1206,7 +1317,7 @@ function BaselineImport({
       <div>
         <div className="eyebrow">baseline</div>
         <h2>Upload your autoresearch loop script</h2>
-        <p>Drop a Python script here to import it as <span className="mono-inline">script/train.py</span>.</p>
+        <p>Drop a Python script here to import it as <span className="mono-inline">experiment/candidate.py</span>.</p>
       </div>
       <button className="btn" disabled={disabled} onClick={() => inputRef.current?.click()}>
         <Upload size={15} /> {disabled ? "Importing…" : "Choose file"}
@@ -1237,34 +1348,29 @@ function ResearchContract({
   return (
     <div className="contract">
       {files.map((file) => (
-        <div className="crow" key={file.path}>
+        <button
+          className={`contract-file ${file.role}`}
+          key={file.path}
+          onClick={() => onOpen(file.path)}
+          disabled={disabled}
+          title={`${file.path} · ${file.desc}${file.hash ? ` · ${file.hash}` : ""}`}
+        >
           <span className={`role ${file.role}`}>
             {file.role === "frozen" ? <Lock size={11} /> : file.role === "agent" ? <Bot size={12} /> : null}
             {file.role}
           </span>
-          <div className="contract-name">
-            <div className="fname">{file.path}</div>
-            <div className="fdesc">{file.desc}</div>
-          </div>
-          <div className="fmeta">
-            {file.hash ? (
-              <span className="fhash"><Lock size={12} /> {file.hash}</span>
-            ) : null}
-            <button className="btn sm" onClick={() => onOpen(file.path)} disabled={disabled}>
-              {file.role === "frozen" ? <Lock size={13} /> : <Pencil size={13} />}
-              {file.role === "frozen" ? "Open" : "Edit"}
-            </button>
-          </div>
-        </div>
+          <span className="fname">{file.path.split("/").pop()}</span>
+          {file.role === "frozen" ? <Lock size={12} /> : <Pencil size={12} />}
+        </button>
       ))}
     </div>
   );
 }
 
-function ResearchPreflight({ research }: { research: ResearchState }) {
+function ResearchPreflight({ research, embedded = false }: { research: ResearchState; embedded?: boolean }) {
   const failed = research.preflight.checks.filter((check) => check.required && !check.ok);
   return (
-    <div className={`card preflight-card${research.preflight.ok ? " ready" : " blocked"}`}>
+    <div className={`${embedded ? "preflight-card embedded" : "card preflight-card"}${research.preflight.ok ? " ready" : " blocked"}`}>
       <div className="card-head">
         <div>
           <div className="eyebrow">preflight</div>
@@ -1407,6 +1513,28 @@ function ResearchViewer({
       />
     );
   }
+  if (panel.kind === "preflight") {
+    return (
+      <aside className="card panel">
+        <div className="card-head">
+          <div className="ptitle"><span className="ic"><Check size={16} /></span><span className="txt">Preflight checks</span></div>
+          <button className="btn ghost sm" onClick={onClose} aria-label="Close panel"><X size={16} /></button>
+        </div>
+        <div className="panel-body scroll-pane"><ResearchPreflight research={panel.data} embedded /></div>
+      </aside>
+    );
+  }
+  if (panel.kind === "project-report") {
+    return (
+      <aside className="card panel">
+        <div className="card-head">
+          <div className="ptitle"><span className="ic"><FileText size={16} /></span><span className="txt">Project report</span></div>
+          <button className="btn ghost sm" onClick={onClose} aria-label="Close panel"><X size={16} /></button>
+        </div>
+        <div className="panel-body"><RunReport data={panel.data} project /></div>
+      </aside>
+    );
+  }
   const title =
     panel.kind === "program"
       ? `${panel.data.path} · ${panel.data.role}-owned`
@@ -1533,7 +1661,7 @@ function ResearchAttemptInspector({
   }, [experiment.run_id, projectId, selectedArtifact, tab]);
 
   const tabs: Array<{ id: ResearchTab; label: string; icon: LucideIcon }> = [
-    { id: "diff", label: "Diff", icon: GitBranch },
+    { id: "diff", label: "Changes", icon: GitBranch },
     { id: "run", label: "Run", icon: FlaskConical },
     { id: "artifacts", label: "Artifacts", icon: FolderOpen },
   ];
@@ -1551,9 +1679,6 @@ function ResearchAttemptInspector({
         <button className="btn ghost sm inspector-close" onClick={onClose} aria-label="Close research inspector"><X size={16} /></button>
       </div>
       <div className="attempt-summary">
-        <OverviewValue label="Base snapshot" value={experiment.base_snapshot_id} mono />
-        <OverviewValue label="Candidate snapshot" value={experiment.candidate_snapshot_id} mono />
-        <OverviewValue label="Run" value={experiment.run_id} mono />
         <OverviewValue label={objective.metric} value={experiment.score === null ? null : formatScore(experiment.score)} />
         <OverviewValue label="Best before" value={experiment.best_score_before === null || experiment.best_score_before === undefined ? null : formatScore(experiment.best_score_before)} />
         <OverviewValue label="Improvement" value={experiment.improvement === null || experiment.improvement === undefined ? null : formatScore(experiment.improvement)} />
@@ -1572,7 +1697,7 @@ function ResearchAttemptInspector({
           </button>
         ))}
       </div>
-      <div className="panel-body run-pane">
+      <div className={`panel-body run-pane${tab === "run" ? " scroll-pane" : ""}`}>
         {paneError ? <div className="pane-error"><AlertTriangle size={14} /> {paneError}</div> : null}
         {tab === "diff" ? diff ? <RunDiff data={diff} /> : pending ? <PaneLoading /> : null : null}
         {tab === "run" ? experiment.run_id
@@ -1591,6 +1716,14 @@ function ResearchAttemptInspector({
           />
         ) : <Empty title="No run artifacts yet">This attempt has not allocated a run.</Empty> : null}
       </div>
+      <details className="attempt-technical">
+        <summary>Technical identity</summary>
+        <div className="attempt-technical-grid">
+          <OverviewValue label="Run" value={experiment.run_id} mono />
+          <OverviewValue label="Base snapshot" value={experiment.base_snapshot_id} mono />
+          <OverviewValue label="Candidate snapshot" value={experiment.candidate_snapshot_id} mono />
+        </div>
+      </details>
     </aside>
   );
 }
@@ -1704,12 +1837,14 @@ function RunLedger({
       <table className="ledger">
         <thead>
           <tr>
-            <th style={{ width: "26%" }}>Run</th>
-            <th style={{ width: "13%" }}>Status</th>
-            <th style={{ width: "21%" }}>Script</th>
-            <th style={{ width: "16%" }}>Report</th>
-            <th style={{ width: "16%" }}>Output</th>
-            <th style={{ width: "8%" }}>Re-run</th>
+            <th style={{ width: "22%" }}>Title</th>
+            <th style={{ width: "19%" }}>Run</th>
+            <th style={{ width: "12%" }}>Changed</th>
+            <th style={{ width: "10%" }}>Status</th>
+            <th style={{ width: "13%" }}>Script</th>
+            <th style={{ width: "10%" }}>Report</th>
+            <th style={{ width: "9%" }}>Output</th>
+            <th style={{ width: "5%" }}>Re-run</th>
           </tr>
         </thead>
         <tbody>
@@ -1727,6 +1862,9 @@ function RunLedger({
               }}
             >
               <td>
+                <span className="run-title" title={run.title}>{run.title || "Untitled run"}</span>
+              </td>
+              <td>
                 <div className="runid">
                   <div className="runid-stack">
                     <span className="id">{run.run_id}</span>
@@ -1742,6 +1880,13 @@ function RunLedger({
                   >
                     <Clipboard size={13} />
                   </button>
+                </div>
+              </td>
+              <td>
+                <div className="change-tags">
+                  {(run.changes || ["unknown"]).map((change) => (
+                    <span className={change === "output drift" ? "warn" : ""} key={change}>{change}</span>
+                  ))}
                 </div>
               </td>
               <td>
@@ -1824,7 +1969,7 @@ const STANDARD_TABS: { id: StandardTab; label: string; icon: LucideIcon }[] = [
   { id: "output", label: "Output", icon: FolderOpen },
   { id: "logs", label: "Logs", icon: Terminal },
   { id: "report", label: "Report", icon: FileText },
-  { id: "diff", label: "Diff", icon: GitBranch },
+  { id: "diff", label: "Changes", icon: GitBranch },
 ];
 
 function projectUrl(path: string, projectId: string) {
@@ -2036,7 +2181,7 @@ function StandardInspector({
           </button>
         ))}
       </div>
-      <div className="panel-body run-pane">
+      <div className={`panel-body run-pane${tab === "overview" ? " scroll-pane" : ""}`}>
         {paneError ? <div className="pane-error"><AlertTriangle size={14} /> {paneError}</div> : null}
         {tab === "overview" ? (
           overview ? <RunOverview data={overview} onNavigate={onTab} /> : <PaneLoading />
@@ -2045,7 +2190,6 @@ function StandardInspector({
           source ? (
             <SourceEditor
               data={source}
-              theme={theme}
               onSave={async (snapshotId, path, text, saveAs) => {
                 const result = await onSaveScript(run.run_id, snapshotId, path, text, saveAs);
                 setDerivedSnapshot(result.snapshot.snapshot_id);
@@ -2069,7 +2213,7 @@ function StandardInspector({
           report ? <RunReport data={report} /> : pending ? <PaneLoading /> : !paneError ? <Empty title="No report yet">No report is attached to this run.</Empty> : null
         ) : null}
         {tab === "diff" ? (
-          diff ? <RunDiff data={diff} /> : pending ? <PaneLoading /> : !paneError ? <Empty title="No parent diff">This run has no source difference to show.</Empty> : null
+          diff ? <RunDiff data={diff} /> : pending ? <PaneLoading /> : !paneError ? <Empty title="No source changes">This run matches its comparison snapshot.</Empty> : null
         ) : null}
       </div>
     </aside>
@@ -2098,10 +2242,11 @@ function RunOverview({ data, onNavigate }: { data: RunAggregate; onNavigate: (ta
       ? `${run.duration_ms} ms`
       : `${(run.duration_ms / 1000).toFixed(2)} s`;
   const reproductionRecord = asRecord(data.reproduction || run.reproduction);
+  const comparisonRun = valueText(reproductionRecord?.run_id);
   const reproduction = run.reproduces_run_id
     ? `reproduces ${run.reproduces_run_id}`
     : data.divergence || run.divergence || reproductionRecord?.state === "divergence"
-      ? "output diverged under the same capsule"
+      ? `Different output from ${comparisonRun}: the recorded source, parameters, runtime, and declared inputs match. This usually means nondeterministic behavior or an undeclared external input.`
       : reproductionRecord?.state === "reproduction"
         ? `reproduces ${valueText(reproductionRecord.run_id)}`
         : valueText(data.reproduction || run.reproduction);
@@ -2115,29 +2260,22 @@ function RunOverview({ data, onNavigate }: { data: RunAggregate; onNavigate: (ta
 
   return (
     <div className="overview-grid">
-      <section className="evidence-section">
-        <h3>Run identity</h3>
-        <div className="kv-grid">
-          <OverviewValue label="Source snapshot" value={snapshot?.snapshot_id || run.source_snapshot_id} />
-          <OverviewValue label="Trigger" value={triggerText} />
-          <OverviewValue label="Capsule hash" value={run.capsule_hash} mono />
-          <OverviewValue label="Output hash" value={run.output_hash} mono />
-          <OverviewValue label="Runner" value={[run.runner, run.runner_identity].filter(Boolean).join(" · ")} />
-          <OverviewValue label="Duration / exit" value={`${duration} · exit ${run.exit_code ?? "—"}`} />
-          <OverviewValue label="Started" value={run.started_at} />
-          <OverviewValue label="Ended" value={run.ended_at} />
+      <section className="evidence-section result-evidence">
+        <h3>Results &amp; artifacts</h3>
+        <div className="artifact-summary">
+          {artifacts.length ? artifacts.map(([label, value]) => {
+            const target = ({ output: "output", log: "logs", report: "report" } as const)[label as "output" | "log" | "report"];
+            return target ? (
+              <button key={label} onClick={() => onNavigate(target)}><b>{String(value)}</b>{humanize(label)}</button>
+            ) : (
+              <span key={label}><b>{String(value)}</b>{humanize(label)}</span>
+            );
+          }) : <span>No artifact summary recorded.</span>}
         </div>
-      </section>
-
-      <section className="evidence-section">
-        <h3>Lineage</h3>
-        <div className="lineage-row">
-          <div className="lineage-node"><span>parent run</span><b>{parent?.run_id || run.parent_run_id || "root"}</b></div>
-          <span className="lineage-arrow">→</span>
-          <div className="lineage-node"><span>source snapshot</span><b>{snapshot?.snapshot_id || run.source_snapshot_id || "unknown"}</b></div>
-          <span className="lineage-arrow">→</span>
-          <div className="lineage-node current"><span>current run</span><b>{run.run_id}</b></div>
-        </div>
+        <div className={`reproduction-note${/diverg/i.test(reproduction) ? " warn" : ""}`}>{reproduction}</div>
+        {run.failure_message ? (
+          <div className="failure-note"><b>{run.failure_kind || "execution failure"}</b>{run.failure_message}</div>
+        ) : null}
       </section>
 
       <section className="evidence-section">
@@ -2166,22 +2304,30 @@ function RunOverview({ data, onNavigate }: { data: RunAggregate; onNavigate: (ta
       </section>
 
       <section className="evidence-section">
-        <h3>Artifacts &amp; reproduction</h3>
-        <div className="artifact-summary">
-          {artifacts.length ? artifacts.map(([label, value]) => {
-            const target = ({ output: "output", log: "logs", report: "report" } as const)[label as "output" | "log" | "report"];
-            return target ? (
-              <button key={label} onClick={() => onNavigate(target)}><b>{String(value)}</b>{humanize(label)}</button>
-            ) : (
-              <span key={label}><b>{String(value)}</b>{humanize(label)}</span>
-            );
-          }) : <span>No artifact summary recorded.</span>}
+        <h3>Run identity</h3>
+        <div className="kv-grid">
+          <OverviewValue label="Source snapshot" value={snapshot?.snapshot_id || run.source_snapshot_id} />
+          <OverviewValue label="Trigger" value={triggerText} />
+          <OverviewValue label="Capsule hash" value={run.capsule_hash} mono />
+          <OverviewValue label="Output hash" value={run.output_hash} mono />
+          <OverviewValue label="Runner" value={[run.runner, run.runner_identity].filter(Boolean).join(" · ")} />
+          <OverviewValue label="Duration / exit" value={`${duration} · exit ${run.exit_code ?? "—"}`} />
+          <OverviewValue label="Started" value={run.started_at} />
+          <OverviewValue label="Ended" value={run.ended_at} />
         </div>
-        <div className={`reproduction-note${/diverg/i.test(reproduction) ? " warn" : ""}`}>{reproduction}</div>
-        {run.failure_message ? (
-          <div className="failure-note"><b>{run.failure_kind || "execution failure"}</b>{run.failure_message}</div>
-        ) : null}
       </section>
+
+      <section className="evidence-section">
+        <h3>Lineage</h3>
+        <div className="lineage-row">
+          <div className="lineage-node"><span>parent run</span><b>{parent?.run_id || run.parent_run_id || "root"}</b></div>
+          <span className="lineage-arrow">→</span>
+          <div className="lineage-node"><span>source snapshot</span><b>{snapshot?.snapshot_id || run.source_snapshot_id || "unknown"}</b></div>
+          <span className="lineage-arrow">→</span>
+          <div className="lineage-node current"><span>current run</span><b>{run.run_id}</b></div>
+        </div>
+      </section>
+
     </div>
   );
 }
@@ -2362,15 +2508,20 @@ function RunLogs({ run, projectId }: { run: Run; projectId: string }) {
   );
 }
 
-function RunReport({ data }: { data: ReportPayload }) {
+function RunReport({ data, project = false }: { data: Pick<ReportPayload, "path" | "text">; project?: boolean }) {
   const [raw, setRaw] = useState(false);
+  const text = normalizeMarkdown(data.text);
   return (
     <div className="editor-shell">
       <div className="ptools">
         <span className="tool-label">{data.path || "report"}</span>
         <div className="right"><button className="btn sm" onClick={() => setRaw(!raw)}>{raw ? "Rendered" : "Raw"}</button></div>
       </div>
-      {raw ? <pre className="raw-preview report-raw">{data.text}</pre> : <MarkdownViewer path="" text={data.text} />}
+      {raw ? <pre className="raw-preview report-raw">{text}</pre> : text ? <MarkdownViewer path="" text={text} /> : (
+        <Empty title={project ? "No project report yet" : "No report yet"}>
+          {project ? "Ask the connected agent to synthesize project_summary and write the final project report." : "No report is attached to this run."}
+        </Empty>
+      )}
     </div>
   );
 }
@@ -2418,6 +2569,7 @@ function UnifiedDiff({ text }: { text: string }) {
             newNumber = newLine++;
           }
         }
+        if (hunk || /^(diff --git |index |--- |\+\+\+ )/.test(line)) return null;
         const kind = hunk || line.startsWith("---") || line.startsWith("+++")
           ? "hunk"
           : line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : "ctx";
@@ -2451,11 +2603,13 @@ function Viewer({
   const title =
     panel.kind === "instruction"
       ? "Report instruction"
+      : panel.kind === "project-report"
+        ? "Project report"
       : panel.kind === "params"
-        ? "Params · script/params.json"
+        ? "Parameters"
         : "Worker log";
   const Icon =
-    panel.kind === "instruction"
+    panel.kind === "instruction" || panel.kind === "project-report"
       ? FileText
       : panel.kind === "log"
         ? Terminal
@@ -2475,6 +2629,7 @@ function Viewer({
         </button>
       </div>
       <div className="panel-body">
+        {panel.kind === "project-report" ? <RunReport data={panel.data} project /> : null}
         {panel.kind === "instruction" ? (
           <TextEditor
             value={panel.data.text}
@@ -2497,11 +2652,37 @@ function CodePane({
   value,
   editing,
   onChange,
+  path,
 }: {
   value: string;
   editing: boolean;
   onChange: (value: string) => void;
+  path?: string;
 }) {
+  if (path && !editing) {
+    const extension = path.split(".").pop()?.toLowerCase();
+    const language = extension === "py" ? "python"
+      : extension === "json" ? "json"
+        : extension === "md" ? "markdown"
+          : extension === "toml" ? "ini"
+            : "plaintext";
+    const highlighted = language === "plaintext"
+      ? value.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+      : hljs.highlight(value, { language }).value;
+    const lines = value.split("\n");
+    return (
+      <div className="code">
+        <div className="codeflex">
+          <div className="gutter">
+            {lines.map((_, index) => <div key={index}>{index + 1}</div>)}
+          </div>
+          <div className="codearea">
+            <pre><code dangerouslySetInnerHTML={{ __html: highlighted }} /></pre>
+          </div>
+        </div>
+      </div>
+    );
+  }
   const lines = value.split("\n");
   return (
     <div className="code">
@@ -2542,7 +2723,6 @@ function SourceEditor({
   onSave,
 }: {
   data: SourcePayload;
-  theme: Theme;
   onSave: (
     snapshotId: string | null,
     path: string,
@@ -2636,7 +2816,12 @@ function SourceEditor({
           )}
         </div>
       </div>
-      <CodePane value={editing ? draft : file.text} editing={editing} onChange={setDraft} />
+      <CodePane
+        value={editing ? draft : file.text}
+        editing={editing}
+        onChange={setDraft}
+        path={file.path}
+      />
     </div>
   );
 }
@@ -2684,7 +2869,7 @@ function ParamsEditor({
   return (
     <div className="editor-shell">
       <div className="ptools">
-        <span className="tool-label">script/params.json · applied on the next run</span>
+        <span className="tool-label">Experiment parameters · applied on the next run</span>
         <div className="right">
           {editing && invalid ? <span className="savehint invalid">invalid JSON</span> : null}
           {!editing ? (

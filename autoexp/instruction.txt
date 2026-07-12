@@ -1,86 +1,47 @@
-`autoexp` is a shared workspace for black-box agentic experimentation through a central execution plane.
+# Autoexp Project Contract
 
-## Agent Contract
+## Agent contract
 
-When you create or edit an experiment, use this workflow:
+1. Keep human- and agent-authored experiment files under `experiment/`.
+2. Read `.autoexp/instructions.md` and use Autoexp MCP operations when available.
+   - Use Standard mode for qualitative, comparative, multi-variant, or software experiments.
+   - Use Autoresearch only when one stable numeric metric and a frozen evaluator can automatically decide keep versus revert.
+3. Put local environment values in `.env`, never directly in source.
+4. Run experiments through Autoexp so source, parameters, outputs, logs, and reports remain tied to an immutable run.
+5. Never hand-edit completed run output or log artifacts.
+6. Before the first recorded run, give generic source such as `main.py` or `candidate.py` a concise domain-specific filename when the project purpose makes one obvious. Do not leave the generic filename once the task is understood. Keep `.autoexp/stage.json` and the editable-source declaration in `.autoexp/project.json` aligned with the rename.
+7. When the user's prompt defines the desired report audience, questions, comparisons, or sections, read the existing report guidance and append those project-specific requirements through the report-guidance UI or MCP capability before running. Do not discard the existing guidance.
+8. Give every MCP-triggered run a short title that states the variant or hypothesis being tested. Prefer `SQLite warm-cache pass` over `Run 1` or an opaque identifier.
+9. When the requested experimentation has distinct variants or phases that need separate reports and insights, use separate descriptively named scripts for those parts instead of one large parameter-switched script. Execute and report each part independently; share only genuinely common helpers.
+10. Mark only decision-changing results, surprising failures, and new best results as milestones. At project completion, use the project summary evidence to write one central `.autoexp/project-report.md` for the end-to-end result.
 
-1. Edit source files only inside `script/` or `autoexp.json`.
-2. Put project-local environment values in `app.env`, never directly in scripts.
-3. Execute the experiment only with `autoexp run`.
-4. Read the `run_id:` line from command output.
-5. Use that `run_id` for follow-up actions such as inspecting the run or running `autoexp run <run_id>`.
+## Workspace boundary
 
-Do not run files inside `script/` directly. `autoexp run` copies the exact script/config state into a self-contained `runs/<run_id>/` directory, passes `app.env` into the selected runner, writes output/log artifacts there, and records the run history.
-Every execution records a new `run_id`. If the same capsule produces identical stable output again, Autoexp keeps both runs and links the newer run to the result it reproduces.
+- `experiment/` contains the visible experiment source and domain files.
+- `runs/` contains inspectable immutable run evidence and generated reports.
+- `.env`, `.gitignore`, `AGENTS.md`, and `CLAUDE.md` remain user-editable root files.
+- `.autoexp/` contains Autoexp-managed project settings, stage configuration, parameters, report guidance, state, and snapshot storage. Use the dedicated UI or MCP capability for these files rather than a generic script editor.
+- `.autoexp/stage.json` defines the execution command.
+- `.autoexp/params.json` and `.autoexp/params.schema.json` back the Parameters interface.
+- `.autoexp/report-instructions.md` backs the Report Guidance interface.
+- `.autoexp/project-report.md` is the agent-generated, project-level synthesis shown in both modes.
 
-Each completed or failed run is recorded in `index.sqlite`, retained under `runs/<run_id>/`, and available in the UI. Source and configuration state are snapshotted automatically when the run starts.
+Only files declared by `.autoexp/project.json` as editable source belong in the script editing interface. Other files under `experiment/`, including datasets, are not implicitly editable there.
 
-## Project Structure
+## Execution and evidence
 
-- `script/` is the only versioned executable source directory.
-- `script/stage.json` defines the runner command entry point.
-- `script/params.json` contains user-editable non-secret parameters.
-- `script/params.schema.json` describes those parameters for browser/API controls.
-- `report.txt` contains project-specific report generation instructions. Edit it when the domain, audience, or report structure changes.
-- `app.env` contains local environment variables and secrets. Autoexp creates it during project init, passes it to the selected runner, ignores it in `.gitignore`, and does not store it in the private Autoexp git history.
-- `runs/` contains local run snapshots and generated artifacts.
-- `.autoexp/` contains Autoexp's private git repository and is separate from any user-managed project-level git repository.
+Do not run experiment files directly when producing recorded evidence. `autoexp run` snapshots the exact experiment and managed configuration, copies that state into `runs/<run_id>/`, passes `.env` to the selected runner, and records the lifecycle in `.autoexp/state.sqlite`.
 
-## Versioned Source
+The experiment receives a JSON context path through `${CTX}`. Read `script_params_path`, `output_dir`, and `logs_dir` from that context. Write generated output only to `output_dir` and logs only to `logs_dir`.
 
-Autoexp computes a deterministic recursive content hash for `script/`, excluding files matched by the project `.gitignore`.
+Every run has an immutable source identity. Rerunning a prior run creates a child run from its pinned source. Restoring changes the workspace source; it does not rewrite historical evidence.
 
-A run capsule is the combination of:
+## Reports
 
-- `script_hash`
-- `script_env_hash`
-- `runtime_context_hash`
+Use the active report guidance exposed by Autoexp. A report bundle is written to `runs/<run_id>/report/report_bundle.json`; generated reports belong under that run's `report/` directory. Do not read secret values from `.env`; the bundle exposes names only.
 
-Changing files under `script/` changes the script hash. Changing `app.env` can change runtime behavior, but `app.env` itself is intentionally local and unversioned.
+Per-run reports explain individual executions. The central project report synthesizes the full experiment, including milestones and cross-run conclusions; generate it from `project_summary`, not from memory.
 
-## Execution Trigger
+## Autoresearch
 
-Use `autoexp run` as the central execution trigger. Agents should call this command instead of running `script/` files directly.
-
-Each run executes in `runs/<run_id>/` and receives a JSON context file at `${CTX}`. The run directory contains:
-
-- `ctx.json`
-- `run.json`
-- `script/`
-- `output/`
-- `logs/`
-- `report/`
-
-Reports are not generated by `autoexp run`. Autoexp writes report context automatically at `runs/<run_id>/report/report_bundle.json` for each recorded run.
-
-When asked to generate a report, use the active report instructions from `report.txt` or the configured project report instruction file.
-The bundle contains project-relative pointers to associated output and log files, not their contents. Read the referenced files needed for the report, then write generated report artifacts under `runs/<run_id>/report/`.
-The report output may contain markdown, images, data files, or other generated assets.
-Do not read secret values from `app.env`; use only the environment variable names included in the bundle.
-
-## Runtime Context
-
-Read paths from `${CTX}` instead of hardcoding runtime paths. Important keys:
-
-- `script_dir`
-- `script_params_path`
-- `app_env_path`
-- `output_dir`
-- `logs_dir`
-
-Generated output and logs must be written only to the paths provided by `${CTX}`. Do not write generated artifacts into `script/`.
-
-## Editing Rules
-
-- Put executable workflow logic, helpers, templates, and non-secret params in `script/`.
-- Put local credentials, tokens, endpoints, and environment-specific values in `app.env`.
-- Put sandbox, runtime, title, and metadata changes in `autoexp.json`.
-- Do not edit generated files under `runs/` unless the user explicitly asks to inspect or repair artifacts.
-
-From the terminal, `autoexp run <run_id>` creates a child run from that run's pinned source snapshot. The parent row, outputs, logs, and report remain unchanged.
-
-## Autoresearch Projects
-
-When `autoexp.json` sets `mode` to `autoresearch`, call `research_preflight` and `research_state` before starting an attempt. Edit only the configured `agent` file for candidate work; `human` files hold user direction and the `frozen` evaluator is read-only within the active contract.
-
-Each research attempt must start with one explicit hypothesis. Save the candidate through Autoexp, call `research_begin_attempt`, then call `research_finish_attempt` with the returned attempt ID. Autoexp records the base snapshot, candidate snapshot, immutable run, indexed artifacts, score, and kept/reverted verdict. Reverted candidates remain historical evidence. An intentional evaluator change creates a new contract boundary instead of reinterpreting prior scores.
+In Autoresearch mode, `experiment/program.md` contains human research direction, `experiment/candidate.py` is agent-owned, and `experiment/evaluate.py` is frozen within a research contract. Run research preflight first, change one hypothesis at a time, and finish every begun attempt through Autoexp. Kept and reverted candidates remain inspectable evidence. A changed evaluator starts a new contract boundary rather than rewriting old attempts.

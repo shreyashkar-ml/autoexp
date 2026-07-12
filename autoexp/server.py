@@ -1,7 +1,10 @@
 import json
 import ipaddress
 import mimetypes
+import os
+import shutil
 import sqlite3
+import subprocess
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -9,7 +12,15 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 from .artifacts import artifact_content, artifact_detail, list_artifacts, read_log
 from .jobs import RunManager, recover_stranded
-from .reports import report_instruction, write_report_instruction
+from .reports import (
+    list_milestones,
+    mark_milestone,
+    project_summary,
+    read_project_report,
+    report_instruction,
+    write_project_report,
+    write_report_instruction,
+)
 from .autoresearch import for_project as research_for_project
 from .store import init_db, require_autoexp_git_repo
 from .workspace import (
@@ -49,6 +60,21 @@ def bounded_int(raw, default=0, minimum=0, maximum=1048576):
         return max(minimum, min(int(raw), maximum))
     except (TypeError, ValueError):
         return default
+
+
+def open_project_path(path):
+    """Open a registered project in the host's file manager."""
+    path = Path(path).resolve()
+    command = "open" if sys.platform == "darwin" else "explorer" if os.name == "nt" else "xdg-open"
+    executable = shutil.which(command)
+    if not executable:
+        raise ValueError(f"file manager command is unavailable: {command}")
+    subprocess.Popen(
+        [executable, str(path)],
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+    )
 
 
 class AutoexpHTTPServer(ThreadingHTTPServer):
@@ -213,6 +239,12 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             return self._json(read_script_params(root))
         if path == "/api/report/instruction":
             return self._json(report_instruction(root))
+        if path == "/api/project-report":
+            return self._json(read_project_report(root))
+        if path == "/api/project-summary":
+            return self._json(project_summary(root, limit))
+        if path == "/api/milestones":
+            return self._json({"milestones": list_milestones(root)})
         if path == "/api/research":
             return self._json(self.server.research(root).state())
         if path == "/api/research/preflight":
@@ -250,6 +282,24 @@ class AutoexpHandler(BaseHTTPRequestHandler):
     def _post(self):
         path = urlparse(self.path).path
         body = self._body({})
+
+        if path == "/api/open-path":
+            root = self._project_root(body)
+            open_project_path(root)
+            print(f"[autoexp] opened {root}", flush=True)
+            return self._json({"ok": True, "path": str(root)})
+
+        if path == "/api/milestones":
+            if not isinstance(body, dict):
+                return self._json({"error": "body must be a JSON object"}, 400)
+            return self._json(mark_milestone(
+                title=body.get("title"),
+                significance=body.get("significance"),
+                run_id=body.get("run_id"),
+                attempt_id=body.get("attempt_id"),
+                actor_name="autoexp-view",
+                root=self._project_root(body),
+            ), 201)
 
         if path == "/api/runs":
             if not isinstance(body, dict):
@@ -311,10 +361,14 @@ class AutoexpHandler(BaseHTTPRequestHandler):
                     "error": (failed or {}).get("detail") or "research preflight failed",
                     "preflight": preflight,
                 }, 422)
-            return self._json(research.start_loop(), 202)
+            result = research.start_loop()
+            print("[autoexp] Autoresearch loop started", flush=True)
+            return self._json(result, 202)
         if path == "/api/research/loop/kill":
             root = self._project_root(body)
-            return self._json(self.server.research(root).stop_loop(), 202)
+            result = self.server.research(root).stop_loop()
+            print("[autoexp] Autoresearch loop stop requested", flush=True)
+            return self._json(result, 202)
         self._json({"error": "not found"}, 404)
 
     def _patch(self):
@@ -339,7 +393,7 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         if save_as is not None and not isinstance(save_as, str):
             return self._json({"error": "save_as must be a string"}, 400)
 
-        self._json(save_script_file(
+        result = save_script_file(
             rel,
             text,
             self._project_root(body),
@@ -348,7 +402,9 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             source_snapshot_id=snapshot_id,
             trigger_kind="ui",
             actor_name="autoexp-view",
-        ))
+        )
+        print(f"[autoexp] saved {result['path']} as {result['snapshot']['snapshot_id']}", flush=True)
+        self._json(result)
 
     def _put(self):
         path = urlparse(self.path).path
@@ -361,23 +417,36 @@ class AutoexpHandler(BaseHTTPRequestHandler):
                 return self._json({"error": "path is required"}, 400)
             if not isinstance(text, str):
                 return self._json({"error": "text must be a string"}, 400)
-            return self._json(
-                self.server.research(self._project_root(body)).save_file(rel, text)
-            )
+            result = self.server.research(self._project_root(body)).save_file(rel, text)
+            print(f"[autoexp] saved research file {rel}", flush=True)
+            return self._json(result)
 
         if path == "/api/report/instruction":
             body = self._body({})
             text = body.get("text") if isinstance(body, dict) else None
             if not isinstance(text, str):
                 return self._json({"error": "text must be a string"}, 400)
-            return self._json(write_report_instruction(text, self._project_root(body)))
+            result = write_report_instruction(text, self._project_root(body))
+            print("[autoexp] saved report guidance", flush=True)
+            return self._json(result)
+
+        if path == "/api/project-report":
+            body = self._body({})
+            text = body.get("text") if isinstance(body, dict) else None
+            if not isinstance(text, str):
+                return self._json({"error": "text must be a string"}, 400)
+            result = write_project_report(text, self._project_root(body))
+            print("[autoexp] saved project report", flush=True)
+            return self._json(result)
 
         if path == "/api/research/program":
             body = self._body({})
             text = body.get("text") if isinstance(body, dict) else None
             if not isinstance(text, str):
                 return self._json({"error": "text must be a string"}, 400)
-            return self._json(self.server.research(self._project_root(body)).save_program(text))
+            result = self.server.research(self._project_root(body)).save_program(text)
+            print("[autoexp] saved research program", flush=True)
+            return self._json(result)
 
         if path == "/api/research/subject":
             body = self._body({})
@@ -386,8 +455,10 @@ class AutoexpHandler(BaseHTTPRequestHandler):
                 return self._json({"error": "text must be a string"}, 400)
             research = self.server.research(self._project_root(body))
             if not research.can_import_baseline():
-                return self._json({"error": "baseline import is only available before attempts and before train.py is edited"}, 409)
-            return self._json(research.save_subject(text))
+                return self._json({"error": "baseline import is only available before attempts and before candidate.py is edited"}, 409)
+            result = research.save_subject(text)
+            print("[autoexp] imported Autoresearch baseline", flush=True)
+            return self._json(result)
 
         if path != "/api/script/params":
             return self._json({"error": "not found"}, 404)
@@ -398,12 +469,14 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             return self._json({"error": "params must be a JSON object"}, 400)
 
         root_data = body if isinstance(body, dict) else {}
-        self._json(write_script_params(
+        result = write_script_params(
             params,
             self._project_root(root_data),
             trigger_kind="ui",
             actor_name="autoexp-view",
-        ))
+        )
+        print(f"[autoexp] saved parameters as {result['snapshot']['snapshot_id']}", flush=True)
+        self._json(result)
 
     # ------------------------------------------------------------------
     #  Shared helpers
@@ -521,7 +594,9 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def log_message(self, fmt, *args):
-        print(f"{self.address_string()} - {fmt % args}", file=sys.stderr)
+        status = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 0
+        if status >= 400:
+            print(f"[autoexp] HTTP {status}: {args[0]}", file=sys.stderr, flush=True)
 
 
 def view(host, port, allow_origins=None, project=None):
@@ -546,10 +621,10 @@ def view(host, port, allow_origins=None, project=None):
         default_project=default_project,
         allow_origins=allow_origins,
     )
-    print(f"serving Autoexp view on http://{host}:{server.server_port}")
+    print(f"[autoexp] view ready at http://{host}:{server.server_port}", flush=True)
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        pass
+        print("\n[autoexp] view stopped", flush=True)
     finally:
         server.server_close()

@@ -12,6 +12,8 @@ from pathlib import Path
 from .store import db
 from .workspace import (
     APP_ENV,
+    EXPERIMENT_DIR,
+    PARAMS_FILE,
     PROJECT_CONFIG,
     die,
     gitignore_patterns,
@@ -26,9 +28,9 @@ from .workspace import (
 # Paths *inside* the sandbox container. The host mounts the run/script dirs here.
 RUN_CONTEXT = {
     "run_dir": "/workspace/run",
-    "script_dir": "/workspace/script",
-    "app_env_path": "/workspace/app.env",
-    "script_params_path": "/workspace/script/params.json",
+    "script_dir": "/workspace/source/experiment",
+    "app_env_path": "/workspace/.env",
+    "script_params_path": "/workspace/source/.autoexp/params.json",
     "output_dir": "/workspace/run/output",
     "logs_dir": "/workspace/run/logs",
 }
@@ -70,16 +72,20 @@ def compute_hashes(root=None):
     root = resolve_root(root)
     cfg = read_json(root / PROJECT_CONFIG)
     if not isinstance(cfg, dict):
-        raise ValueError("autoexp.json must contain a JSON object")
+        raise ValueError(f"{PROJECT_CONFIG} must contain a JSON object")
     manifest = script_manifest(root)
     sandbox = cfg.get("sandbox") if isinstance(cfg.get("sandbox"), dict) else {}
     data = {
-        "script_hash": hash_dir(root / "script"),
+        "script_hash": hash_dir(root / EXPERIMENT_DIR),
         "script_env_hash": hash_json({
             "runner": cfg.get("runner", "local"),
             "image": manifest.get("image") or sandbox.get("image"),
         }),
-        "runtime_context_hash": hash_json(cfg.get("runtime", {})),
+        "runtime_context_hash": hash_json({
+            "runtime": cfg.get("runtime", {}),
+            "params": read_json(root / PARAMS_FILE),
+            "stage": manifest,
+        }),
     }
     data["capsule_hash"] = hash_json(data)
     return data
@@ -169,7 +175,7 @@ def run_script(run_dir, root=None, source_root=None, *, extra_env=None, timeout_
 
     workdir = manifest["working_dir"].strip().replace("\\", "/")
     if not workdir.startswith("/workspace/"):
-        workdir = f"/workspace/{workdir if workdir.startswith('script') else 'script'}"
+        workdir = f"/workspace/source/{workdir if workdir.startswith(EXPERIMENT_DIR) else EXPERIMENT_DIR}"
 
     sandbox = cfg["sandbox"]
     container_name = f"autoexp-{Path(run_dir).name}"
@@ -183,13 +189,13 @@ def run_script(run_dir, root=None, source_root=None, *, extra_env=None, timeout_
     app_env_path = root / APP_ENV
     if app_env_path.exists():
         cmd += ["--env-file", str(app_env_path.resolve()),
-                "-v", f"{app_env_path.resolve()}:/workspace/app.env:ro"]
+                "-v", f"{app_env_path.resolve()}:/workspace/.env:ro"]
     for key, value in (extra_env or {}).items():
         cmd += ["-e", f"{key}={value}"]
     cmd += [
         "-e", "AUTOEXP_OUTPUT_DIR=/workspace/run/output",
         "-e", "PYTHONDONTWRITEBYTECODE=1",
-        "-v", f"{(source_root / 'script').resolve()}:/workspace/script:ro",
+        "-v", f"{source_root.resolve()}:/workspace/source:ro",
         "-v", f"{Path(run_dir).resolve()}:/workspace/run:rw",
         "-w", workdir,
         manifest.get("image", sandbox["image"]),
@@ -230,7 +236,7 @@ def docker_ready():
 # ======================================================================
 
 def app_env(root):
-    """Parse app.env into a dict of {KEY: value} (quotes stripped)."""
+    """Parse .env into a dict of {KEY: value} (quotes stripped)."""
     path = Path(root) / APP_ENV
     values = {}
     if not path.exists():
@@ -249,9 +255,9 @@ def local_run_context(run_dir, source_root, root):
     source_root = Path(source_root).resolve()
     return {
         "run_dir": str(run_dir),
-        "script_dir": str(source_root / "script"),
+        "script_dir": str(source_root / EXPERIMENT_DIR),
         "app_env_path": str((Path(root) / APP_ENV).resolve()),
-        "script_params_path": str(source_root / "script" / "params.json"),
+        "script_params_path": str(source_root / PARAMS_FILE),
         "output_dir": str(run_dir / "output"),
         "logs_dir": str(run_dir / "logs"),
     }
@@ -260,13 +266,13 @@ def local_run_context(run_dir, source_root, root):
 def local_workdir(manifest, run_dir, source_root):
     """Translate the manifest working_dir (which may use container paths) to a host path."""
     workdir = manifest["working_dir"].strip().replace("\\", "/")
-    if workdir.startswith("/workspace/script"):
-        return Path(source_root) / "script" / workdir.removeprefix("/workspace/script").lstrip("/")
+    if workdir.startswith("/workspace/source/"):
+        return Path(source_root) / workdir.removeprefix("/workspace/source/")
     if workdir.startswith("/workspace/run"):
         return Path(run_dir) / workdir.removeprefix("/workspace/run").lstrip("/")
-    if workdir.startswith("script"):
+    if workdir.startswith(EXPERIMENT_DIR):
         return Path(source_root) / workdir
-    return Path(source_root) / "script"
+    return Path(source_root) / EXPERIMENT_DIR
 
 
 def run_script_local(run_dir, root=None, source_root=None, *, extra_env=None, timeout_sec=None):
@@ -284,7 +290,7 @@ def run_script_local(run_dir, root=None, source_root=None, *, extra_env=None, ti
 
     env = os.environ | app_env(root) | (extra_env or {}) | {
         "AUTOEXP_RUN_DIR": str(Path(run_dir).resolve()),
-        "AUTOEXP_SCRIPT_DIR": str((source_root / "script").resolve()),
+        "AUTOEXP_SCRIPT_DIR": str((source_root / EXPERIMENT_DIR).resolve()),
         "AUTOEXP_OUTPUT_DIR": str((Path(run_dir) / "output").resolve()),
         "PYTHONDONTWRITEBYTECODE": "1",
     }
@@ -304,7 +310,7 @@ def runner_type(root, source_root=None):
     source_root = Path(root) if source_root is None else Path(source_root)
     requested = read_json(source_root / PROJECT_CONFIG).get("runner", "local")
     if requested not in {"docker", "local"}:
-        die("autoexp.json runner must be one of: docker, local")
+        die(f"{PROJECT_CONFIG} runner must be one of: docker, local")
     if requested == "local":
         return "local"
     ok, message = docker_ready()

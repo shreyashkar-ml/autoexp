@@ -4,9 +4,14 @@ import sys
 from .artifacts import artifact_detail, list_artifacts, read_log
 from .autoresearch import for_project as research_for_project
 from .reports import (
+    list_milestones,
+    mark_milestone,
+    project_summary,
+    read_project_report,
     report_generation_instruction,
     set_report_instruction as set_project_report_instruction,
     write_report_instruction as write_project_report_instruction,
+    write_project_report,
 )
 from .runtime import (
     diff_runs,
@@ -25,7 +30,7 @@ from .runtime import (
     workspace,
     write_script_params,
 )
-from .workspace import project_root, read_json, script_manifest
+from .workspace import PROJECT_CONFIG, PROJECT_INSTRUCTIONS, project_root, read_json, script_manifest
 
 
 PROTOCOL_VERSION = "2025-06-18"
@@ -80,17 +85,17 @@ def _read_logs(root, args):
 
 TOOLS = {
     "workspace": {
-        "description": "Read Autoexp workspace metadata.",
+        "description": "Start here: read project mode and metadata. Use Standard for qualitative or multi-variant experiments; use Autoresearch only for iterative optimization against one frozen numeric evaluator.",
         "schema": tool_schema(),
         "handler": lambda root, a: workspace(root),
     },
     "contract": {
         "description": "Read the Autoexp workspace contract.",
         "schema": tool_schema(),
-        "handler": lambda root, a: {"text": (root / "autoexp.md").read_text()},
+        "handler": lambda root, a: {"text": (root / PROJECT_INSTRUCTIONS).read_text()},
     },
     "script_manifest": {
-        "description": "Read script/stage.json.",
+        "description": "Read the experiment stage manifest.",
         "schema": tool_schema(),
         "handler": lambda root, a: script_manifest(root),
     },
@@ -139,7 +144,7 @@ TOOLS = {
         "handler": lambda root, a: artifact_detail(a["run_id"], a["artifact_id"], root),
     },
     "read_final_report": {
-        "description": "Read a generated report if present.",
+        "description": "Read one run's generated report if present.",
         "schema": _run_id_schema(),
         "handler": lambda root, a: run_report(a["run_id"], root),
     },
@@ -171,6 +176,47 @@ TOOLS = {
         "schema": tool_schema({"text": {"type": "string"}}, ["text"]),
         "handler": lambda root, a: write_project_report_instruction(a["text"], root),
     },
+    "read_project_report": {
+        "description": "Read the central end-to-end report shared by Standard and Autoresearch projects.",
+        "schema": tool_schema(),
+        "handler": lambda root, a: read_project_report(root),
+    },
+    "write_project_report": {
+        "description": "Write the central end-to-end Markdown report after synthesizing recorded project evidence.",
+        "schema": tool_schema({"text": {"type": "string"}}, ["text"]),
+        "handler": lambda root, a: write_project_report(a["text"], root),
+    },
+    "mark_milestone": {
+        "description": "Mark a decision-changing result, surprising failure, or new best as remarkable evidence. Do not mark routine runs.",
+        "schema": tool_schema(
+            {
+                "title": {"type": "string", "maxLength": 120},
+                "significance": {"type": "string"},
+                "run_id": {"type": "string"},
+                "attempt_id": {"type": "string"},
+                "actor_name": {"type": "string"},
+            },
+            ["title", "significance"],
+        ),
+        "handler": lambda root, a: mark_milestone(
+            title=a["title"],
+            significance=a["significance"],
+            run_id=a.get("run_id"),
+            attempt_id=a.get("attempt_id"),
+            actor_name=a.get("actor_name") or "autoexp-mcp",
+            root=root,
+        ),
+    },
+    "list_milestones": {
+        "description": "Read remarkable experiment evidence and linked report excerpts without opening the UI.",
+        "schema": tool_schema(),
+        "handler": lambda root, a: {"milestones": list_milestones(root)},
+    },
+    "project_summary": {
+        "description": "Fetch the end-to-end evidence index, milestones, runs, and current central report for agent-side user summaries.",
+        "schema": tool_schema({"limit": {"type": "integer", "default": 20}}),
+        "handler": lambda root, a: project_summary(root, int(a.get("limit", 20))),
+    },
     "write_script_file": {
         "description": "Create a source snapshot with edited script content without executing it.",
         "schema": tool_schema(
@@ -196,7 +242,7 @@ TOOLS = {
         ),
     },
     "write_script_params": {
-        "description": "Write script/params.json.",
+        "description": "Write experiment parameters.",
         "schema": tool_schema(
             {"params": {"type": "object"}, "actor_name": {"type": "string"}},
             ["params"],
@@ -219,22 +265,24 @@ TOOLS = {
             "run_id": {"type": "string"},
             "snapshot_id": {"type": "string"},
             "actor_name": {"type": "string"},
-        }),
+            "title": {"type": "string", "maxLength": 80, "description": "Concise title describing this run's hypothesis or variant."},
+        }, ["title"]),
         "handler": lambda root, a: run_autoexp(
             a.get("run_id"),
             root,
             snapshot_id=a.get("snapshot_id"),
             actor_name=a.get("actor_name") or "autoexp-mcp",
+            title=a["title"],
         ),
     },
     "rerun": {
         "description": "Create a child execution from a historical run's pinned snapshot.",
         "schema": tool_schema(
-            {"run_id": {"type": "string"}, "actor_name": {"type": "string"}},
-            ["run_id"],
+            {"run_id": {"type": "string"}, "actor_name": {"type": "string"}, "title": {"type": "string", "maxLength": 80}},
+            ["run_id", "title"],
         ),
         "handler": lambda root, a: run_autoexp(
-            a["run_id"], root, actor_name=a.get("actor_name") or "autoexp-mcp"
+            a["run_id"], root, actor_name=a.get("actor_name") or "autoexp-mcp", title=a["title"]
         ),
     },
     "diff_run": {
@@ -293,9 +341,11 @@ TOOLS = {
 
 
 PROMPTS = {
-    "autoexp/improve-script": "Read autoexp.md, inspect recent runs and the selected run source, improve script behavior, save a versioned script snapshot, run Autoexp, then summarize run_id, status, output files, logs, and report path.",
-    "autoexp/debug-failed-run": "Read autoexp.md, inspect the failed run metadata, logs, source, and report bundle. Identify the likely failure cause and propose or create a versioned script fix.",
-    "autoexp/write-report": "Read autoexp.md and the active project report instruction. Use runs/{run_id}/report/report_bundle.json to write report artifacts under that run's report directory.",
+    "autoexp/choose-workflow": "Choose Standard for qualitative, comparative, multi-variant, or software experimentation. Choose Autoresearch only when one stable numeric metric and a frozen evaluator can automatically keep or revert each candidate. Initialize the matching mode, then start with workspace and contract.",
+    "autoexp/improve-script": "Read the Autoexp contract, inspect recent runs and the selected run source, improve experiment behavior, save a versioned source snapshot, run Autoexp, then summarize run_id, status, output files, logs, and report path.",
+    "autoexp/debug-failed-run": "Read the Autoexp contract, inspect the failed run metadata, logs, source, and report bundle. Identify the likely failure cause and propose or create a versioned source fix.",
+    "autoexp/write-report": "Read the Autoexp contract and active report instruction. Use runs/{run_id}/report/report_bundle.json to write report artifacts under that run's report directory.",
+    "autoexp/write-project-report": "Read project_summary, inspect milestone evidence and linked run reports as needed, then write one evidence-grounded end-to-end Markdown synthesis with write_project_report. Cover the objective, approaches, comparisons, failures, conclusions, and next steps; distinguish evidence from inference.",
 }
 
 
@@ -313,12 +363,15 @@ def call_tool(name, args):
 # URI -> (display name, MIME type, producer).
 RESOURCES = {
     "autoexp://workspace": ("workspace", "application/json", lambda root: json_text(workspace(root))),
-    "autoexp://contract": ("contract", "text/markdown", lambda root: (root / "autoexp.md").read_text()),
-    "autoexp://config": ("config", "application/json", lambda root: json_text(read_json(root / "autoexp.json"))),
+    "autoexp://contract": ("contract", "text/markdown", lambda root: (root / PROJECT_INSTRUCTIONS).read_text()),
+    "autoexp://config": ("config", "application/json", lambda root: json_text(read_json(root / PROJECT_CONFIG))),
     "autoexp://script/manifest": ("script manifest", "application/json", lambda root: json_text(script_manifest(root))),
     "autoexp://script/params": ("script params", "application/json", lambda root: json_text(read_script_params(root))),
     "autoexp://runs/latest": ("latest runs", "application/json", lambda root: json_text({"runs": list_runs(root=root)})),
     "autoexp://report-instruction": ("report instruction", "application/json", lambda root: json_text(report_generation_instruction(root))),
+    "autoexp://project-summary": ("project summary", "application/json", lambda root: json_text(project_summary(root))),
+    "autoexp://project-report": ("project report", "text/markdown", lambda root: read_project_report(root)["text"]),
+    "autoexp://milestones": ("milestones", "application/json", lambda root: json_text({"milestones": list_milestones(root)})),
     "autoexp://research": ("autoresearch state", "application/json", lambda root: json_text(research_for_project(root).state())),
 }
 
