@@ -177,6 +177,10 @@ create trigger if not exists artifacts_immutable_no_update before update on arti
 when old.category = 'report' or exists(
   select 1 from runs where run_id = old.run_id and status in ('success', 'failed', 'canceled')
 ) begin select raise(abort, 'artifact is immutable'); end;
+create trigger if not exists artifacts_terminal_no_insert before insert on artifacts
+when new.category in ('output', 'log') and exists(
+  select 1 from runs where run_id = new.run_id and status in ('success', 'failed', 'canceled')
+) begin select raise(abort, 'terminal run evidence is immutable'); end;
 create trigger if not exists snapshots_immutable_no_update before update on source_snapshots
 begin select raise(abort, 'source snapshot is immutable'); end;
 create trigger if not exists snapshots_immutable_no_delete before delete on source_snapshots
@@ -202,6 +206,9 @@ begin select raise(abort, 'research attempt is immutable'); end;
 create trigger if not exists inputs_terminal_no_update before update on run_external_inputs
 when exists(select 1 from runs where run_id = old.run_id and status in ('success', 'failed', 'canceled'))
 begin select raise(abort, 'run input evidence is immutable'); end;
+create trigger if not exists inputs_terminal_no_insert before insert on run_external_inputs
+when exists(select 1 from runs where run_id = new.run_id and status in ('success', 'failed', 'canceled'))
+begin select raise(abort, 'terminal run evidence is immutable'); end;
 create trigger if not exists inputs_terminal_no_delete before delete on run_external_inputs
 when exists(select 1 from runs where run_id = old.run_id and status in ('success', 'failed', 'canceled'))
 begin select raise(abort, 'run input evidence is immutable'); end;

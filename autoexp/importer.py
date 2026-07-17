@@ -73,7 +73,7 @@ def _validate_snapshot_hashes(old, data_root):
         checked += 1
     return {"checked": checked, "ok": True}
 
-def _copy_rows(old, new, table, *, extras=None, renames=None):
+def _copy_rows(old, new, table, *, extras=None, renames=None, transform=None):
     if table not in _tables(old):
         return 0
     extras = extras or {}
@@ -85,6 +85,8 @@ def _copy_rows(old, new, table, *, extras=None, renames=None):
         value = dict(source)
         value.update(extras)
         value.update({target: value[source_name] for source_name, target in renames.items() if source_name in value})
+        if transform:
+            value = transform(value)
         columns = [name for name in new_columns if name in value]
         new.execute(
             f"insert into {table}({', '.join(columns)}) values({', '.join('?' for _ in columns)})",
@@ -146,7 +148,22 @@ def _record_for_non_git_repo(root, config, stage, title, kind):
     return experiment_id
 
 
-def import_legacy_project(path):
+def _discard_incomplete_experiment(experiment_id):
+    conn = db()
+    try:
+        row = conn.execute(
+            "select data_path from experiments where experiment_id = ?", (experiment_id,)
+        ).fetchone()
+        conn.execute("delete from manifest_files where experiment_id = ?", (experiment_id,))
+        conn.execute("delete from experiments where experiment_id = ?", (experiment_id,))
+        conn.commit()
+    finally:
+        conn.close()
+    if row:
+        shutil.rmtree(row["data_path"], ignore_errors=True)
+
+
+def _import_legacy_project(path, created):
     source = Path(path).expanduser().resolve()
     old_db_path = source / ".autoexp/state.sqlite"
     config_path = source / PROJECT_CONFIG
@@ -177,6 +194,7 @@ def import_legacy_project(path):
         if "Git worktree" not in str(exc):
             raise
         experiment_id = _record_for_non_git_repo(source, config, stage, title, kind)
+    created.append(experiment_id)
 
     from .workspace import experiment_entry
     entry = experiment_entry(experiment_id)
@@ -218,9 +236,22 @@ def import_legacy_project(path):
         new.execute("pragma defer_foreign_keys = on")
         summary["copied"]["triggers"] = _copy_rows(old, new, "triggers", extras={"experiment_id": experiment_id})
         summary["copied"]["source_snapshots"] = _copy_rows(old, new, "source_snapshots", extras={"repo_id": entry["repo_id"], "experiment_id": experiment_id})
-        summary["copied"]["runs"] = _copy_rows(old, new, "runs", extras={"experiment_id": experiment_id})
+        terminal_runs = {}
+
+        def mutable_run(value):
+            if value.get("status") in {"success", "failed", "canceled"}:
+                terminal_runs[value["run_id"]] = value["status"]
+                value["status"] = "running"
+            return value
+
+        summary["copied"]["runs"] = _copy_rows(
+            old, new, "runs", extras={"experiment_id": experiment_id},
+            transform=mutable_run,
+        )
         for table in ("artifacts", "run_external_inputs"):
             summary["copied"][table] = _copy_rows(old, new, table)
+        for run_id, status in terminal_runs.items():
+            new.execute("update runs set status = ? where run_id = ?", (status, run_id))
         summary["copied"]["research_contracts"] = _copy_rows(old, new, "research_contracts", extras={"experiment_id": experiment_id})
         for table in ("research_sessions", "research_attempts"):
             summary["copied"][table] = _copy_rows(old, new, table)
@@ -277,3 +308,13 @@ def import_legacy_project(path):
         old.close()
         new.close()
     return summary
+
+
+def import_legacy_project(path):
+    created = []
+    try:
+        return _import_legacy_project(path, created)
+    except Exception:
+        for experiment_id in created:
+            _discard_incomplete_experiment(experiment_id)
+        raise

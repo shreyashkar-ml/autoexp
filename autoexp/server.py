@@ -319,6 +319,18 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             print(f"[autoexp] HTTP {args[1]}: {args[0]}", file=sys.stderr, flush=True)
 
 
+def _require_loopback_host(host):
+    try:
+        loopback = host == "localhost" or (
+            ipaddress.ip_address(host).version == 4
+            and ipaddress.ip_address(host).is_loopback
+        )
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise ValueError("Autoexp view may only bind to a loopback host")
+
+
 def _healthy(host, port):
     try:
         with urlopen(f"http://{host}:{port}/api/health", timeout=0.5) as response:
@@ -329,6 +341,7 @@ def _healthy(host, port):
 
 
 def ensure_server(host="127.0.0.1", port=8765):
+    _require_loopback_host(host)
     if _healthy(host, port):
         return f"http://{host}:{port}", None
     proc = subprocess.Popen(
@@ -345,6 +358,7 @@ def ensure_server(host="127.0.0.1", port=8765):
 
 
 def view(host="127.0.0.1", port=8765, allow_origins=None, experiment=None, review_token=None, open_browser=True):
+    _require_loopback_host(host)
     if _healthy(host, port):
         base = f"http://{host}:{port}"
         query = []

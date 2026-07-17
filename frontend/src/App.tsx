@@ -100,7 +100,9 @@ function App() {
     const load = () => api<{ repositories: Repository[] }>("/api/registry").then(value => {
       if (!active) return;
       setRepositories(value.repositories);
-      if (!experimentId) setExperimentId(value.repositories.flatMap(repo => repo.experiments)[0]?.experiment_id || null);
+      setExperimentId(current =>
+        current || value.repositories.flatMap(repo => repo.experiments)[0]?.experiment_id || null
+      );
     }).catch(reason => active && setError(String(reason)));
     load();
     const timer = window.setInterval(load, 5000);

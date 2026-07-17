@@ -1,17 +1,20 @@
 import json
 import os
 import shutil
+import subprocess
 import tempfile
 import uuid
 from pathlib import Path
 
 from .store import db, insert_run
 from .workspace import (
+    ensure_within_project,
     now,
     read_json,
     repository_root,
     resolve_root,
     run_dir_for,
+    safe_repository_path,
     script_manifest,
     write_json,
     experiment_id,
@@ -76,19 +79,47 @@ def run_stage_commit(run):
 
 def copy_run_source(src_root, root):
     """Restore declared source files from a snapshot to the live repository."""
-    src_root = Path(src_root)
+    src_root = Path(src_root).resolve()
     root = resolve_root(root)
-    repo = repository_root(root)
     config = read_json(src_root / ".autoexp/project.json")
     for item in config.get("files", []):
         if item.get("role") in {"secret-source", "generated-output", "frozen-evaluator"}:
             continue
-        rel = Path(item["path"])
+        rel = ensure_within_project(item["path"], "snapshot source path")
         source = src_root / rel
-        target = repo / rel
+        cursor = src_root
+        for part in rel.parts:
+            cursor /= part
+            if cursor.is_symlink():
+                raise ValueError(f"snapshot source path contains a symlink: {rel}")
+        if not source.resolve(strict=False).is_relative_to(src_root):
+            raise ValueError(f"snapshot source path escapes snapshot: {rel}")
+        target = safe_repository_path(root, rel)
         if source.is_file():
             target.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, target)
+        elif source.exists():
+            raise ValueError(f"snapshot source is not a file: {rel}")
+        elif target.is_dir():
+            raise ValueError(f"refusing to replace directory with absent source: {rel}")
+        else:
+            target.unlink(missing_ok=True)
+
+
+def _dirty_restore_paths(src_root, root):
+    config = read_json(Path(src_root) / ".autoexp/project.json")
+    paths = [
+        str(ensure_within_project(item["path"], "snapshot source path"))
+        for item in config.get("files", [])
+        if item.get("role") not in {"secret-source", "generated-output", "frozen-evaluator"}
+    ]
+    if not paths:
+        return ""
+    proc = subprocess.run(
+        ["git", "-C", str(repository_root(root)), "status", "--porcelain", "--", *paths],
+        check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+    )
+    return proc.stdout.strip()
 
 
 def source_root_for_run(run, root=None):
@@ -108,6 +139,12 @@ def restore_run_state(run_id, root=None):
 
     with tempfile.TemporaryDirectory(prefix="autoexp-restore-") as tmp:
         materialize_snapshot(run["source_snapshot_id"], tmp, root)
+        dirty = _dirty_restore_paths(tmp, root)
+        if dirty:
+            raise ValueError(
+                "refusing to restore over uncommitted source changes:\n"
+                f"{dirty}"
+            )
         copy_run_source(tmp, root)
     return run, run_stage_commit(run)
 
