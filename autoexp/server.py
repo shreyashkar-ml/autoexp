@@ -1,46 +1,31 @@
-import json
+"""Global read/download dashboard and explicit browser-review transport."""
+
+import io
+import hashlib
 import ipaddress
+import json
 import mimetypes
 import os
 import shutil
-import sqlite3
 import subprocess
 import sys
+import time
+import webbrowser
+import zipfile
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+from urllib.parse import parse_qs, quote, unquote, urlparse
+from urllib.request import urlopen
 
-from .artifacts import artifact_content, artifact_detail, list_artifacts, read_log
-from .jobs import RunManager, recover_stranded
-from .reports import (
-    list_milestones,
-    mark_milestone,
-    project_summary,
-    read_project_report,
-    report_instruction,
-    write_project_report,
-    write_report_instruction,
-)
-from .autoresearch import for_project as research_for_project
-from .store import init_db, require_autoexp_git_repo
+from .artifacts import artifact_content, artifact_detail, artifact_file, list_artifacts, read_log
+from .reports import list_documents, list_milestones, read_project_report
+from .review import review_session, submit_review
+from .runtime import list_runs, run_diff, run_overview, run_report, run_source
+from .snapshots import materialize_snapshot
+from .store import db
 from .workspace import (
-    is_project_root,
-    list_registered_projects,
-    project_id,
-    project_mode,
-    register_project,
-    resolve_registered_project,
-)
-from .runtime import (
-    list_runs,
-    read_script_params,
-    run_diff,
-    run_overview,
-    run_report,
-    run_source,
-    save_script_file,
-    workspace,
-    write_script_params,
+    experiment_entry, manifest_files, project_mode, registry, resolve_root,
+    safe_repository_path,
 )
 
 
@@ -48,75 +33,96 @@ UI_DIR = Path(__file__).with_name("ui")
 
 
 def clamp(raw, default=20, maximum=200):
-    """Coerce a query value to an int in [1, maximum], falling back to default."""
     try:
         return max(1, min(int(raw), maximum))
     except (TypeError, ValueError):
         return default
 
 
-def bounded_int(raw, default=0, minimum=0, maximum=1048576):
+def bounded_int(raw, default=0, minimum=0, maximum=16 * 1024 * 1024):
     try:
         return max(minimum, min(int(raw), maximum))
     except (TypeError, ValueError):
         return default
 
 
-def open_project_path(path):
-    """Open a registered project in the host's file manager."""
-    path = Path(path).resolve()
-    command = "open" if sys.platform == "darwin" else "explorer" if os.name == "nt" else "xdg-open"
-    executable = shutil.which(command)
-    if not executable:
-        raise ValueError(f"file manager command is unavailable: {command}")
-    subprocess.Popen(
-        [executable, str(path)],
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-        start_new_session=True,
-    )
+def _run_stats():
+    conn = db()
+    rows = conn.execute(
+        "select experiment_id, run_id, status, created_at from runs order by rowid desc"
+    ).fetchall()
+    conn.close()
+    result = {}
+    for row in rows:
+        item = result.setdefault(row["experiment_id"], {"run_count": 0})
+        item["run_count"] += 1
+        if "latest_run_id" not in item:
+            item.update(
+                latest_run_id=row["run_id"], latest_run_status=row["status"],
+                latest_run_at=row["created_at"],
+            )
+    return result
+
+
+def _public_experiment(item, stats=None):
+    value = {key: item.get(key) for key in (
+        "experiment_id", "repo_id", "repo_title", "repo_path", "title", "objective",
+        "kind", "status", "runner", "created_at", "updated_at", "exists",
+    )}
+    return value | (stats or {"run_count": 0})
+
+
+def _experiment_payload(root, limit=100):
+    item = experiment_entry(root)
+    payload = {
+        "experiment": _public_experiment(item),
+        "files": manifest_files(root, refresh=False),
+        "runs": list_runs(limit, root),
+        "documents": list_documents(root),
+        "milestones": list_milestones(root),
+        "project_report": read_project_report(root),
+        "managed": {
+            "stage": item["stage"],
+            "params": item["params"],
+            "params_schema": item["params_schema"],
+            "report_guidance": item["report_guidance"],
+        },
+    }
+    if project_mode(root) == "autoresearch":
+        from .autoresearch import for_project
+        payload["research"] = for_project(root).state()
+    return payload
+
+
+def _bundle(root):
+    root = resolve_root(root)
+    buffer = io.BytesIO()
+    with zipfile.ZipFile(buffer, "w", zipfile.ZIP_DEFLATED) as archive:
+        for top in ("reports", "insights", "runs"):
+            base = root / top
+            if not base.is_dir():
+                continue
+            for path in sorted(base.rglob("*")):
+                if path.is_file() and not path.is_symlink():
+                    archive.write(path, path.relative_to(root))
+    return buffer.getvalue()
 
 
 class AutoexpHTTPServer(ThreadingHTTPServer):
     daemon_threads = True
 
-    def __init__(self, server_address, handler_class, default_project=None, allow_origins=None):
-        super().__init__(server_address, handler_class)
-        self.default_project = default_project
-        self.managers = {}
-        self.researchers = {}
+    def __init__(self, address, handler, allow_origins=None):
+        super().__init__(address, handler)
         self.allow_origins = set(allow_origins or [])
-
-    def project_root(self, raw=None):
-        return resolve_registered_project(raw or self.default_project)
-
-    def selected_project_id(self, raw=None):
-        return project_id(self.project_root(raw))
-
-    def manager(self, root):
-        key = project_id(root)
-        if key not in self.managers:
-            self.managers[key] = RunManager(root)
-        return self.managers[key]
-
-    def research(self, root):
-        key = project_id(root)
-        if key not in self.researchers:
-            self.researchers[key] = research_for_project(root)
-        return self.researchers[key]
 
 
 class AutoexpHandler(BaseHTTPRequestHandler):
-    server_version = "AutoexpHTTP/0.2"
-
-    # ------------------------------------------------------------------
-    #  Method entry points
-    # ------------------------------------------------------------------
+    server_version = "AutoexpHTTP/0.3"
 
     def do_OPTIONS(self):
         self.send_response(204)
         self._headers()
-        self.send_header("Access-Control-Allow-Methods", "GET, POST, PUT, PATCH, OPTIONS")
+        self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
         self.end_headers()
 
@@ -126,398 +132,151 @@ class AutoexpHandler(BaseHTTPRequestHandler):
     def do_POST(self):
         self._dispatch(self._post, check_origin=True)
 
-    def do_PUT(self):
-        self._dispatch(self._put, check_origin=True)
-
-    def do_PATCH(self):
-        self._dispatch(self._patch, check_origin=True)
-
-    def _dispatch(self, handler, check_origin=False):
+    def _dispatch(self, fn, check_origin=False):
         if check_origin and not self._origin_allowed():
-            self._json({"error": "origin not allowed"}, 403)
-            return
+            return self._json({"error": "origin not allowed"}, 403)
         try:
-            handler()
+            fn()
         except FileNotFoundError as exc:
             self._json({"error": str(exc)}, 404)
-        except sqlite3.IntegrityError as exc:
-            self._json({"error": str(exc)}, 409)
         except (TypeError, ValueError) as exc:
             self._json({"error": str(exc)}, 400)
-        except SystemExit:
-            self._json({"error": "request could not be completed"}, 400)
         except Exception as exc:
             self._json({"error": str(exc)}, 500)
-
-    # ------------------------------------------------------------------
-    #  GET routes
-    # ------------------------------------------------------------------
 
     def _get(self):
         parsed = urlparse(self.path)
         query = parse_qs(parsed.query)
         path = parsed.path
-
         if path == "/api/health":
-            return self._json({"ok": True})
-        if path == "/api/projects":
-            raw = query.get("project_id", [""])[0] or None
-            projects = list_registered_projects()
-            has_existing = any(item["exists"] for item in projects)
-            selected = self.server.selected_project_id(raw) if has_existing else None
-            return self._json({"projects": projects, "selected_project_id": selected})
+            return self._json({"ok": True, "version": "0.3"})
+        if path == "/api/registry":
+            stats = _run_stats()
+            repos = registry()
+            for repo in repos:
+                repo["experiments"] = [_public_experiment(item, stats.get(item["experiment_id"])) for item in repo["experiments"]]
+            return self._json({"repositories": repos})
+        if path == "/api/review":
+            token = query.get("token", [""])[0]
+            session = review_session(token)
+            return self._json({"session": session}, 200 if session else 404)
         if not path.startswith("/api/"):
             return self._static(path)
 
-        root = self._project_root(query)
-        manager = self.server.manager(root)
-        limit = clamp(query.get("limit", [20])[0])
+        parts = [unquote(part) for part in path.removeprefix("/api/").split("/") if part]
+        if len(parts) >= 2 and parts[0] == "experiments":
+            root = resolve_root(parts[1])
+            if len(parts) == 2:
+                return self._json(_experiment_payload(root, clamp(query.get("limit", [100])[0])))
+            if parts[2:] == ["files"]:
+                return self._experiment_file(root, query)
+            if parts[2:] == ["bundle"]:
+                entry = experiment_entry(root)
+                return self._content(_bundle(root), "application/zip", f"{entry['experiment_id']}.zip", attachment=True)
+            if parts[2:] == ["documents"]:
+                return self._document(root, query)
 
-        if path == "/api/workspace":
-            return self._json(workspace(root))
-        if path == "/api/preflight":
-            from .execution import preflight_request
-
-            return self._json(preflight_request(
-                root,
-                run_id=query.get("run_id", [None])[0],
-                snapshot_id=query.get("snapshot_id", [None])[0],
-            ))
-        if path == "/api/runs":
-            return self._json({"runs": list_runs(limit, root)})
-        if path.startswith("/api/runs/"):
-            parts = [unquote(part) for part in path.removeprefix("/api/runs/").split("/")]
-            run_id = parts[0]
-            if not run_id:
-                return self._json({"error": "run_id is required"}, 400)
-            if len(parts) == 1:
+        if len(parts) >= 2 and parts[0] == "runs":
+            run_id = parts[1]
+            root = self._root_for_run(run_id)
+            if len(parts) == 2:
                 return self._json(run_overview(run_id, root))
-            if parts[1:] == ["source"]:
+            if parts[2:] == ["source"]:
                 return self._json(run_source(run_id, root))
-            if parts[1:] == ["artifacts"]:
-                category = query.get("category", [None])[0]
-                return self._json({
-                    "run_id": run_id,
-                    "artifacts": list_artifacts(run_id, root=root, category=category),
-                })
-            if len(parts) == 3 and parts[1] == "artifacts":
-                return self._json(artifact_detail(run_id, parts[2], root))
-            if len(parts) == 4 and parts[1] == "artifacts" and parts[3] == "content":
-                offset = bounded_int(query.get("offset", [0])[0], maximum=2**63 - 1)
-                size = bounded_int(
-                    query.get("limit", [16 * 1024 * 1024])[0],
-                    default=16 * 1024 * 1024,
-                    minimum=1,
-                    maximum=16 * 1024 * 1024,
-                )
-                artifact, content = artifact_content(
-                    run_id, parts[2], root, offset=offset, limit=size
-                )
-                return self._content(
-                    content,
-                    artifact.get("media_type") or "application/octet-stream",
-                    artifact.get("path"),
-                    truncated=offset + len(content) < artifact["size_bytes"],
-                )
-            if len(parts) == 3 and parts[1] == "logs":
-                offset = bounded_int(query.get("offset", [0])[0], maximum=2**63 - 1)
-                size = bounded_int(query.get("limit", [65536])[0], default=65536, minimum=1)
-                return self._json(read_log(run_id, parts[2], offset=offset, limit=size, root=root))
-            if parts[1:] == ["report"]:
-                return self._json(run_report(run_id, root))
-            if parts[1:] == ["diff"]:
-                return self._json(run_diff(
-                    run_id,
-                    root,
-                    base_run_id=query.get("base_run_id", [None])[0],
-                    base_snapshot_id=query.get("base_snapshot_id", [None])[0],
-                ))
-            return self._json({"error": "not found"}, 404)
-        if path == "/api/status":
-            return self._json({"run": manager.active(), "runs": list_runs(limit, root)})
-        if path == "/api/script/params":
-            return self._json(read_script_params(root))
-        if path == "/api/report/instruction":
-            return self._json(report_instruction(root))
-        if path == "/api/project-report":
-            return self._json(read_project_report(root))
-        if path == "/api/project-summary":
-            return self._json(project_summary(root, limit))
-        if path == "/api/milestones":
-            return self._json({"milestones": list_milestones(root)})
-        if path == "/api/research":
-            return self._json(self.server.research(root).state())
-        if path == "/api/research/preflight":
-            return self._json(self.server.research(root).preflight())
-        if path == "/api/research/diff":
-            attempt_id = query.get("attempt_id", query.get("tag", [""]))[0]
-            if not attempt_id:
-                return self._json({"error": "attempt_id is required"}, 400)
-            return self._json(self.server.research(root).diff(attempt_id))
-        if path == "/api/research/file":
-            rel = query.get("path", [""])[0]
-            if not rel:
-                return self._json({"error": "path is required"}, 400)
-            return self._json(self.server.research(root).open_file(rel))
-        if path == "/api/run/source":
-            return self._run_scoped(query, root, run_source)
-        if path == "/api/run/report":
-            return self._run_scoped(query, root, run_report)
-        if path == "/api/run/log":
-            tail = clamp(query.get("tail_bytes", [65536])[0], default=65536, maximum=1048576)
-            log = self.server.research(root).log(tail) if project_mode(root) == "autoresearch" else manager.log(tail)
-            return self._json({"log": log, "kind": "agent" if project_mode(root) == "autoresearch" else "job"})
-        self._static(path)
-
-    def _run_scoped(self, query, root, fn):
-        run_id = query.get("run_id", [""])[0]
-        if not run_id:
-            return self._json({"error": "run_id is required"}, 400)
-        return self._json(fn(run_id, root))
-
-    # ------------------------------------------------------------------
-    #  POST / PUT / PATCH routes
-    # ------------------------------------------------------------------
+            if parts[2:] == ["report"]:
+                report = run_report(run_id, root)
+                if query.get("download", ["0"])[0] == "1" and report["artifact"]:
+                    return self._content(
+                        report["text"].encode(), report["artifact"]["media_type"],
+                        Path(report["path"]).name, attachment=True,
+                    )
+                return self._json(report)
+            if parts[2:] == ["diff"]:
+                return self._json(run_diff(run_id, root, base_run_id=query.get("base_run_id", [None])[0]))
+            if parts[2:] == ["artifacts"]:
+                return self._json({"artifacts": list_artifacts(run_id, root, query.get("category", [None])[0])})
+            if len(parts) == 4 and parts[2] == "artifacts":
+                return self._json(artifact_detail(run_id, parts[3], root))
+            if len(parts) == 5 and parts[2] == "artifacts" and parts[4] == "content":
+                if query.get("download", ["0"])[0] == "1":
+                    artifact, file_path = artifact_file(run_id, parts[3], root)
+                    return self._file(file_path, artifact["media_type"], Path(artifact["path"]).name)
+                offset = bounded_int(query.get("offset", [0])[0])
+                size = bounded_int(query.get("limit", [16 * 1024 * 1024])[0], minimum=1)
+                artifact, content = artifact_content(run_id, parts[3], root, offset=offset, limit=size)
+                return self._content(content, artifact["media_type"], Path(artifact["path"]).name)
+            if len(parts) == 4 and parts[2] == "logs":
+                log = read_log(run_id, parts[3], root=root)
+                if query.get("download", ["0"])[0] == "1":
+                    artifact = next(
+                        (
+                            item for item in list_artifacts(run_id, root, "log")
+                            if item["path"] == f"logs/script.{log['stream']}.log"
+                        ),
+                        None,
+                    )
+                    filename = f"{run_id}-{log['stream']}.log"
+                    if artifact:
+                        _, file_path = artifact_file(run_id, artifact["artifact_id"], root)
+                        return self._file(file_path, "text/plain; charset=utf-8", filename)
+                    return self._content(b"", "text/plain; charset=utf-8", filename, attachment=True)
+                return self._json(log)
+        return self._json({"error": "not found"}, 404)
 
     def _post(self):
-        path = urlparse(self.path).path
+        if urlparse(self.path).path != "/api/review/submit":
+            return self._json({"error": "not found"}, 404)
         body = self._body({})
+        if not isinstance(body, dict):
+            return self._json({"error": "body must be an object"}, 400)
+        return self._json({"session": submit_review(body.get("token"), body.get("notes"))})
 
-        if path == "/api/open-path":
-            root = self._project_root(body)
-            open_project_path(root)
-            print(f"[autoexp] opened {root}", flush=True)
-            return self._json({"ok": True, "path": str(root)})
+    def _root_for_run(self, run_id):
+        from .store import db
+        conn = db()
+        row = conn.execute("select experiment_id from runs where run_id = ?", (run_id,)).fetchone()
+        conn.close()
+        if not row:
+            raise ValueError(f"unknown run_id: {run_id}")
+        return resolve_root(row["experiment_id"])
 
-        if path == "/api/milestones":
-            if not isinstance(body, dict):
-                return self._json({"error": "body must be a JSON object"}, 400)
-            return self._json(mark_milestone(
-                title=body.get("title"),
-                significance=body.get("significance"),
-                run_id=body.get("run_id"),
-                attempt_id=body.get("attempt_id"),
-                actor_name="autoexp-view",
-                root=self._project_root(body),
-            ), 201)
+    def _experiment_file(self, root, query):
+        rel = query.get("path", [""])[0]
+        item = next((item for item in manifest_files(root, refresh=False) if item["path"] == rel), None)
+        if not item:
+            raise ValueError(f"file is not declared: {rel}")
+        if item["role"] == "secret-source":
+            return self._json({"file": item, "text": None, "secret": True})
+        snapshot_id = query.get("snapshot", [None])[0]
+        if snapshot_id:
+            import tempfile
+            with tempfile.TemporaryDirectory(prefix="autoexp-browser-source-") as tmp:
+                materialize_snapshot(snapshot_id, tmp, root)
+                path = Path(tmp) / rel
+                text = path.read_text(errors="replace") if path.is_file() else None
+            return self._json({"file": item, "text": text, "snapshot_id": snapshot_id, "live": False})
+        path = safe_repository_path(root, rel)
+        return self._json({"file": item, "text": path.read_text(errors="replace") if path.is_file() else None, "live": True})
 
-        if path == "/api/runs":
-            if not isinstance(body, dict):
-                return self._json({"error": "body must be a JSON object"}, 400)
-            snapshot_id = body.get("snapshot_id")
-            if snapshot_id is not None and not isinstance(snapshot_id, str):
-                return self._json({"error": "snapshot_id must be a string"}, 400)
-            root = self._project_root(body)
-            if not self._execution_preflight(root, snapshot_id=snapshot_id):
-                return
-            ok, payload = self.server.manager(root).start(snapshot_id=snapshot_id)
-            return self._json(payload, 202 if ok else 409)
-        if path.startswith("/api/runs/"):
-            parts = [unquote(part) for part in path.removeprefix("/api/runs/").split("/")]
-            if len(parts) == 2 and parts[0] and parts[1] == "rerun":
-                if not isinstance(body, dict):
-                    return self._json({"error": "body must be a JSON object"}, 400)
-                root = self._project_root(body)
-                if not self._execution_preflight(root, run_id=parts[0]):
-                    return
-                ok, payload = self.server.manager(root).start(run_id=parts[0])
-                return self._json(payload, 202 if ok else 409)
-            if len(parts) == 2 and parts[0] and parts[1] == "cancel":
-                if not isinstance(body, dict):
-                    return self._json({"error": "body must be a JSON object"}, 400)
-                manager = self.server.manager(self._project_root(body))
-                current = manager.active()
-                if not current["active"] or current["job"].get("run_id") != parts[0]:
-                    return self._json({"error": "run is not active"}, 409)
-                ok, payload = manager.kill(bool(body.get("force")))
-                return self._json(payload, 202 if ok else 409)
-            return self._json({"error": "not found"}, 404)
-        if path == "/api/run/start":
-            root = self._project_root(body)
-            run_id = body.get("run_id")
-            if run_id is not None and not isinstance(run_id, str):
-                return self._json({"error": "run_id must be a string"}, 400)
-            snapshot_id = body.get("snapshot_id")
-            if snapshot_id is not None and not isinstance(snapshot_id, str):
-                return self._json({"error": "snapshot_id must be a string"}, 400)
-            if not self._execution_preflight(root, run_id=run_id, snapshot_id=snapshot_id):
-                return
-            ok, payload = self.server.manager(root).start(run_id, snapshot_id)
-            return self._json(payload, 202 if ok else 409)
-        if path == "/api/run/kill":
-            root = self._project_root(body)
-            ok, payload = self.server.manager(root).kill(bool(body.get("force")))
-            return self._json(payload, 202 if ok else 409)
-        if path == "/api/research/loop/start":
-            root = self._project_root(body)
-            research = self.server.research(root)
-            preflight = research.preflight()
-            if not preflight["ok"]:
-                failed = next(
-                    (item for item in preflight["checks"] if item["required"] and not item["ok"]),
-                    None,
-                )
-                return self._json({
-                    "error": (failed or {}).get("detail") or "research preflight failed",
-                    "preflight": preflight,
-                }, 422)
-            result = research.start_loop()
-            print("[autoexp] Autoresearch loop started", flush=True)
-            return self._json(result, 202)
-        if path == "/api/research/loop/kill":
-            root = self._project_root(body)
-            result = self.server.research(root).stop_loop()
-            print("[autoexp] Autoresearch loop stop requested", flush=True)
-            return self._json(result, 202)
-        self._json({"error": "not found"}, 404)
-
-    def _patch(self):
-        if urlparse(self.path).path != "/api/script/file":
-            return self._json({"error": "not found"}, 404)
-
-        body = self._body({})
-        rel = body.get("path")
-        text = body.get("text")
-        if not isinstance(rel, str) or not rel:
-            return self._json({"error": "path is required"}, 400)
-        if not isinstance(text, str):
-            return self._json({"error": "text must be a string"}, 400)
-
-        run_id = body.get("run_id")
-        if run_id is not None and not isinstance(run_id, str):
-            return self._json({"error": "run_id must be a string"}, 400)
-        snapshot_id = body.get("snapshot_id")
-        if snapshot_id is not None and not isinstance(snapshot_id, str):
-            return self._json({"error": "snapshot_id must be a string"}, 400)
-        save_as = body.get("save_as")
-        if save_as is not None and not isinstance(save_as, str):
-            return self._json({"error": "save_as must be a string"}, 400)
-
-        result = save_script_file(
-            rel,
-            text,
-            self._project_root(body),
-            source_run_id=run_id,
-            save_as=save_as,
-            source_snapshot_id=snapshot_id,
-            trigger_kind="ui",
-            actor_name="autoexp-view",
-        )
-        print(f"[autoexp] saved {result['path']} as {result['snapshot']['snapshot_id']}", flush=True)
-        self._json(result)
-
-    def _put(self):
-        path = urlparse(self.path).path
-
-        if path == "/api/research/file":
-            body = self._body({})
-            rel = body.get("path") if isinstance(body, dict) else None
-            text = body.get("text") if isinstance(body, dict) else None
-            if not isinstance(rel, str) or not rel:
-                return self._json({"error": "path is required"}, 400)
-            if not isinstance(text, str):
-                return self._json({"error": "text must be a string"}, 400)
-            result = self.server.research(self._project_root(body)).save_file(rel, text)
-            print(f"[autoexp] saved research file {rel}", flush=True)
-            return self._json(result)
-
-        if path == "/api/report/instruction":
-            body = self._body({})
-            text = body.get("text") if isinstance(body, dict) else None
-            if not isinstance(text, str):
-                return self._json({"error": "text must be a string"}, 400)
-            result = write_report_instruction(text, self._project_root(body))
-            print("[autoexp] saved report guidance", flush=True)
-            return self._json(result)
-
-        if path == "/api/project-report":
-            body = self._body({})
-            text = body.get("text") if isinstance(body, dict) else None
-            if not isinstance(text, str):
-                return self._json({"error": "text must be a string"}, 400)
-            result = write_project_report(text, self._project_root(body))
-            print("[autoexp] saved project report", flush=True)
-            return self._json(result)
-
-        if path == "/api/research/program":
-            body = self._body({})
-            text = body.get("text") if isinstance(body, dict) else None
-            if not isinstance(text, str):
-                return self._json({"error": "text must be a string"}, 400)
-            result = self.server.research(self._project_root(body)).save_program(text)
-            print("[autoexp] saved research program", flush=True)
-            return self._json(result)
-
-        if path == "/api/research/subject":
-            body = self._body({})
-            text = body.get("text") if isinstance(body, dict) else None
-            if not isinstance(text, str):
-                return self._json({"error": "text must be a string"}, 400)
-            research = self.server.research(self._project_root(body))
-            if not research.can_import_baseline():
-                return self._json({"error": "baseline import is only available before attempts and before candidate.py is edited"}, 409)
-            result = research.save_subject(text)
-            print("[autoexp] imported Autoresearch baseline", flush=True)
-            return self._json(result)
-
-        if path != "/api/script/params":
-            return self._json({"error": "not found"}, 404)
-
-        body = self._body()
-        params = body.get("params") if isinstance(body, dict) and "params" in body else body
-        if not isinstance(params, dict):
-            return self._json({"error": "params must be a JSON object"}, 400)
-
-        root_data = body if isinstance(body, dict) else {}
-        result = write_script_params(
-            params,
-            self._project_root(root_data),
-            trigger_kind="ui",
-            actor_name="autoexp-view",
-        )
-        print(f"[autoexp] saved parameters as {result['snapshot']['snapshot_id']}", flush=True)
-        self._json(result)
-
-    # ------------------------------------------------------------------
-    #  Shared helpers
-    # ------------------------------------------------------------------
-
-    @staticmethod
-    def _project_id_from(data):
-        """Pull project_id from a request, handling both query (list) and JSON (scalar) shapes."""
-        if not isinstance(data, dict):
-            return None
-        value = data.get("project_id")
-        if isinstance(value, list):
-            return value[0] if value else None
-        return value
-
-    def _project_root(self, data):
-        return self.server.project_root(self._project_id_from(data) or None)
-
-    def _execution_preflight(self, root, run_id=None, snapshot_id=None):
-        from .execution import preflight_request
-
-        result = preflight_request(root, run_id=run_id, snapshot_id=snapshot_id)
-        if result["ok"]:
-            return True
-        failed = next((item for item in result["checks"] if not item["ok"]), None)
-        self._json({
-            "error": (failed or {}).get("detail") or "execution preflight failed",
-            "preflight": result,
-        }, 422)
-        return False
+    def _document(self, root, query):
+        rel = query.get("path", [""])[0]
+        document = next((item for item in list_documents(root) if item["path"] == rel), None)
+        if not document:
+            raise ValueError(f"unknown document: {rel}")
+        path = (root / rel).resolve()
+        if not path.is_file() or not path.is_relative_to(root.resolve()):
+            raise FileNotFoundError(rel)
+        if path.stat().st_size != document["size_bytes"] or hashlib.sha256(path.read_bytes()).hexdigest() != document["content_hash"]:
+            raise ValueError(f"immutable document content changed: {rel}")
+        return self._content(path.read_bytes(), mimetypes.guess_type(path.name)[0] or "application/octet-stream", path.name, attachment=query.get("download", ["0"])[0] == "1")
 
     def _body(self, default=None):
         length = int(self.headers.get("Content-Length", "0"))
         if length == 0:
             return default
-        if length > 16 * 1024 * 1024:
+        if length > 1024 * 1024:
             raise ValueError("request body is too large")
-        try:
-            return json.loads(self.rfile.read(length).decode())
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"invalid JSON body: {exc}") from exc
+        return json.loads(self.rfile.read(length).decode())
 
     def _origin_allowed(self):
         origin = self.headers.get("Origin")
@@ -525,22 +284,17 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             return True
         parsed = urlparse(origin)
         try:
-            port = parsed.port
-        except ValueError:
+            return parsed.scheme == "http" and parsed.port == self.server.server_port and (parsed.hostname == "localhost" or ipaddress.ip_address(parsed.hostname).is_loopback)
+        except (ValueError, TypeError):
             return False
-        if parsed.scheme != "http" or port != self.server.server_port:
-            return False
-        hostname = parsed.hostname or ""
-        if hostname == "localhost":
-            return True
-        try:
-            address = ipaddress.ip_address(hostname)
-            bound = ipaddress.ip_address(self.server.server_address[0])
-        except ValueError:
-            return False
-        return address.is_loopback or (
-            not bound.is_unspecified and address == bound
-        )
+
+    def _headers(self):
+        self.send_header("Cache-Control", "no-store")
+        self.send_header("X-Content-Type-Options", "nosniff")
+        origin = self.headers.get("Origin")
+        if origin and self._origin_allowed():
+            self.send_header("Access-Control-Allow-Origin", origin)
+            self.send_header("Vary", "Origin")
 
     def _json(self, payload, status=200):
         body = json.dumps(payload, indent=2).encode()
@@ -551,77 +305,107 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def _content(self, body, content_type, path=None, *, truncated=False):
+    def _content(self, body, content_type, filename=None, *, attachment=False, static=False):
+        self.send_response(200)
+        self._headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Security-Policy", "default-src 'self'; connect-src 'self'; img-src 'self' data:; style-src 'self' https://fonts.googleapis.com; font-src https://fonts.gstatic.com; script-src 'self'; base-uri 'none'; frame-ancestors 'none'; form-action 'none'" if static else "sandbox; default-src 'none'")
+        if attachment and filename:
+            safe = filename.replace('"', "").replace("\r", "").replace("\n", "")
+            self.send_header("Content-Disposition", f'attachment; filename="{safe}"')
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def _file(self, path, content_type, filename):
+        path = Path(path)
+        safe = filename.replace('"', "").replace("\r", "").replace("\n", "")
         self.send_response(200)
         self._headers()
         self.send_header("Content-Type", content_type)
         self.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
-        self.send_header("X-Content-Truncated", "true" if truncated else "false")
-        if content_type.split(";", 1)[0].lower() in {"text/html", "application/xhtml+xml"}:
-            filename = Path(path or "artifact").name.replace('"', "").replace("\r", "").replace("\n", "")
-            self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
-        self.send_header("Content-Length", str(len(body)))
+        self.send_header("Content-Disposition", f'attachment; filename="{safe}"')
+        self.send_header("Content-Length", str(path.stat().st_size))
         self.end_headers()
-        self.wfile.write(body)
-
-    def _headers(self):
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("X-Content-Type-Options", "nosniff")
-        origin = self.headers.get("Origin")
-        if origin and self._origin_allowed():
-            self.send_header("Access-Control-Allow-Origin", origin)
-            self.send_header("Vary", "Origin")
+        with path.open("rb") as handle:
+            shutil.copyfileobj(handle, self.wfile)
 
     def _static(self, path):
         rel = "index.html" if path in {"", "/"} else path.lstrip("/")
         target = (UI_DIR / rel).resolve()
-
         if not target.is_relative_to(UI_DIR.resolve()) or not target.is_file():
             target = UI_DIR / "index.html"
         if not target.is_file():
             return self._json({"error": "not found"}, 404)
-
-        body = target.read_bytes()
-        if target.suffix == ".jsx":
-            content_type = "text/javascript"
-        else:
-            content_type = mimetypes.guess_type(target.name)[0] or "application/octet-stream"
-        self.send_response(200)
-        self._headers()
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
+        return self._content(target.read_bytes(), mimetypes.guess_type(target.name)[0] or "application/octet-stream", static=True)
 
     def log_message(self, fmt, *args):
-        status = int(args[1]) if len(args) > 1 and str(args[1]).isdigit() else 0
-        if status >= 400:
-            print(f"[autoexp] HTTP {status}: {args[0]}", file=sys.stderr, flush=True)
+        if len(args) > 1 and str(args[1]).isdigit() and int(args[1]) >= 400:
+            print(f"[autoexp] HTTP {args[1]}: {args[0]}", file=sys.stderr, flush=True)
 
 
-def view(host, port, allow_origins=None, project=None):
-    default_project = None
-    if project:
-        root = Path(project).expanduser()
-        if is_project_root(root):
-            default_project = register_project(root)["project_id"]
-        else:
-            default_project = project
+def _require_loopback_host(host):
+    try:
+        loopback = host == "localhost" or (
+            ipaddress.ip_address(host).version == 4
+            and ipaddress.ip_address(host).is_loopback
+        )
+    except ValueError:
+        loopback = False
+    if not loopback:
+        raise ValueError("Autoexp view may only bind to a loopback host")
 
-    for item in list_registered_projects():
-        if item["exists"]:
-            root = Path(item["path"])
-            require_autoexp_git_repo(root)
-            init_db(root)
-            recover_stranded(root)
 
-    server = AutoexpHTTPServer(
-        (host, port),
-        AutoexpHandler,
-        default_project=default_project,
-        allow_origins=allow_origins,
+def _healthy(host, port):
+    try:
+        with urlopen(f"http://{host}:{port}/api/health", timeout=0.5) as response:
+            data = json.load(response)
+            return data.get("ok") is True and data.get("version") == "0.3"
+    except Exception:
+        return False
+
+
+def ensure_server(host="127.0.0.1", port=8765):
+    _require_loopback_host(host)
+    if _healthy(host, port):
+        return f"http://{host}:{port}", None
+    proc = subprocess.Popen(
+        [sys.executable, "-m", "autoexp", "view", "--host", host, "--port", str(port), "--no-open"],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, start_new_session=True,
     )
-    print(f"[autoexp] view ready at http://{host}:{server.server_port}", flush=True)
+    for _ in range(40):
+        if _healthy(host, port):
+            return f"http://{host}:{port}", proc
+        if proc.poll() is not None:
+            break
+        time.sleep(0.1)
+    raise ValueError("Autoexp browser server could not start")
+
+
+def view(host="127.0.0.1", port=8765, allow_origins=None, experiment=None, review_token=None, open_browser=True):
+    _require_loopback_host(host)
+    if _healthy(host, port):
+        base = f"http://{host}:{port}"
+        query = []
+        if experiment:
+            query.append(f"experiment={quote(str(experiment))}")
+        if review_token:
+            query.append(f"review={quote(review_token)}")
+        url = base + ("/?" + "&".join(query) if query else "")
+        if open_browser:
+            webbrowser.open(url)
+        print(f"[autoexp] using {url}")
+        return
+    server = AutoexpHTTPServer((host, port), AutoexpHandler, allow_origins)
+    query = []
+    if experiment:
+        query.append(f"experiment={quote(str(experiment))}")
+    if review_token:
+        query.append(f"review={quote(review_token)}")
+    url = f"http://{host}:{server.server_port}/" + ("?" + "&".join(query) if query else "")
+    print(f"[autoexp] view ready at {url}", flush=True)
+    if open_browser:
+        webbrowser.open(url)
     try:
         server.serve_forever()
     except KeyboardInterrupt:

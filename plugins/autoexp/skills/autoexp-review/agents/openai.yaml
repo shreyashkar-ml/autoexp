@@ -1,0 +1,6 @@
+interface:
+  display_name: "Autoexp Review"
+  short_description: "Open browser feedback for an Autoexp experiment"
+  default_prompt: "Open the Autoexp browser review for the active experiment and wait for my feedback."
+policy:
+  allow_implicit_invocation: false

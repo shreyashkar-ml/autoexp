@@ -8,24 +8,18 @@ import uuid
 from pathlib import Path
 
 from .git_store import commit_source_tree, materialize_commit, preserve_snapshot_ref
-from .store import (
-    autoexp_git,
-    current_autoexp_commit,
-    db,
-    git_commit_source,
-    require_autoexp_git_repo,
-)
+from .store import autoexp_git, current_autoexp_commit, db, require_autoexp_git_repo
 from .workspace import (
-    EXPERIMENT_DIR,
     PARAMS_FILE,
-    STAGE_MANIFEST,
     PROJECT_CONFIG,
+    STAGE_MANIFEST,
     ensure_within_project,
+    experiment_id,
+    materialize_workspace,
     now,
     project_id,
     read_json,
     resolve_root,
-    run_dir_for,
     source_paths,
 )
 
@@ -40,21 +34,60 @@ def _hash_file(path):
     return _hash_bytes(path.read_bytes()) if path.is_file() else _hash_bytes(b"")
 
 
-def _hash_script_source(script_dir):
+def _hash_declared_source(source_root, config, *, include_types=True):
     digest = hashlib.sha256()
+    for item in sorted(config.get("files", []), key=lambda value: value.get("path", "")):
+        if item.get("role") in {"secret-source", "generated-output"}:
+            continue
+        rel = item.get("path", "")
+        path = source_root / rel
+        if path.is_symlink():
+            raise ValueError(f"source contains unsupported symlink: {rel}")
+        digest.update(rel.encode())
+        digest.update(b"\0")
+        if include_types and path.is_file():
+            digest.update(b"file\0")
+        elif include_types and path.exists():
+            digest.update(b"other\0")
+        elif include_types:
+            digest.update(b"missing\0")
+        if path.is_file():
+            digest.update(path.read_bytes())
+        digest.update(b"\0")
+    return digest.hexdigest()
+
+
+def _legacy_snapshot_hashes(source_root, config):
+    """Reproduce the source identity written by repo-local Autoexp 0.2."""
+    digest = hashlib.sha256()
+    script_dir = source_root / "experiment"
     if script_dir.is_symlink():
         raise ValueError("script directory must not be a symlink")
-    if script_dir.is_dir():
-        for path in sorted(script_dir.rglob("*")):
-            if path.is_symlink():
-                raise ValueError(f"source contains unsupported symlink: {path.relative_to(script_dir)}")
-            if not path.is_file():
-                continue
+    for path in sorted(script_dir.rglob("*")) if script_dir.is_dir() else ():
+        if path.is_symlink():
+            raise ValueError(f"source contains unsupported symlink: {path.relative_to(script_dir)}")
+        if path.is_file():
             digest.update(path.relative_to(script_dir).as_posix().encode())
             digest.update(b"\0")
             digest.update(path.read_bytes())
             digest.update(b"\0")
-    return digest.hexdigest()
+    runtime_config = {
+        key: config.get(key)
+        for key in ("runner", "sandbox", "runtime")
+        if key in config
+    }
+    hashes = {
+        "script_hash": digest.hexdigest(),
+        "params_hash": _hash_file(source_root / PARAMS_FILE),
+        "manifest_hash": _hash_file(source_root / STAGE_MANIFEST),
+        "runtime_config_hash": _hash_bytes(
+            json.dumps(runtime_config, sort_keys=True, separators=(",", ":")).encode()
+        ),
+    }
+    hashes["source_hash"] = _hash_bytes(
+        json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode()
+    )
+    return hashes
 
 
 def _safe_change_path(source_root, rel):
@@ -66,25 +99,22 @@ def _safe_change_path(source_root, rel):
         if cursor.is_symlink():
             raise ValueError(f"snapshot path must not contain symlinks: {rel}")
     if not path.resolve(strict=False).is_relative_to(source_root):
-        raise ValueError("snapshot path must stay inside the project")
+        raise ValueError("snapshot path must stay inside its source tree")
     return path
 
 
-def snapshot_hashes(source_root):
-    """Return semantic hashes for the execution-relevant source categories."""
+def snapshot_hashes(source_root, *, include_types=True):
     source_root = Path(source_root)
-    if (source_root / PROJECT_CONFIG).is_symlink():
-        raise ValueError(f"{PROJECT_CONFIG} must not be a symlink")
     config = read_json(source_root / PROJECT_CONFIG)
-    if not isinstance(config, dict):
-        raise ValueError(f"{PROJECT_CONFIG} must contain a JSON object")
+    if "files" not in config and isinstance(config.get("source"), dict):
+        return _legacy_snapshot_hashes(source_root, config)
     runtime_config = {
         key: config.get(key)
         for key in ("runner", "sandbox", "runtime")
         if key in config
     }
     hashes = {
-        "script_hash": _hash_script_source(source_root / EXPERIMENT_DIR),
+        "script_hash": _hash_declared_source(source_root, config, include_types=include_types),
         "params_hash": _hash_file(source_root / PARAMS_FILE),
         "manifest_hash": _hash_file(source_root / STAGE_MANIFEST),
         "runtime_config_hash": _hash_bytes(
@@ -95,6 +125,15 @@ def snapshot_hashes(source_root):
         json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode()
     )
     return hashes
+
+
+def snapshot_matches(snapshot, source_root):
+    # ponytail: legacy snapshots lack type markers; remove fallback with 0.2 import support.
+    return any(
+        snapshot_hashes(source_root, include_types=include_types)["source_hash"]
+        == snapshot["source_hash"]
+        for include_types in (True, False)
+    )
 
 
 def _insert_snapshot(
@@ -113,7 +152,8 @@ def _insert_snapshot(
     snapshot_id = f"snap_{hashes['source_hash'][:8]}_{uuid.uuid4().hex[:6]}"
     snapshot = {
         "snapshot_id": snapshot_id,
-        "project_id": project_id(root),
+        "repo_id": project_id(root),
+        "experiment_id": experiment_id(root),
         "parent_snapshot_id": parent_snapshot_id,
         "git_commit": commit,
         **hashes,
@@ -123,17 +163,17 @@ def _insert_snapshot(
         "legacy_run_id": legacy_run_id,
     }
     preserve_snapshot_ref(snapshot_id, commit, root)
-    conn = db(root)
+    conn = db()
     conn.execute(
         """insert into source_snapshots(
-            snapshot_id, project_id, parent_snapshot_id, git_commit,
-            script_hash, params_hash, manifest_hash, runtime_config_hash,
-            source_hash, created_at, created_by_trigger_id, label, legacy_run_id
-        ) values(
-            :snapshot_id, :project_id, :parent_snapshot_id, :git_commit,
-            :script_hash, :params_hash, :manifest_hash, :runtime_config_hash,
-            :source_hash, :created_at, :created_by_trigger_id, :label, :legacy_run_id
-        )""",
+             snapshot_id, repo_id, experiment_id, parent_snapshot_id, git_commit,
+             script_hash, params_hash, manifest_hash, runtime_config_hash,
+             source_hash, created_at, created_by_trigger_id, label, legacy_run_id
+           ) values(
+             :snapshot_id, :repo_id, :experiment_id, :parent_snapshot_id, :git_commit,
+             :script_hash, :params_hash, :manifest_hash, :runtime_config_hash,
+             :source_hash, :created_at, :created_by_trigger_id, :label, :legacy_run_id
+           )""",
         snapshot,
     )
     conn.commit()
@@ -143,9 +183,10 @@ def _insert_snapshot(
 
 def get_snapshot(snapshot_id, root=None):
     root = resolve_root(root)
-    conn = db(root)
+    conn = db()
     row = conn.execute(
-        "select * from source_snapshots where snapshot_id = ?", (snapshot_id,)
+        "select * from source_snapshots where snapshot_id = ? and experiment_id = ?",
+        (snapshot_id, experiment_id(root)),
     ).fetchone()
     conn.close()
     if not row:
@@ -155,9 +196,11 @@ def get_snapshot(snapshot_id, root=None):
 
 def list_snapshots(root=None):
     root = resolve_root(root)
-    conn = db(root)
+    conn = db()
     rows = conn.execute(
-        "select * from source_snapshots order by created_at desc, rowid desc"
+        """select * from source_snapshots where experiment_id = ?
+           order by created_at desc, rowid desc""",
+        (experiment_id(root),),
     ).fetchall()
     conn.close()
     return [dict(row) for row in rows]
@@ -172,17 +215,15 @@ def capture_workspace(
 ):
     root = resolve_root(root)
     require_autoexp_git_repo(root)
-    hashes = snapshot_hashes(root)
-    commit, _ = git_commit_source("autoexp source snapshot", root)
-    return _insert_snapshot(
-        commit,
-        root,
-        root=root,
-        hashes=hashes,
-        parent_snapshot_id=parent_snapshot_id,
-        created_by_trigger_id=created_by_trigger_id,
-        label=label,
-    )
+    with tempfile.TemporaryDirectory(prefix="autoexp-live-source-") as tmp:
+        source_root = materialize_workspace(root, tmp)
+        return capture_source_tree(
+            source_root,
+            root,
+            parent_snapshot_id=parent_snapshot_id,
+            created_by_trigger_id=created_by_trigger_id,
+            label=label,
+        )
 
 
 def capture_source_tree(
@@ -194,20 +235,13 @@ def capture_source_tree(
     created_by_trigger_id=None,
     label=None,
 ):
-    """Capture an already-materialized source tree without changing the workspace."""
     root = resolve_root(root)
     require_autoexp_git_repo(root)
     hashes = snapshot_hashes(source_root)
     if parent_snapshot_id:
-        parent = get_snapshot(parent_snapshot_id, root)
-        parent_commit = parent["git_commit"]
+        parent_commit = get_snapshot(parent_snapshot_id, root)["git_commit"]
     parent_commit = parent_commit or current_autoexp_commit(root)
-    commit = commit_source_tree(
-        source_root,
-        parent_commit,
-        "autoexp derived source snapshot",
-        root,
-    )
+    commit = commit_source_tree(source_root, parent_commit, "autoexp source snapshot", root)
     return _insert_snapshot(
         commit,
         source_root,
@@ -221,7 +255,6 @@ def capture_source_tree(
 
 def materialize_snapshot(snapshot_id, destination, root=None):
     root = resolve_root(root)
-    require_autoexp_git_repo(root)
     snapshot = get_snapshot(snapshot_id, root)
     materialize_commit(snapshot["git_commit"], destination, root)
     return snapshot
@@ -229,11 +262,10 @@ def materialize_snapshot(snapshot_id, destination, root=None):
 
 def diff_snapshots(snapshot_a, snapshot_b, root=None):
     root = resolve_root(root)
-    require_autoexp_git_repo(root)
     left = get_snapshot(snapshot_a, root)
     right = get_snapshot(snapshot_b, root)
     return autoexp_git(
-        ["diff", left["git_commit"], right["git_commit"], "--", *source_paths(root)],
+        ["diff", left["git_commit"], right["git_commit"], "--"],
         root=root,
         capture=True,
         check=False,
@@ -248,106 +280,29 @@ def derive_snapshot(
     created_by_trigger_id=None,
     label=None,
 ):
-    """Apply project-relative text replacements to a historical snapshot."""
     root = resolve_root(root)
-    require_autoexp_git_repo(root)
     base = get_snapshot(snapshot_id, root)
     with tempfile.TemporaryDirectory(prefix="autoexp-snapshot-") as tmp:
         source_root = Path(tmp)
         materialize_commit(base["git_commit"], source_root, root)
+        allowed = set(source_paths(source_root))
         for raw_path, content in changes.items():
-            rel = ensure_within_project(raw_path, "snapshot path must stay inside the project")
+            rel = ensure_within_project(raw_path, "snapshot path must stay inside its source tree")
+            if rel.as_posix() not in allowed:
+                raise ValueError(f"path is not declared by this experiment: {rel}")
             path = _safe_change_path(source_root, rel)
             if content is None:
                 if path.is_dir():
                     shutil.rmtree(path)
                 else:
                     path.unlink(missing_ok=True)
-                continue
-            path.parent.mkdir(parents=True, exist_ok=True)
-            path.write_text(content)
-        hashes = snapshot_hashes(source_root)
-        commit = commit_source_tree(
+            else:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(content)
+        return capture_source_tree(
             source_root,
-            base["git_commit"],
-            f"autoexp snapshot derived from {snapshot_id}",
             root,
-        )
-        return _insert_snapshot(
-            commit,
-            source_root,
-            root=root,
-            hashes=hashes,
             parent_snapshot_id=snapshot_id,
             created_by_trigger_id=created_by_trigger_id,
             label=label,
         )
-
-
-def migrate_legacy_run_snapshots(root=None):
-    """Link legacy executions to snapshots and remove `edited` pseudo-runs."""
-    root = resolve_root(root)
-    require_autoexp_git_repo(root)
-    conn = db(root)
-    rows = conn.execute(
-        "select * from runs where source_snapshot_id is null order by created_at, run_id"
-    ).fetchall()
-    conn.close()
-    if not rows:
-        return True
-
-    try:
-        head = current_autoexp_commit(root)
-    except SystemExit:
-        return False
-
-    for raw in rows:
-        run = dict(raw)
-        conn = db(root)
-        existing = conn.execute(
-            "select * from source_snapshots where legacy_run_id = ?", (run["run_id"],)
-        ).fetchone()
-        conn.close()
-        run_dir = run_dir_for(run, root)
-        if existing:
-            snapshot = dict(existing)
-        else:
-            base_commit = run.get("stage_commit") or head
-            if (run_dir / EXPERIMENT_DIR).is_dir() and (run_dir / PROJECT_CONFIG).is_file():
-                commit = commit_source_tree(
-                    run_dir,
-                    base_commit,
-                    f"migrate legacy run {run['run_id']}",
-                    root,
-                )
-                snapshot = _insert_snapshot(
-                    commit,
-                    run_dir,
-                    root=root,
-                    created_at=run.get("created_at"),
-                    label=f"Imported legacy {run['status']} record",
-                    legacy_run_id=run["run_id"],
-                )
-            else:
-                with tempfile.TemporaryDirectory(prefix="autoexp-legacy-source-") as tmp:
-                    source_root = Path(tmp)
-                    materialize_commit(base_commit, source_root, root)
-                    snapshot = _insert_snapshot(
-                        base_commit,
-                        source_root,
-                        root=root,
-                        created_at=run.get("created_at"),
-                        label=f"Imported legacy {run['status']} record",
-                        legacy_run_id=run["run_id"],
-                    )
-        conn = db(root)
-        if run["status"] == "edited":
-            conn.execute("delete from runs where run_id = ?", (run["run_id"],))
-        else:
-            conn.execute(
-                "update runs set source_snapshot_id = ? where run_id = ?",
-                (snapshot["snapshot_id"], run["run_id"]),
-            )
-        conn.commit()
-        conn.close()
-    return True

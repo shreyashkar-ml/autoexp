@@ -8,9 +8,7 @@ import math
 import os
 import re
 import shutil
-import signal
 import sqlite3
-import subprocess
 import tempfile
 import threading
 import uuid
@@ -19,11 +17,9 @@ from pathlib import Path
 from typing import Literal
 
 from .workspace import (
-    EXPERIMENT_DIR,
-    PARAMS_FILE,
-    PARAMS_SCHEMA_FILE,
     PROJECT_CONFIG,
-    STAGE_MANIFEST,
+    experiment_id,
+    repository_root,
 )
 
 
@@ -62,7 +58,8 @@ class ResearchConfig:
 
     @classmethod
     def load(cls, project_dir: Path):
-        config = json.loads((project_dir / PROJECT_CONFIG).read_text())
+        from .workspace import experiment_config
+        config = experiment_config(project_dir)
         research = config["autoresearch"]
         return cls(
             objective=Objective(**research["objective"]),
@@ -106,15 +103,14 @@ class AutoResearch:
         from .workspace import resolve_root
 
         self.dir = resolve_root(project_dir).resolve()
-        self._state_dir = self.dir / ".autoexp"
-        self._ledger_path = self._state_dir / "research.jsonl"
-        self._diff_dir = self._state_dir / "research-diffs"
-        self._proc: subprocess.Popen | None = None
+        self.experiment_id = experiment_id(self.dir)
+        self._state_dir = self.dir
+        self._proc = None
         self._mu = threading.Lock()
         init_db(self.dir)
+        self._recover_stranded_attempts()
         if self._contract_ready():
             self._resolve_contract()
-            self._migrate_legacy_ledger()
 
     def _load_config(self):
         try:
@@ -131,13 +127,14 @@ class AutoResearch:
     def _configured_path(self, path):
         role = self._require_config().role_of(path)
         rel = Path(path)
-        target = self.dir / rel
+        from .workspace import repository_root
+        target = repository_root(self.dir) / rel
         if (
             role is None
             or rel.is_absolute()
             or ".." in rel.parts
             or target.is_symlink()
-            or not target.resolve(strict=False).is_relative_to(self.dir.resolve())
+            or not target.resolve(strict=False).is_relative_to(repository_root(self.dir).resolve())
         ):
             raise ValueError(f"unknown or unsafe research file: {path}")
         return target, role
@@ -154,14 +151,17 @@ class AutoResearch:
     def preflight(self, *, require_agent=True):
         from .preflight import standard_preflight
 
-        standard = standard_preflight(self.dir, self.dir)
+        from .workspace import materialize_workspace
+        with tempfile.TemporaryDirectory(prefix="autoexp-research-preflight-") as tmp:
+            materialize_workspace(self.dir, tmp)
+            standard = standard_preflight(self.dir, tmp)
         checks = list(standard["checks"])
 
         def add(name, ok, detail="", required=True):
             checks.append({
                 "name": name,
                 "ok": bool(ok),
-                "detail": str(detail),
+                "detail": "" if ok else str(detail),
                 "required": bool(required),
             })
 
@@ -288,7 +288,8 @@ class AutoResearch:
 
         conn = db(self.dir)
         row = conn.execute(
-            "select * from research_contracts where status = 'active' order by rowid desc limit 1"
+            "select * from research_contracts where experiment_id = ? and status = 'active' order by rowid desc limit 1",
+            (self.experiment_id,),
         ).fetchone()
         conn.close()
         return self._decode_contract(row)
@@ -297,7 +298,7 @@ class AutoResearch:
         from .provenance import create_trigger
         from .snapshots import capture_workspace
         from .store import db
-        from .workspace import now, project_id
+        from .workspace import experiment_id, now
 
         values = self._contract_values()
         current = self._active_contract()
@@ -337,14 +338,14 @@ class AutoResearch:
                 )
             conn.execute(
                 """insert into research_contracts(
-                   contract_id, project_id, parent_contract_id, status, contract_hash,
+                   contract_id, experiment_id, parent_contract_id, status, contract_hash,
                    metric, direction, baseline_score, best_score, best_snapshot_id,
                    evaluator_path, evaluator_hash, program_path, subject_path,
                    budget_sec, metric_source, agent_command, created_at, ended_at
                ) values (?, ?, ?, 'active', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, null)""",
                 (
                     contract_id,
-                    project_id(self.dir),
+                    self.experiment_id,
                     current["contract_id"] if current else None,
                     values["contract_hash"],
                     values["metric"],
@@ -372,126 +373,6 @@ class AutoResearch:
             raise ValueError("research contract changed concurrently; retry")
         return active
 
-    def _migrate_legacy_ledger(self):
-        from .runs import get_run
-        from .store import db
-        from .workspace import now, write_json
-
-        conn = db(self.dir)
-        complete = conn.execute(
-            "select research_migration_complete from schema_metadata"
-        ).fetchone()[0]
-        conn.close()
-        if complete:
-            return
-        diagnostics = []
-        legacy_rows = []
-        if self._ledger_path.is_file():
-            for line_number, line in enumerate(self._ledger_path.read_text().splitlines(), 1):
-                if not line.strip():
-                    continue
-                try:
-                    value = json.loads(line)
-                    if not isinstance(value, dict) or not re.fullmatch(
-                        r"a\d+", str(value.get("tag", ""))
-                    ):
-                        raise ValueError("missing valid attempt tag")
-                    legacy_rows.append((line_number, value))
-                except (ValueError, json.JSONDecodeError) as exc:
-                    diagnostics.append({"line": line_number, "error": str(exc)})
-        contract = self._active_contract()
-        conn = db(self.dir)
-        conn.execute("begin immediate")
-        seen = set()
-        scored_rows = []
-        kept_rows = []
-        for line_number, legacy in legacy_rows:
-            attempt_id = legacy["tag"]
-            if attempt_id in seen:
-                diagnostics.append({"line": line_number, "error": f"duplicate attempt tag: {attempt_id}"})
-                continue
-            seen.add(attempt_id)
-            run = None
-            if legacy.get("run_id"):
-                try:
-                    run = get_run(legacy["run_id"], self.dir)
-                except ValueError:
-                    diagnostics.append({"line": line_number, "error": "referenced run is missing"})
-            base = (
-                conn.execute(
-                    "select snapshot_id from source_snapshots where git_commit = ? order by rowid limit 1",
-                    (legacy.get("base_commit"),),
-                ).fetchone()
-                if legacy.get("base_commit")
-                else None
-            )
-            old_status = legacy.get("status")
-            score = legacy.get("score")
-            scored = (
-                old_status in {"kept", "reverted"}
-                and isinstance(score, (int, float))
-                and math.isfinite(score)
-            )
-            status = "scored" if scored else "failed"
-            verdict = old_status if scored else None
-            failure = None if scored else f"legacy attempt imported from {old_status or 'unknown'} state"
-            candidate_id = run.get("source_snapshot_id") if run else None
-            conn.execute(
-                """insert or ignore into research_attempts(
-                       contract_id, attempt_id, sequence, session_id, status, hypothesis,
-                       base_snapshot_id, candidate_snapshot_id, run_id, score, verdict,
-                       best_score_before, improvement, created_at, ended_at,
-                       failure_message, metadata
-                   ) values (?, ?, ?, null, ?, ?, ?, ?, ?, ?, ?, null, null, ?, ?, ?, ?)""",
-                (
-                    contract["contract_id"],
-                    attempt_id,
-                    int(attempt_id[1:]),
-                    status,
-                    str(legacy.get("hyp") or "Legacy attempt"),
-                    base[0] if base else None,
-                    candidate_id,
-                    run.get("run_id") if run else None,
-                    float(score) if scored else None,
-                    verdict,
-                    run.get("created_at") if run else None,
-                    run.get("ended_at") if run else now(),
-                    failure,
-                    json.dumps({"legacy_line": line_number, "legacy": legacy}, sort_keys=True),
-                ),
-            )
-            if scored:
-                scored_rows.append((float(score), candidate_id))
-                if verdict == "kept":
-                    kept_rows.append((float(score), candidate_id))
-        if scored_rows:
-            baseline = scored_rows[0][0]
-            choose = min if contract["direction"] == "min" else max
-            best = choose(kept_rows, key=lambda item: item[0]) if kept_rows else None
-            conn.execute(
-                """update research_contracts
-                   set baseline_score = coalesce(baseline_score, ?),
-                       best_score = coalesce(?, best_score),
-                       best_snapshot_id = coalesce(?, best_snapshot_id)
-                   where contract_id = ?""",
-                (
-                    baseline,
-                    best[0] if best else None,
-                    best[1] if best else None,
-                    contract["contract_id"],
-                ),
-            )
-        conn.execute("update schema_metadata set research_migration_complete = 1")
-        conn.commit()
-        conn.close()
-        write_json(
-            self._state_dir / "research-migration.json",
-            {
-                "source": self._ledger_path.relative_to(self.dir).as_posix(),
-                "imported": len(seen),
-                "diagnostics": diagnostics,
-            },
-        )
 
     @staticmethod
     def _decode_attempt(row):
@@ -531,7 +412,7 @@ class AutoResearch:
         from .store import db
 
         conn = db(self.dir)
-        rows = conn.execute("select * from research_attempts order by rowid desc").fetchall()
+        rows = conn.execute("select a.* from research_attempts a join research_contracts c on c.contract_id = a.contract_id where c.experiment_id = ? order by a.rowid desc", (self.experiment_id,)).fetchall()
         conn.close()
         return [self._decode_attempt(row) for row in rows]
 
@@ -540,7 +421,9 @@ class AutoResearch:
 
         conn = db(self.dir)
         row = conn.execute(
-            "select * from research_sessions where status = 'running' order by rowid desc limit 1"
+            """select s.* from research_sessions s join research_contracts c on c.contract_id = s.contract_id
+               where c.experiment_id = ? and s.status = 'running' order by s.rowid desc limit 1""",
+            (self.experiment_id,),
         ).fetchone()
         conn.close()
         return dict(row) if row else None
@@ -550,7 +433,9 @@ class AutoResearch:
 
         conn = db(self.dir)
         row = conn.execute(
-            "select * from research_sessions order by rowid desc limit 1"
+            """select s.* from research_sessions s join research_contracts c on c.contract_id = s.contract_id
+               where c.experiment_id = ? order by s.rowid desc limit 1""",
+            (self.experiment_id,),
         ).fetchone()
         conn.close()
         return dict(row) if row else None
@@ -633,15 +518,22 @@ class AutoResearch:
             "failure_message": session.get("failure_message"),
         }
 
-    def _restore_snapshot(self, snapshot_id):
+    def _restore_snapshot(self, snapshot_id, subject_path, candidate_snapshot_id):
         from .runs import copy_run_source
         from .snapshots import materialize_snapshot
 
         if not snapshot_id:
             return
         with tempfile.TemporaryDirectory(prefix="autoexp-research-restore-") as tmp:
-            materialize_snapshot(snapshot_id, tmp, self.dir)
-            copy_run_source(tmp, self.dir)
+            base = Path(tmp) / "base"
+            candidate = Path(tmp) / "candidate"
+            materialize_snapshot(snapshot_id, base, self.dir)
+            materialize_snapshot(candidate_snapshot_id, candidate, self.dir)
+            live, _ = self._configured_path(subject_path)
+            expected = candidate / subject_path
+            if not live.is_file() or not expected.is_file() or self._full_hash(live) != self._full_hash(expected):
+                raise ValueError("refusing to restore over newer candidate changes")
+            copy_run_source(base, self.dir, only={subject_path})
 
     def _score_run(self, run_id, contract):
         from .artifacts import artifact_content, list_artifacts
@@ -671,6 +563,33 @@ class AutoResearch:
             return score if math.isfinite(score) else None
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
+
+    def _recover_stranded_attempts(self):
+        from .store import db
+
+        conn = db(self.dir)
+        rows = conn.execute(
+            """select a.contract_id, a.attempt_id, a.metadata
+               from research_attempts a join research_contracts c
+                 on c.contract_id = a.contract_id
+               where c.experiment_id = ? and a.status = 'running'""",
+            (self.experiment_id,),
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            metadata = json.loads(row["metadata"] or "{}")
+            pid = metadata.get("owner_pid") if isinstance(metadata, dict) else None
+            try:
+                # ponytail: local PID ownership is enough until attempts run off-host.
+                if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                    os.kill(pid, 0)
+                    continue
+            except (OSError, TypeError, ValueError):
+                pass
+            self._fail_attempt(
+                f"{row['contract_id']}:{row['attempt_id']}",
+                "research attempt owner is no longer running",
+            )
 
     def begin_attempt(self, hypothesis):
         from .execution import execute
@@ -713,7 +632,7 @@ class AutoResearch:
                        base_snapshot_id, candidate_snapshot_id, run_id, score, verdict,
                        best_score_before, improvement, created_at, ended_at,
                        failure_message, metadata
-                   ) values (?, ?, ?, ?, 'running', ?, ?, ?, null, null, null, ?, null, ?, null, null, '{}')""",
+                   ) values (?, ?, ?, ?, 'running', ?, ?, ?, null, null, null, ?, null, ?, null, null, ?)""",
                 (
                     contract["contract_id"],
                     attempt_id,
@@ -724,6 +643,7 @@ class AutoResearch:
                     candidate["snapshot_id"],
                     contract["best_score"],
                     now(),
+                    json.dumps({"owner_pid": os.getpid()}),
                 ),
             )
             conn.commit()
@@ -811,7 +731,11 @@ class AutoResearch:
         )
         conn.commit()
         conn.close()
-        self._restore_snapshot(attempt["base_snapshot_id"])
+        contract = self._decode_contract(self._contract_row(attempt["contract_id"]))
+        self._restore_snapshot(
+            attempt["base_snapshot_id"], contract["subject_path"],
+            attempt["candidate_snapshot_id"],
+        )
         self._update_session(attempt.get("session_id"), phase="propose", attempt_id=None)
         return self._attempt(key)
 
@@ -880,96 +804,17 @@ class AutoResearch:
         conn.commit()
         conn.close()
         if not improves:
-            self._restore_snapshot(attempt["base_snapshot_id"])
+            self._restore_snapshot(
+                attempt["base_snapshot_id"], contract["subject_path"],
+                attempt["candidate_snapshot_id"],
+            )
         self._update_session(attempt.get("session_id"), phase="propose", attempt_id=None)
         return self._attempt(key)
-
-    def start_loop(self):
-        from .store import db
-        from .workspace import now
-
-        result = self.preflight(require_agent=True)
-        if not result["ok"]:
-            raise ResearchPreflightError(result)
-        with self._mu:
-            active = self._sync_session()
-            if active:
-                return {"active": True, "job": active}
-            contract = self._resolve_contract()
-            log_path = self._state_dir / "research-agent.log"
-            session_id = f"research_session_{uuid.uuid4().hex}"
-            conn = db(self.dir)
-            try:
-                conn.execute("begin immediate")
-                existing = conn.execute(
-                    """select * from research_sessions
-                       where contract_id = ? and status = 'running' limit 1""",
-                    (contract["contract_id"],),
-                ).fetchone()
-                if existing:
-                    conn.rollback()
-                    return {"active": True, "job": dict(existing)}
-                with log_path.open("a") as log:
-                    proc = subprocess.Popen(
-                        self._require_config().agent_cmd,
-                        cwd=self.dir,
-                        stdout=log,
-                        stderr=subprocess.STDOUT,
-                        start_new_session=True,
-                    )
-                conn.execute(
-                    """insert into research_sessions(
-                       session_id, contract_id, status, phase, attempt_id, pid,
-                       log_path, started_at, ended_at, failure_message
-                   ) values (?, ?, 'running', 'propose', null, ?, ?, ?, null, null)""",
-                    (
-                        session_id,
-                        contract["contract_id"],
-                        proc.pid,
-                        log_path.relative_to(self.dir).as_posix(),
-                        now(),
-                    ),
-                )
-                conn.commit()
-            except OSError as exc:
-                conn.rollback()
-                raise ValueError(f"could not start research agent: {exc}") from exc
-            finally:
-                conn.close()
-            self._proc = proc
-            return {"active": True, "job": self._session()}
-
-    def stop_loop(self):
-        from .workspace import now
-
-        with self._mu:
-            session = self._sync_session()
-            if not session:
-                return {"active": False, "job": None}
-            try:
-                if hasattr(os, "killpg"):
-                    os.killpg(os.getpgid(session["pid"]), signal.SIGTERM)
-                else:
-                    os.kill(session["pid"], signal.SIGTERM)
-            except ProcessLookupError:
-                pass
-            self._update_session(session["session_id"], status="stopped", ended_at=now())
-            self._proc = None
-            return {"active": False, "job": None}
-
-    def log(self, tail_bytes=65536):
-        path = self._state_dir / "research-agent.log"
-        if not path.exists():
-            return ""
-        with path.open("rb") as handle:
-            handle.seek(0, os.SEEK_END)
-            handle.seek(max(0, handle.tell() - tail_bytes))
-            return handle.read().decode(errors="replace")
 
     def state(self):
         config = self._load_config()
         preflight = self.preflight(require_agent=True)
-        contract = self._resolve_contract() if self._contract_ready() else self._active_contract()
+        contract = self._active_contract()
         files = []
         if config:
             for item in config.files:
@@ -1006,245 +851,20 @@ class AutoResearch:
             "experiments": self._experiments(),
             "loop": self._loop_view(),
             "preflight": preflight,
-            "can_import_baseline": self.can_import_baseline(),
         }
 
     def diff(self, key):
         from .snapshots import diff_snapshots
 
         attempt = self._attempt(key)
-        if attempt.get("base_snapshot_id") and attempt.get("candidate_snapshot_id"):
-            value = diff_snapshots(
-                attempt["base_snapshot_id"],
-                attempt["candidate_snapshot_id"],
-                self.dir,
-            )
-        else:
-            legacy = self._diff_dir / f"{attempt['attempt_id']}.diff"
-            value = legacy.read_text() if legacy.is_file() else ""
-        return {"attempt": attempt, "tag": attempt["attempt_id"], "diff": value}
-
-    def open_file(self, path):
-        target, role = self._configured_path(path)
-        if not target.is_file():
-            raise FileNotFoundError(f"missing research file: {path}")
-        entry = {"path": path, "text": target.read_text(), "role": role}
-        if role == "frozen":
-            entry["hash"] = self._display_hash(self._full_hash(target))
-        return entry
-
-    def _ensure_no_running_attempt(self):
-        from .store import db
-
-        conn = db(self.dir)
-        running = conn.execute(
-            "select 1 from research_attempts where status = 'running' limit 1"
-        ).fetchone()
-        conn.close()
-        if running:
-            raise ValueError("research files cannot be edited while an attempt is running")
-
-    def save_file(self, path, text):
-        from .provenance import create_trigger
-        from .snapshots import capture_workspace
-        from .store import db
-
-        if not isinstance(text, str):
-            raise ValueError("text must be a string")
-        target, role = self._configured_path(path)
-        if role == "frozen":
-            raise ValueError("the evaluator is frozen for the active research contract")
-        self._ensure_no_running_attempt()
-        contract = self._resolve_contract()
-        target.write_text(text)
-        trigger = create_trigger(
-            "human",
-            root=self.dir,
-            actor_name="autoexp-view",
-            metadata={"operation": "research_file_edit", "path": path},
-        )
-        snapshot = capture_workspace(
+        if not attempt.get("base_snapshot_id") or not attempt.get("candidate_snapshot_id"):
+            raise ValueError("research attempt has no immutable source snapshots")
+        value = diff_snapshots(
+            attempt["base_snapshot_id"],
+            attempt["candidate_snapshot_id"],
             self.dir,
-            parent_snapshot_id=contract["best_snapshot_id"],
-            created_by_trigger_id=trigger["trigger_id"],
-            label=f"Edited {path}",
         )
-        if role == "human":
-            conn = db(self.dir)
-            conn.execute(
-                """update research_contracts set best_snapshot_id = ?
-                   where contract_id = ? and status = 'active'""",
-                (snapshot["snapshot_id"], contract["contract_id"]),
-            )
-            conn.commit()
-            conn.close()
-        return self.open_file(path) | {"snapshot": snapshot}
-
-    def save_program(self, text):
-        return self.save_file(self._require_config().program_path, text)
-
-    def can_import_baseline(self):
-        from .store import db
-
-        config = self._load_config()
-        if not config:
-            return False
-        conn = db(self.dir)
-        count = conn.execute("select count(*) from research_attempts").fetchone()[0]
-        conn.close()
-        try:
-            return (
-                count == 0
-                and self._configured_path(config.subject_path)[0].read_text() == TRAIN_TEXT
-            )
-        except OSError:
-            return False
-
-    def save_subject(self, text):
-        from .store import db
-
-        if not self.can_import_baseline():
-            raise ValueError(
-                "baseline import is only available before attempts and before candidate.py is edited"
-            )
-        result = self.save_file(self._require_config().subject_path, text)
-        contract = self._resolve_contract()
-        conn = db(self.dir)
-        conn.execute(
-            """update research_contracts set best_snapshot_id = ?
-               where contract_id = ? and status = 'active'""",
-            (result["snapshot"]["snapshot_id"], contract["contract_id"]),
-        )
-        conn.commit()
-        conn.close()
-        return result
-
-
-def ensure_research_file_editable(root, script_path):
-    """Reject frozen evaluator edits through generic HTTP/MCP script surfaces."""
-    try:
-        config = ResearchConfig.load(Path(root))
-    except (KeyError, TypeError, ValueError, OSError, json.JSONDecodeError):
-        return
-    project_path = f"{EXPERIMENT_DIR}/{Path(script_path).as_posix()}"
-    if config.role_of(project_path) == "frozen":
-        raise ValueError("the evaluator is frozen for the active research contract")
-
-
-PROGRAM_TEXT = """# Autoresearch program
-
-Improve the objective by editing only `experiment/candidate.py`.
-
-If you have an existing training or experiment script, use it as the starting
-point for `experiment/candidate.py` before beginning the first attempt.
-
-The loop:
-
-1. Read the current research state with the `research_state` MCP tool.
-2. Form one concrete hypothesis and edit `experiment/candidate.py`.
-3. Call `research_begin_attempt` with the hypothesis. It runs the experiment.
-4. Call `research_finish_attempt` with the returned attempt tag.
-5. Study kept and reverted attempts, then repeat until stopped.
-
-Mark only a new best, surprising failure, or decision-changing result with
-`mark_milestone`. Before concluding, read `project_summary` and write one
-end-to-end synthesis with `write_project_report`.
-
-`experiment/evaluate.py` is the fixed evaluator. Do not edit it.
-The experiment budget is available as `AUTOEXP_RESEARCH_BUDGET_SEC`.
-Keep each attempt focused so its diff and result remain understandable.
-"""
-
-TRAIN_TEXT = """import argparse
-import json
-import os
-from pathlib import Path
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--ctx", required=True)
-ctx = json.loads(Path(parser.parse_args().ctx).read_text())
-
-# This is the agent-owned subject. Replace the simple candidate with the
-# implementation or artifact your research project is optimizing.
-candidate = {"score": 0.5, "attempt": os.environ.get("AUTOEXP_RESEARCH_TAG", "baseline")}
-output = Path(ctx["output_dir"])
-output.mkdir(parents=True, exist_ok=True)
-(output / "candidate.json").write_text(json.dumps(candidate, indent=2) + "\\n")
-"""
-
-EVALUATE_TEXT = """import argparse
-import json
-from pathlib import Path
-
-parser = argparse.ArgumentParser()
-parser.add_argument("--ctx", required=True)
-ctx = json.loads(Path(parser.parse_args().ctx).read_text())
-output = Path(ctx["output_dir"])
-candidate = json.loads((output / "candidate.json").read_text())
-
-# Replace this with the stable evaluator for your domain.
-metrics = {"score": float(candidate["score"])}
-(output / "metrics.json").write_text(json.dumps(metrics, indent=2) + "\\n")
-print(f"score: {metrics['score']}")
-"""
-
-
-def config_block():
-    return {
-        "mode": "autoresearch",
-        "source": {"root": EXPERIMENT_DIR, "editable": ["candidate.py"]},
-        "autoresearch": {
-            "objective": {
-                "metric": "score",
-                "direction": "max",
-                "baseline": None,
-                "budget_sec": 300,
-            },
-            "files": [
-                {
-                    "path": "experiment/program.md",
-                    "role": "human",
-                    "desc": "research directions and loop rules",
-                },
-                {
-                    "path": "experiment/candidate.py",
-                    "role": "agent",
-                    "desc": "the implementation the agent improves",
-                },
-                {
-                    "path": "experiment/evaluate.py",
-                    "role": "frozen",
-                    "desc": "the fixed evaluator",
-                },
-            ],
-            "metric": {"kind": "json", "path": "metrics.json", "key": "score"},
-            "agent": {
-                "cmd": [
-                    "codex",
-                    "exec",
-                    "Read experiment/program.md and run the autoresearch loop using the Autoexp MCP tools.",
-                ],
-            },
-        },
-    }
-
-
-def scaffold(root, write_json):
-    script = root / EXPERIMENT_DIR
-    (script / "program.md").write_text(PROGRAM_TEXT)
-    (script / "candidate.py").write_text(TRAIN_TEXT)
-    (script / "evaluate.py").write_text(EVALUATE_TEXT)
-    write_json(
-        root / STAGE_MANIFEST,
-        {
-            "name": "candidate.py",
-            "command": "python candidate.py --ctx ${CTX} && python evaluate.py --ctx ${CTX}",
-            "working_dir": EXPERIMENT_DIR,
-            "interface_version": "1",
-        },
-    )
-    write_json(root / PARAMS_FILE, {})
-    write_json(root / PARAMS_SCHEMA_FILE, {"type": "object", "properties": {}})
+        return {"attempt": attempt, "tag": attempt["attempt_id"], "diff": value}
 
 
 def for_project(root):

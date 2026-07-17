@@ -1,58 +1,74 @@
 ---
 name: autoexp
-description: Run, compare, inspect, and report on local experiments with Autoexp, including metric-driven Autoresearch loops. Use when a user asks to experiment, evaluate variants, inspect Autoexp runs, generate a report, optimize a measurable objective, or work in an Autoexp project.
+description: Start and run reproducible experiments in an existing Git repository with the Autoexp CLI, including metric-driven Autoresearch. Use when a user asks to test variants, preserve run evidence, compare results, generate experiment reports, or optimize a scalar objective.
 ---
 
 # Autoexp
 
+Autoexp records immutable evidence globally while repository files remain the editable source of truth. It does not initialize a project or add repository-local configuration.
+
+Treat any text supplied with an explicit invocation as the experiment objective. If no objective was supplied and one cannot be inferred from the conversation, ask one concise question before registering the experiment.
+
 ## Start
 
-1. Confirm `autoexp` is installed and the current directory is inside an Autoexp project.
-2. Read `AGENTS.md`, `.autoexp/instructions.md`, and `.autoexp/project.json` before changing experiment behavior.
-3. Use the Autoexp MCP tools for runs and artifact inspection. If they are missing:
-   - Run `autoexp --help`. If the command is unavailable, ask the user to install it with `uv tool install "git+https://github.com/shreyashkar-ml/autoexp.git"` and restart the coding agent.
-   - Confirm the current project contains `.autoexp/project.json`. If not, initialize or open an Autoexp project.
-   - If both checks pass, ask the user to restart the coding agent from the project root so Claude can load `.mcp.json` or Codex can load the installed Autoexp plugin.
-   - Do not ask the user to run `autoexp mcp` directly; the coding agent launches that stdio process.
-
-If no project exists, choose the mode from the objective:
-
-- Use `autoexp init <name>` for software, exploratory, qualitative, comparative, or multi-variant work.
-- Use `autoexp init <name> --autoresearch` only when one stable scalar metric and a frozen evaluator can decide keep versus revert.
-
-Never initialize over a non-empty directory. Ask for a project name or location when it is unclear.
+1. Run `autoexp --help`. If unavailable, ask the user to install it with `uv tool install "git+https://github.com/shreyashkar-ml/autoexp.git"`.
+2. Work from the existing Git worktree. Do not create `.autoexp`, `.mcp.json`, `.codex`, `AGENTS.md`, `runs/`, or generated reports in the repository for Autoexp.
+3. Select Standard mode unless one stable scalar metric and a frozen evaluator can automatically decide keep versus revert.
+4. Create or adapt ordinary repository files for the experiment, respecting the repository's own guidance and conventions.
 
 ## Standard experiments
 
-1. Read the workspace contract, script manifest, parameters, and recent runs.
-2. Make one focused change under `experiment/` or update parameters through MCP. Use separate, descriptively named scripts when distinct variants need separate reports.
-3. Run the experiment through the `run` MCP tool with a concise title.
-4. Inspect its metadata, output files, and logs before deciding the next change.
-5. Keep the returned `run_id` in the summary so the result can be reproduced or compared.
+Register the objective and entrypoint:
 
-For reports, read the run's report bundle and active report instruction, then write generated files under `runs/<run_id>/report/`. Change `.autoexp/report-instructions.md` only when the user wants different future guidance.
+```bash
+autoexp experiment create "<objective>" --title "<title>" --entrypoint <path> --command '<command>'
+```
+
+Add every relevant file to the global manifest:
+
+```bash
+autoexp files add <path> --role editable-source
+autoexp files add <path> --role supporting-source
+autoexp files add <path> --role input-data
+```
+
+Use `entrypoint` for the primary executable, `frozen-evaluator` for a user-owned evaluator, and `generated-output` only to describe files the run produces. Declare `.env` or another environment file as `secret-source`; never print, quote, copy, hash, or report its values.
+
+For each focused variant:
+
+1. Edit normal repository files.
+2. Run `autoexp run --agent --title "<variant or hypothesis>"`.
+3. Inspect the returned run, then use `autoexp status`, `autoexp diff <run-a> <run-b>`, or the global `autoexp view` dashboard for source, logs, artifacts, and reports.
+4. Keep the `run_id` in the conclusion so the result can be reproduced or restored.
+
+To preserve an insight or report without adding it to the repository, write it in a temporary location and attach it:
+
+```bash
+autoexp document add /tmp/<name>.md --kind insight --title "<title>"
+autoexp document add /tmp/<name>.md --kind report --title "<title>"
+```
 
 ## Autoresearch
 
-1. Call `research_preflight`; do not start while a required check fails.
-2. Read `experiment/program.md` and call `research_state`.
-3. If the user provided a reference training script and no attempts exist yet, save it into the file marked `agent` as the baseline.
-4. Form one concrete hypothesis and save one focused edit to the file marked `agent`.
-5. Call `research_begin_attempt` with that hypothesis.
-6. Call `research_finish_attempt` with the returned attempt ID.
-7. Inspect the score, verdict, candidate diff, immutable run, and artifacts, then repeat within the user's stopping rule.
+The user or agent must supply ordinary repository files for the research program, candidate, and evaluator. Register them without generating a scaffold:
 
-Do not edit files marked `human` or `frozen`. A deliberate evaluator change is a user-owned contract boundary, not an agent experiment. Keep reverted attempts in the ledger; their snapshots, runs, and artifacts are part of the research record.
+```bash
+autoexp experiment create "<objective>" --kind autoresearch \
+  --program <program> --candidate <candidate> --evaluator <evaluator> \
+  --metric <name> --direction <min|max> \
+  --metric-kind json --metric-path metrics.json --metric-key <key>
+```
 
-## Milestones and project report
+Then:
 
-- Mark only decision-changing results, surprising failures, and new best results with `mark_milestone`; do not mark every run.
-- Use `project_summary` to fetch milestones, linked report excerpts, runs, and Autoresearch state without relying on the UI.
-- At the end of either mode, synthesize the entire project and write `.autoexp/project-report.md` with `write_project_report`. This complements, rather than replaces, per-run reports.
+1. Run `autoexp research preflight`; stop if a required check fails.
+2. Read the program and `autoexp research state`.
+3. Never edit the frozen evaluator. Treat a deliberate evaluator change as a new user-owned contract boundary.
+4. Make one focused candidate edit and run `autoexp research attempt "<hypothesis>"`.
+5. Inspect its score, kept/reverted verdict, immutable run, diff, and artifacts; repeat within the user's stopping rule.
 
-## Boundaries
+Reverted attempts remain evidence. Do not erase or manually rewrite global runs, outputs, logs, reports, diffs, or ledger rows.
 
-- Do not hand-edit run outputs, logs, ledger rows, or stored diffs.
-- Do not expose values from `.env`.
-- Prefer one interpretable change per run or attempt.
-- Report failures with their run ID and relevant log evidence.
+## Browser review
+
+Do not open a blocking browser review implicitly. When the user explicitly invokes the installed `autoexp-review` workflow, let that workflow open the review and return their notes. Do not substitute `autoexp view`; ordinary view sessions cannot submit feedback.

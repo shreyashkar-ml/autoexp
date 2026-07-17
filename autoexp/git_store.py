@@ -5,13 +5,13 @@ import subprocess
 import tempfile
 from pathlib import Path
 
-from .store import AUTOEXP_GIT_DIR, autoexp_git, require_autoexp_git_repo
+from .store import autoexp_git, private_git_dir, require_autoexp_git_repo
 from .workspace import resolve_root, source_paths
 
 
 def _git(root, args, *, env=None):
     root = resolve_root(root)
-    command = ["git", "--git-dir", str(root / AUTOEXP_GIT_DIR), *args]
+    command = ["git", "--git-dir", str(private_git_dir(root)), *args]
     proc = subprocess.run(
         command,
         check=True,
@@ -25,14 +25,13 @@ def _git(root, args, *, env=None):
 
 def _temporary_index(root):
     root = resolve_root(root)
-    fd, name = tempfile.mkstemp(prefix="snapshot-index-", dir=root / ".autoexp")
+    fd, name = tempfile.mkstemp(prefix="snapshot-index-", dir=private_git_dir(root).parent)
     os.close(fd)
     Path(name).unlink()
     return Path(name)
 
 
 def materialize_commit(commit, destination, root=None):
-    """Materialize a private-Git commit without changing its checkout or index."""
     root = resolve_root(root)
     require_autoexp_git_repo(root)
     destination = Path(destination)
@@ -45,22 +44,26 @@ def materialize_commit(commit, destination, root=None):
     env = os.environ | {"GIT_INDEX_FILE": str(index)}
     try:
         _git(root, ["read-tree", commit], env=env)
-        prefix = f"{destination.resolve()}{os.sep}"
-        _git(root, ["checkout-index", "--all", "--force", f"--prefix={prefix}"], env=env)
+        _git(root, [f"--work-tree={destination}", "checkout-index", "--all", "--force", f"--prefix={destination.resolve()}{os.sep}"], env=env)
     finally:
         index.unlink(missing_ok=True)
 
 
 def commit_source_tree(source_root, parent_commit, message, root=None):
-    """Commit a complete source tree without touching the active workspace."""
     root = resolve_root(root)
     require_autoexp_git_repo(root)
     source_root = Path(source_root)
     index = _temporary_index(root)
-    env = os.environ | {"GIT_INDEX_FILE": str(index)}
+    env = os.environ | {
+        "GIT_INDEX_FILE": str(index),
+        "GIT_AUTHOR_NAME": "Autoexp",
+        "GIT_AUTHOR_EMAIL": "autoexp@local",
+        "GIT_COMMITTER_NAME": "Autoexp",
+        "GIT_COMMITTER_EMAIL": "autoexp@local",
+    }
     try:
-        _git(root, ["read-tree", parent_commit], env=env)
-        paths = source_paths(source_root)
+        _git(root, ["read-tree", "--empty"], env=env)
+        paths = [path for path in source_paths(source_root) if (source_root / path).exists()]
         _git(root, [f"--work-tree={source_root}", "add", "-f", "-A", "--", *paths], env=env)
         tree = _git(root, ["write-tree"], env=env)
         return _git(root, ["commit-tree", tree, "-p", parent_commit, "-m", message], env=env)

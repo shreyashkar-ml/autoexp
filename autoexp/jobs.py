@@ -11,7 +11,7 @@ import uuid
 from pathlib import Path
 
 from .store import db
-from .workspace import now
+from .workspace import experiment_id, now
 
 
 def recover_stranded(root, *, canceled=False, run_id=None):
@@ -26,7 +26,7 @@ def recover_stranded(root, *, canceled=False, run_id=None):
 def _run_ids(root):
     try:
         conn = db(root)
-        rows = conn.execute("select run_id from runs order by rowid desc").fetchall()
+        rows = conn.execute("select run_id from runs where experiment_id = ? order by rowid desc", (experiment_id(root),)).fetchall()
         conn.close()
         return [row[0] for row in rows]
     except Exception:

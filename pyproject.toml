@@ -1,6 +1,6 @@
 [project]
 name = "autoexp"
-version = "0.2.0"
+version = "0.3.0"
 description = "Local execution ledger for reproducible agent-led experiments"
 readme = "README.md"
 requires-python = ">=3.11"
@@ -37,7 +37,7 @@ Issues = "https://github.com/shreyashkar-ml/autoexp/issues"
 packages = ["autoexp", "autoexp.ui", "autoexp.ui.assets"]
 
 [tool.setuptools.package-data]
-autoexp = ["instruction.txt", "report.txt"]
+autoexp = ["report.txt"]
 "autoexp.ui" = ["index.html", "*.png"]
 "autoexp.ui.assets" = ["*.css", "*.js"]
 

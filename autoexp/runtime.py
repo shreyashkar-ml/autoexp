@@ -5,22 +5,17 @@ from pathlib import Path
 
 from .artifacts import (
     artifact_content,
-    index_report_artifacts,
     list_artifacts,
     read_log,
 )
 from .provenance import (
-    create_trigger,
     get_trigger,
     reproducibility_summary,
     reproduction_state,
 )
-from .reports import report_instruction, write_report_bundle
-from .runner import docker_ready
-from .runs import get_run, source_root_for_run, restore_run_state, run_stage_commit
+from .reports import write_report_bundle
+from .runs import get_run, restore_run_state
 from .snapshots import (
-    capture_source_tree,
-    capture_workspace,
     diff_snapshots,
     get_snapshot,
     materialize_snapshot,
@@ -28,31 +23,17 @@ from .snapshots import (
 from .store import (
     autoexp_git,
     db,
-    init_db,
-    require_autoexp_git_repo,
 )
 from .workspace import (
-    APP_ENV,
-    EXPERIMENT_DIR,
-    PARAMS_FILE,
-    PARAMS_SCHEMA_FILE,
-    PROJECT_CONFIG,
-    PROJECT_INSTRUCTIONS,
-    STAGE_MANIFEST,
-    ensure_within_project,
-    is_project_root,
-    project_entry,
-    project_mode,
+    PARAMS_FILE, PROJECT_CONFIG, STAGE_MANIFEST,
+    experiment_id,
     read_json,
     resolve_root,
-    script_manifest,
     source_paths,
-    write_json,
 )
 
 
-# This module is the shared "verbs" layer: every action the CLI, MCP server, and
-# HTTP server expose ultimately calls one of these functions with a project root.
+# Shared read/run verbs for the CLI and read-only HTTP evidence server.
 
 
 def json_value(value):
@@ -70,10 +51,11 @@ def json_value(value):
 # ======================================================================
 
 def report_path_for_run(run, root):
-    """The primary indexed report path, retaining the legacy project-relative shape."""
+    """The primary indexed report path, using its indexed global path."""
     path = run.get("report_path")
     if path:
         return path
+
     reports = list_artifacts(run["run_id"], root=root, category="report")
     artifact = _primary_report(reports)
     return f"{run['run_dir'].rstrip('/')}/{artifact['path']}" if artifact else ""
@@ -127,8 +109,8 @@ def list_runs(limit=20, root=None):
         """select r.*, s.params_hash, s.manifest_hash,
                   s.runtime_config_hash as snapshot_runtime_hash
            from runs r left join source_snapshots s on s.snapshot_id = r.source_snapshot_id
-           order by r.created_at desc, r.rowid desc limit ?""",
-        (limit,),
+           where r.experiment_id = ? order by r.created_at desc, r.rowid desc limit ?""",
+        (experiment_id(root), limit),
     ).fetchall()
     conn.close()
     runs = [run_row(row, root) for row in rows]
@@ -150,36 +132,6 @@ def list_runs(limit=20, root=None):
     return runs
 
 
-def read_script_params(root=None):
-    root = resolve_root(root)
-    schema_path = _safe_project_path(root, PARAMS_SCHEMA_FILE)
-    params_path = _safe_project_path(root, PARAMS_FILE)
-    return {
-        "schema": read_json(schema_path) if schema_path.exists() else None,
-        "params": read_json(params_path) if params_path.exists() else None,
-    }
-
-
-def write_script_params(params, root=None, *, trigger_kind=None, actor_name=None):
-    if not isinstance(params, dict):
-        raise ValueError("params must be a JSON object")
-    root = resolve_root(root)
-    init_db(root)
-    write_json(_safe_project_path(root, PARAMS_FILE), params)
-    trigger = create_trigger(
-        trigger_kind,
-        root=root,
-        actor_name=actor_name,
-        metadata={"operation": "params_update"},
-    ) if trigger_kind else None
-    snapshot = capture_workspace(
-        root,
-        label="Params update",
-        created_by_trigger_id=trigger["trigger_id"] if trigger else None,
-    )
-    return {**read_script_params(root), "snapshot": snapshot}
-
-
 def _safe_project_path(project_root, rel):
     project_root = Path(project_root)
     resolved_root = project_root.resolve()
@@ -193,56 +145,51 @@ def _safe_project_path(project_root, rel):
         raise ValueError(f"path must stay inside the project: {rel}")
     return path
 
-
-def _safe_script_path(script_root, rel):
-    script_root = Path(script_root)
-    if script_root.is_symlink():
-        raise ValueError("experiment directory must not be a symlink")
-    return _safe_project_path(script_root, rel)
-
-
 def _editable_source_files(source_root):
     config = read_json(_safe_project_path(source_root, PROJECT_CONFIG))
     source = config.get("source") if isinstance(config.get("source"), dict) else {}
-    return tuple(source.get("editable") or ())
-
+    editable = tuple(source.get("editable") or ())
+    if "files" in config:
+        return editable
+    source_dir = Path(source.get("root", "experiment"))
+    if source_dir.is_absolute() or ".." in source_dir.parts:
+        raise ValueError("legacy source path must stay inside its snapshot")
+    return tuple((source_dir / path).as_posix() for path in editable)
 
 def run_source(run_id, root=None):
     """List a run's source files (excluding manifest/params), with one selected."""
     root = resolve_root(root)
     run = get_run(run_id, root)
     def read_files(source_root):
-        base = source_root / EXPERIMENT_DIR
-        if base.is_symlink() or not base.is_dir():
-            raise ValueError("snapshot experiment directory is invalid")
-        editable = set(_editable_source_files(source_root))
         files = []
-        for item in sorted(base.rglob("*")):
-            rel = item.relative_to(base)
-            if item.is_symlink() or not item.is_file() or rel.as_posix() not in editable:
+        for rel in sorted(_editable_source_files(source_root)):
+            item = _safe_project_path(source_root, rel)
+            if item.is_symlink() or not item.is_file():
                 continue
-            safe = _safe_script_path(base, rel)
-            files.append({"path": rel.as_posix(), "text": safe.read_text(errors="replace")})
+            files.append({"path": rel, "text": item.read_text(errors="replace")})
         return files
 
-    if run.get("source_snapshot_id"):
-        with tempfile.TemporaryDirectory(prefix="autoexp-run-source-") as tmp:
-            source_root = Path(tmp)
-            materialize_snapshot(run["source_snapshot_id"], source_root, root)
-            files = read_files(source_root)
-    else:
-        files = read_files(source_root_for_run(run, root))
+    if not run.get("source_snapshot_id"):
+        raise ValueError(f"run {run_id} has no immutable source snapshot")
+    with tempfile.TemporaryDirectory(prefix="autoexp-run-source-") as tmp:
+        source_root = Path(tmp)
+        materialize_snapshot(run["source_snapshot_id"], source_root, root)
+        files = read_files(source_root)
+        managed = {}
+        for rel in (PARAMS_FILE, STAGE_MANIFEST):
+            path = _safe_project_path(source_root, rel)
+            if path.is_file():
+                managed[rel] = path.read_text(errors="replace")
 
     wanted = run.get("script_name") or ""
     selected = next((f["path"] for f in files if f["path"] == wanted), "")
     if not selected and files:
         selected = files[0]["path"]
-    return {"run_id": run_id, "script": run.get("script_name"), "selected": selected, "files": files}
+    return {"run_id": run_id, "script": run.get("script_name"), "selected": selected, "files": files, "managed": managed}
 
 
 def run_report(run_id, root=None):
     root = resolve_root(root)
-    index_report_artifacts(run_id, root)
     artifact = _primary_report(list_artifacts(run_id, root=root, category="report"))
     if not artifact:
         return {"run_id": run_id, "path": "", "artifact": None, "text": ""}
@@ -375,206 +322,20 @@ def run_diff(run_id, root=None, *, base_run_id=None, base_snapshot_id=None):
 
 
 # ======================================================================
-#  Editing scripts into new run snapshots
-# ======================================================================
-
-def next_script_version(source_root, rel):
-    """Next free `name_vN` for a script path within one source snapshot."""
-    rel = Path(rel)
-    parent = rel.parent
-    suffix = rel.suffix
-    base = rel.stem
-    if "_v" in base:
-        prefix, version = base.rsplit("_v", 1)
-        if version.isdigit():
-            base = prefix
-
-    highest = 1  # a bare `base` (no suffix) counts as version 1
-    script_root = Path(source_root) / EXPERIMENT_DIR
-    if script_root.is_symlink() or not script_root.is_dir():
-        raise ValueError("snapshot script directory is invalid")
-    for script in script_root.rglob("*"):
-        if script.is_symlink() or not script.is_file():
-            continue
-        existing = script.relative_to(script_root)
-        _safe_script_path(script_root, existing)
-        if existing.parent != parent or existing.suffix != suffix:
-            continue
-        if existing.stem.startswith(f"{base}_v"):
-            version = existing.stem.removeprefix(f"{base}_v")
-            if version.isdigit():
-                highest = max(highest, int(version))
-
-    return (parent / f"{base}_v{highest + 1}{suffix}").as_posix()
-
-
-def _source_snapshot(root, source_run_id=None, source_snapshot_id=None, trigger_id=None):
-    if source_snapshot_id:
-        return get_snapshot(source_snapshot_id, root)
-    if not source_run_id:
-        return capture_workspace(
-            root,
-            label="Script edit base",
-            created_by_trigger_id=trigger_id,
-        )
-
-    run = get_run(source_run_id, root)
-    if run.get("source_snapshot_id"):
-        return get_snapshot(run["source_snapshot_id"], root)
-
-    snapshot = capture_source_tree(
-        source_root_for_run(run, root),
-        root,
-        parent_commit=run_stage_commit(run),
-        label=f"Recovered source for run {source_run_id}",
-        created_by_trigger_id=trigger_id,
-    )
-    conn = db(root)
-    conn.execute(
-        "update runs set source_snapshot_id = ? where run_id = ?",
-        (snapshot["snapshot_id"], source_run_id),
-    )
-    conn.commit()
-    conn.close()
-    return snapshot
-
-
-def save_script_file(
-    path,
-    text,
-    root=None,
-    source_run_id=None,
-    save_as=None,
-    source_snapshot_id=None,
-    trigger_kind=None,
-    actor_name=None,
-):
-    """Derive an edited source snapshot without creating an execution row."""
-    root = resolve_root(root)
-    init_db(root)
-    rel = ensure_within_project(path, "path must stay inside experiment/")
-    if project_mode(root) == "autoresearch":
-        from .autoresearch import (
-            ResearchConfig,
-            ensure_research_file_editable,
-            for_project as research_for_project,
-        )
-
-        ensure_research_file_editable(root, rel)
-        research_path = f"{EXPERIMENT_DIR}/{rel.as_posix()}"
-        config = ResearchConfig.load(root)
-        if (
-            config.role_of(research_path) in {"human", "agent"}
-            and not source_run_id
-            and not source_snapshot_id
-            and not save_as
-        ):
-            return research_for_project(root).save_file(research_path, text)
-    trigger = create_trigger(
-        trigger_kind,
-        root=root,
-        actor_name=actor_name,
-        metadata={"operation": "script_edit"},
-    ) if trigger_kind else None
-    trigger_id = trigger["trigger_id"] if trigger else None
-    base = _source_snapshot(root, source_run_id, source_snapshot_id, trigger_id)
-
-    with tempfile.TemporaryDirectory(prefix="autoexp-script-edit-") as tmp:
-        source_root = Path(tmp)
-        materialize_snapshot(base["snapshot_id"], source_root, root)
-        saved_rel = (
-            ensure_within_project(save_as, "save_as must stay inside experiment/")
-            if save_as
-            else Path(next_script_version(source_root, rel))
-        )
-        script_root = source_root / EXPERIMENT_DIR
-        if rel.as_posix() not in _editable_source_files(source_root):
-            raise ValueError(f"file is not editable in the script interface: {rel.as_posix()}")
-        source = _safe_script_path(script_root, rel)
-        if source.is_symlink() or not source.is_file():
-            raise ValueError(f"unknown script file: {rel.as_posix()}")
-        edited = _safe_script_path(script_root, saved_rel)
-        if saved_rel != rel:
-            source.unlink()
-        edited.parent.mkdir(parents=True, exist_ok=True)
-        edited.write_text(text)
-        manifest = _safe_project_path(source_root, STAGE_MANIFEST)
-        if manifest.is_symlink() or not manifest.is_file():
-            raise ValueError("snapshot stage.json is invalid")
-        _retarget_manifest(manifest, rel, saved_rel)
-        config_path = _safe_project_path(source_root, PROJECT_CONFIG)
-        config = read_json(config_path)
-        editable = config.setdefault("source", {}).setdefault("editable", [])
-        config["source"]["editable"] = [saved_rel.as_posix() if item == rel.as_posix() else item for item in editable]
-        write_json(config_path, config)
-        snapshot = capture_source_tree(
-            source_root,
-            root,
-            parent_snapshot_id=base["snapshot_id"],
-            label=f"Edited {saved_rel.as_posix()}",
-            created_by_trigger_id=trigger_id,
-        )
-    return {"path": saved_rel.as_posix(), "snapshot": snapshot}
-
-
-def _retarget_manifest(manifest_path, old_rel, new_rel):
-    """Point stage.json's name/command at the newly saved script file."""
-    manifest = read_json(manifest_path)
-    if not isinstance(manifest, dict):
-        raise ValueError(f"{STAGE_MANIFEST} must contain a JSON object")
-    command = manifest.get("command", "")
-    for candidate in (old_rel.as_posix(), old_rel.name, str(manifest.get("name") or "")):
-        if candidate and candidate in command:
-            command = command.replace(candidate, new_rel.as_posix(), 1)
-            break
-    manifest["name"] = new_rel.as_posix()
-    manifest["command"] = command
-    write_json(manifest_path, manifest)
-
-
-# ======================================================================
 #  Workspace-level verbs
 # ======================================================================
 
-def workspace(root=None):
-    root = resolve_root(root)
-    return {"root": str(root), "project": project_entry(root)}
 
-
-def restore(run_id, root=None):
-    root = resolve_root(root)
-    run, commit = restore_run_state(run_id, root)
-    return {"run_id": run_id, "stage_commit": commit, "script_name": run.get("script_name")}
 
 
 def diff_runs(run_a, run_b, root=None):
     root = resolve_root(root)
     a = get_run(run_a, root)
     b = get_run(run_b, root)
-    if a.get("source_snapshot_id") and b.get("source_snapshot_id"):
-        return diff_snapshots(a["source_snapshot_id"], b["source_snapshot_id"], root)
-    return autoexp_git(
-        ["diff", run_stage_commit(a), run_stage_commit(b), "--", *source_paths(root)],
-        root=root, capture=True, check=False,
-    )
+    if not a.get("source_snapshot_id") or not b.get("source_snapshot_id"):
+        raise ValueError("both runs must have immutable source snapshots")
+    return diff_snapshots(a["source_snapshot_id"], b["source_snapshot_id"], root)
 
-
-def run_autoexp(run_id=None, root=None, *, snapshot_id=None, trigger_kind="mcp", actor_name="autoexp-mcp", title=None):
-    """Execute synchronously through the shared lifecycle."""
-    from .execution import execute
-
-    root = resolve_root(root)
-    title = str(title or "").strip()
-    if len(title) > 80:
-        raise ValueError("run title must be 80 characters or fewer")
-    return execute(
-        root=root,
-        run_id=run_id,
-        snapshot_id=snapshot_id,
-        trigger_kind=trigger_kind,
-        actor_name=actor_name,
-        metadata={"title": title} if title else None,
-    )
 
 
 # ======================================================================
@@ -582,108 +343,29 @@ def run_autoexp(run_id=None, root=None, *, snapshot_id=None, trigger_kind="mcp",
 # ======================================================================
 
 def doctor(root=None):
-    """Run a set of health checks and return {root, ok, checks}."""
+    """Validate one registered experiment and its global evidence plane."""
+    from .execution import preflight_request
+    from .store import private_git_dir
+    from .workspace import repository_root, user_data_dir
+
     root = resolve_root(root)
     checks = []
-
     def add(name, ok, detail="", required=True):
-        checks.append({"name": name, "ok": bool(ok), "detail": detail, "required": bool(required)})
+        checks.append({"name": name, "ok": bool(ok), "detail": str(detail), "required": bool(required)})
 
-    add("project_root", is_project_root(root), str(root))
-    add(PROJECT_INSTRUCTIONS, (root / PROJECT_INSTRUCTIONS).is_file())
-    add(STAGE_MANIFEST, (root / STAGE_MANIFEST).is_file())
-
-    runner = "local"
+    add("repository", repository_root(root).is_dir(), repository_root(root))
+    add("global_data", root.is_dir() and root.is_relative_to(user_data_dir()), root)
+    add("state.sqlite", (user_data_dir() / "state.sqlite").is_file())
+    add("private_git", private_git_dir(root).is_dir(), private_git_dir(root))
     try:
-        runner = read_json(root / PROJECT_CONFIG).get("runner", "local")
-        add("runner", runner in {"docker", "local"}, runner)
+        result = preflight_request(root)
+        checks.extend({**item, "name": f"preflight_{item['name']}"} for item in result["checks"])
     except Exception as exc:
-        add("runner", False, str(exc))
+        add("preflight", False, exc)
 
-    try:
-        manifest = script_manifest(root)
-        missing = [key for key in ("name", "command", "working_dir", "interface_version") if key not in manifest]
-        add("stage_manifest_keys", not missing, ", ".join(missing))
-        uses_ctx = "${CTX}" in manifest.get("command", "")
-        detail = "" if uses_ctx else "command does not use ${CTX}; scripts can still use AUTOEXP_OUTPUT_DIR"
-        add("stage_command_context", True, detail)
-    except SystemExit as exc:
-        add("stage_manifest_keys", False, str(exc))
-
-    init_db(root)
-    add("state.sqlite", (root / ".autoexp" / "state.sqlite").is_file())
-    add("private_git", (root / ".autoexp" / "repository").is_dir())
-
-    conn = db(root)
-    broken_runs = conn.execute(
-        """select count(*) from runs r left join triggers t on t.trigger_id = r.trigger_id
-           where r.status in ('success', 'failed', 'canceled')
-             and coalesce(t.kind, '') != 'legacy'
-             and (r.source_snapshot_id is null or r.trigger_id is null or
-                  r.runner is null or r.runner_identity is null or
-                  r.started_at is null or r.ended_at is null or r.duration_ms is null)"""
-    ).fetchone()[0]
-    add(
-        "run_lifecycle_integrity",
-        broken_runs == 0,
-        "" if broken_runs == 0 else f"{broken_runs} terminal runs have incomplete lifecycle evidence",
-    )
-    if project_mode(root) == "autoresearch":
-        broken_attempts = conn.execute(
-            """select count(*) from research_attempts a
-               left join runs r on r.run_id = a.run_id
-               where a.run_id is not null and (
-                   r.run_id is null or r.source_snapshot_id is not a.candidate_snapshot_id
-               )"""
-        ).fetchone()[0]
-        incomplete_attempts = conn.execute(
-            """select count(*) from research_attempts
-               where status = 'scored' and (
-                   base_snapshot_id is null or candidate_snapshot_id is null or run_id is null
-               ) and metadata not like '%"legacy"%'"""
-        ).fetchone()[0]
-        add(
-            "research_attempt_integrity",
-            broken_attempts == 0 and incomplete_attempts == 0,
-            "" if not (broken_attempts or incomplete_attempts)
-            else f"{broken_attempts} run/snapshot mismatches; {incomplete_attempts} incomplete scored attempts",
-        )
+    conn = db()
+    broken = conn.execute("""select count(*) from runs where experiment_id = ? and status in ('success', 'failed', 'canceled') and (source_snapshot_id is null or trigger_id is null or runner is null or ended_at is null)""", (experiment_id(root),)).fetchone()[0]
     conn.close()
-
-    gitignore = root / ".gitignore"
-    add(".env_ignored", APP_ENV in gitignore.read_text() if gitignore.is_file() else False)
-
-    try:
-        require_autoexp_git_repo(root)
-        add("private_git_root", True)
-    except SystemExit as exc:
-        add("private_git_root", False, str(exc))
-
-    try:
-        report_instruction(root)
-        add("report_instruction", True)
-    except Exception as exc:
-        add("report_instruction", False, str(exc))
-
-    if runner == "local":
-        add("docker", True, "not required for local runner")
-    else:
-        ok, message = docker_ready()
-        add("docker", ok, "" if ok else message, required=runner == "docker")
-
-    if project_mode(root) == "autoresearch":
-        from .autoresearch import for_project as research_for_project
-
-        preflight = research_for_project(root).preflight()
-        for item in preflight["checks"]:
-            if item["name"] in {"project", "git", "private_git", "runs_directory"}:
-                continue
-            add(
-                f"research_{item['name']}",
-                item["ok"],
-                item["detail"],
-                required=item["required"],
-            )
-
-    overall_ok = all(item["ok"] or not item.get("required", True) for item in checks)
-    return {"root": str(root), "ok": overall_ok, "checks": checks}
+    add("run_lifecycle_integrity", broken == 0, f"{broken} terminal runs have incomplete evidence" if broken else "")
+    overall = all(item["ok"] or not item.get("required", True) for item in checks)
+    return {"root": str(root), "ok": overall, "checks": checks}

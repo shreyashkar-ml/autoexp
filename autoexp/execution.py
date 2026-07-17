@@ -6,7 +6,7 @@ import tempfile
 import time
 from pathlib import Path
 
-from .artifacts import index_execution_artifacts
+from .artifacts import index_execution_artifacts, index_report_artifacts
 from .preflight import require_preflight, standard_preflight
 from .provenance import (
     create_trigger,
@@ -23,7 +23,9 @@ from .runner import (
     hash_json,
     local_run_context,
     run_script,
+    redact_secrets,
     run_script_local,
+    scrub_secrets,
 )
 from .runs import (
     TERMINAL_STATUSES,
@@ -40,10 +42,10 @@ from .snapshots import (
     capture_workspace,
     get_snapshot,
     materialize_snapshot,
-    snapshot_hashes,
+    snapshot_matches,
 )
 from .store import init_db, require_autoexp_git_repo
-from .workspace import resolve_root, run_dir_for, script_manifest, write_json
+from .workspace import materialize_workspace, resolve_root, run_dir_for, script_manifest, write_json
 
 
 def _source_request(root, run_id, snapshot_id):
@@ -67,10 +69,11 @@ def preflight_request(root=None, run_id=None, snapshot_id=None):
     require_autoexp_git_repo(root)
     init_db(root)
     snapshot, _ = _source_request(root, run_id, snapshot_id)
-    if snapshot is None:
-        return standard_preflight(root, root)
     with tempfile.TemporaryDirectory(prefix="autoexp-preflight-") as tmp:
-        materialize_snapshot(snapshot["snapshot_id"], tmp, root)
+        if snapshot is None:
+            materialize_workspace(root, tmp)
+        else:
+            materialize_snapshot(snapshot["snapshot_id"], tmp, root)
         return standard_preflight(root, tmp)
 
 
@@ -78,6 +81,7 @@ def _index_and_hash(run_id, run_dir, root):
     errors = []
     try:
         index_execution_artifacts(run_id, root)
+        index_report_artifacts(run_id, root)
     except Exception as exc:
         errors.append(f"artifact indexing failed: {exc}")
     try:
@@ -120,6 +124,7 @@ def execute(
 ):
     """Execute current source, a snapshot, or a historical run as a new run."""
     root = resolve_root(root)
+    environment = {str(key): str(value) for key, value in (environment or {}).items()}
     require_autoexp_git_repo(root)
     init_db(root)
     snapshot, parent = _source_request(root, run_id, snapshot_id)
@@ -137,7 +142,6 @@ def execute(
     allocated = None
     try:
         if snapshot is None:
-            preflight = require_preflight(root, root)
             trigger = create_trigger(
                 trigger_kind,
                 root=root,
@@ -157,11 +161,16 @@ def execute(
             preflight = require_preflight(root, temp_root)
         hashes = compute_hashes(temp_root)
         input_records = inventory_external_inputs(temp_root, root, environment)
+        secret_values = [
+            environment[record["name"]]
+            for record in input_records
+            if record["kind"] == "secret" and record["name"] in environment
+        ]
         hashes["capsule_hash"] = hash_json({
             "execution": hashes["capsule_hash"],
             "external_inputs": external_input_identity(input_records),
         })
-        if snapshot_hashes(temp_root)["source_hash"] != snapshot["source_hash"]:
+        if not snapshot_matches(snapshot, temp_root):
             raise ValueError("materialized source does not match its snapshot identity")
 
         if trigger is None:
@@ -230,18 +239,27 @@ def execute(
             root=root,
             source_root=run_dir,
             extra_env=environment,
+            secret_values=secret_values,
             timeout_sec=timeout_sec,
         )
     except KeyboardInterrupt:
         canceled = True
     except Exception as exc:
         runner_error = exc
+    try:
+        scrub_secrets(run_dir, root, secret_values)
+    except Exception:
+        for name in ("output", "logs", "report"):
+            shutil.rmtree(run_dir / name, ignore_errors=True)
+            (run_dir / name).mkdir()
+        (run_dir / "logs" / "script.stderr.log").write_text("evidence removed because secret scrubbing failed\n")
+        runner_error = ValueError("secret scrubbing failed")
 
     duration_ms = max(0, round((time.monotonic() - started) * 1000))
     output_hash, evidence_errors = _index_and_hash(running["run_id"], run_dir, root)
     source_error = None
     try:
-        if snapshot_hashes(run_dir)["source_hash"] != snapshot["source_hash"]:
+        if not snapshot_matches(snapshot, run_dir):
             source_error = "runner modified its pinned source"
     except Exception as exc:
         source_error = f"source verification failed: {exc}"
@@ -265,7 +283,7 @@ def execute(
             *( [source_error] if source_error else [] ),
             *evidence_errors,
             *( [bundle_error] if bundle_error else [] ),
-            *( [str(runner_error)] if runner_error is not None else [] ),
+            *( [redact_secrets(runner_error, root, secret_values)] if runner_error is not None else [] ),
         ]
         kind = (
             "source_mutation" if source_error

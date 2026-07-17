@@ -3,36 +3,38 @@
 import hashlib
 import json
 import os
-import re
 import uuid
 from pathlib import Path
 
-from .runner import app_env
+from .runner import SECRET_KEY, app_env, redaction_env_values
 from .runs import get_run
 from .snapshots import get_snapshot
 from .store import db, init_db
-from .workspace import PROJECT_CONFIG, now, read_json, resolve_root
+from .workspace import PROJECT_CONFIG, experiment_id, now, read_json, repository_root, resolve_root
 
 
-TRIGGER_KINDS = {"human", "ui", "cli", "mcp", "agent", "autoresearch", "legacy"}
+TRIGGER_KINDS = {"human", "ui", "cli", "agent", "autoresearch", "legacy"}
 INPUT_KINDS = {"env", "secret", "file", "mount", "network", "external-service", "service"}
-SECRET_KEY = re.compile(r"(?:secret|token|password|passwd|api[_-]?key|credential)", re.I)
 
 
-def _safe_metadata(value, key=""):
+def _safe_metadata(value, key="", secrets=()):
     if SECRET_KEY.search(key):
         return "[redacted]"
     if isinstance(value, dict):
-        return {str(k): _safe_metadata(v, str(k)) for k, v in value.items()}
+        return {str(k): _safe_metadata(v, str(k), secrets) for k, v in value.items()}
     if isinstance(value, (list, tuple)):
-        return [_safe_metadata(item) for item in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
+        return [_safe_metadata(item, secrets=secrets) for item in value]
+    if isinstance(value, str):
+        for secret in sorted({str(item) for item in secrets if item}, key=len, reverse=True):
+            value = value.replace(secret, "[redacted]")
+        return value
+    if value is None or isinstance(value, (int, float, bool)):
         return value
     return str(value)
 
 
-def _json(value):
-    return json.dumps(_safe_metadata(value or {}), sort_keys=True, separators=(",", ":"))
+def _json(value, secrets=()):
+    return json.dumps(_safe_metadata(value or {}, secrets=secrets), sort_keys=True, separators=(",", ":"))
 
 
 def create_trigger(
@@ -48,77 +50,29 @@ def create_trigger(
     init_db(root)
     if kind not in TRIGGER_KINDS:
         raise ValueError(f"trigger kind must be one of: {', '.join(sorted(TRIGGER_KINDS))}")
+    secrets = redaction_env_values(root)
     trigger = {
         "trigger_id": f"trigger_{uuid.uuid4().hex}",
         "kind": kind,
-        "actor_name": actor_name,
-        "session_id": session_id,
-        "request_id": request_id,
-        "metadata": _json(metadata),
+        "experiment_id": experiment_id(root),
+        "actor_name": _safe_metadata(actor_name, secrets=secrets),
+        "session_id": _safe_metadata(session_id, secrets=secrets),
+        "request_id": _safe_metadata(request_id, secrets=secrets),
+        "metadata": _json(metadata, secrets),
         "created_at": now(),
     }
     conn = db(root)
     conn.execute(
         """insert into triggers(
-               trigger_id, kind, actor_name, session_id, request_id, metadata, created_at
+               trigger_id, experiment_id, kind, actor_name, session_id, request_id, metadata, created_at
            ) values(
-               :trigger_id, :kind, :actor_name, :session_id, :request_id, :metadata, :created_at
+               :trigger_id, :experiment_id, :kind, :actor_name, :session_id, :request_id, :metadata, :created_at
            )""",
         trigger,
     )
     conn.commit()
     conn.close()
     return {**trigger, "metadata": json.loads(trigger["metadata"])}
-
-
-def migrate_legacy_provenance(root=None):
-    """Label imported objects as legacy without inventing an actor or lineage."""
-    root = resolve_root(root)
-    conn = db(root)
-    runs = conn.execute(
-        "select run_id, source_snapshot_id from runs where trigger_id is null"
-    ).fetchall()
-    for run_id, snapshot_id in runs:
-        trigger_id = f"trigger_{uuid.uuid4().hex}"
-        conn.execute(
-            """insert into triggers(
-                   trigger_id, kind, actor_name, session_id, request_id, metadata, created_at
-               ) values (?, 'legacy', 'autoexp-v0.1', null, null, ?, ?)""",
-            (trigger_id, _json({"imported_run_id": run_id}), now()),
-        )
-        conn.execute("update runs set trigger_id = ? where run_id = ?", (trigger_id, run_id))
-        if snapshot_id:
-            conn.execute(
-                """update source_snapshots set created_by_trigger_id = ?
-                   where snapshot_id = ? and created_by_trigger_id is null""",
-                (trigger_id, snapshot_id),
-            )
-
-    snapshots = conn.execute(
-        """select snapshot_id, legacy_run_id from source_snapshots
-           where created_by_trigger_id is null"""
-    ).fetchall()
-    for snapshot_id, legacy_run_id in snapshots:
-        trigger_id = f"trigger_{uuid.uuid4().hex}"
-        conn.execute(
-            """insert into triggers(
-                   trigger_id, kind, actor_name, session_id, request_id, metadata, created_at
-               ) values (?, 'legacy', 'autoexp-v0.1', null, null, ?, ?)""",
-            (
-                trigger_id,
-                _json({
-                    "imported_snapshot_id": snapshot_id,
-                    **({"imported_run_id": legacy_run_id} if legacy_run_id else {}),
-                }),
-                now(),
-            ),
-        )
-        conn.execute(
-            "update source_snapshots set created_by_trigger_id = ? where snapshot_id = ?",
-            (trigger_id, snapshot_id),
-        )
-    conn.commit()
-    conn.close()
 
 
 def get_trigger(trigger_id, root=None):
@@ -173,7 +127,7 @@ def _input_record(spec, environment, root):
     elif kind in {"file", "mount"}:
         raw_path = spec.get("path") or name
         path = Path(raw_path).expanduser()
-        path = path if path.is_absolute() else root / path
+        path = path if path.is_absolute() else repository_root(root) / path
         present = path.exists()
         metadata["path"] = raw_path
         if present and path.is_file() and spec.get("fingerprint", True):
@@ -191,7 +145,7 @@ def _input_record(spec, environment, root):
         "fingerprint": fingerprint,
         "version": str(version) if version is not None else None,
         "reproducibility_state": state,
-        "metadata": _json(metadata),
+        "metadata": _json(metadata, redaction_env_values(root)),
     }
 
 
@@ -342,10 +296,10 @@ def reproduction_state(run_id, root=None):
     conn = db(root)
     row = conn.execute(
         """select run_id from runs
-           where run_id != ? and status = 'success' and capsule_hash = ?
+           where experiment_id = ? and run_id != ? and status = 'success' and capsule_hash = ?
              and output_hash != ?
            order by created_at desc, rowid desc limit 1""",
-        (run_id, run["capsule_hash"], run["output_hash"]),
+        (experiment_id(root), run_id, run["capsule_hash"], run["output_hash"]),
     ).fetchone()
     conn.close()
     return {"state": "divergence" if row else "none", "run_id": row[0] if row else None}
