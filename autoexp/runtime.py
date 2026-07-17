@@ -353,7 +353,7 @@ def doctor(root=None):
     add("private_git", private_git_dir(root).is_dir(), private_git_dir(root))
     try:
         result = preflight_request(root)
-        checks.extend({**item, "name": f"preflight_{item["name"]}"} for item in result["checks"])
+        checks.extend({**item, "name": f"preflight_{item['name']}"} for item in result["checks"])
     except Exception as exc:
         add("preflight", False, exc)
 

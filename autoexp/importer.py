@@ -64,8 +64,11 @@ def _validate_snapshot_hashes(old, data_root):
     for snapshot in old.execute("select * from source_snapshots"):
         with tempfile.TemporaryDirectory(prefix="autoexp-import-snapshot-") as tmp:
             materialize_commit(snapshot["git_commit"], tmp, data_root)
-            actual = snapshot_hashes(tmp)
-        if any(actual[field] != snapshot[field] for field in fields):
+            candidates = (
+                snapshot_hashes(tmp),
+                snapshot_hashes(tmp, include_types=False),
+            )
+        if not any(all(actual[field] == snapshot[field] for field in fields) for actual in candidates):
             raise ValueError(f"imported snapshot hash mismatch: {snapshot['snapshot_id']}")
         checked += 1
     return {"checked": checked, "ok": True}

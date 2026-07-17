@@ -41,7 +41,7 @@ from .snapshots import (
     capture_workspace,
     get_snapshot,
     materialize_snapshot,
-    snapshot_hashes,
+    snapshot_matches,
 )
 from .store import init_db, require_autoexp_git_repo
 from .workspace import materialize_workspace, resolve_root, run_dir_for, script_manifest, write_json
@@ -163,7 +163,7 @@ def execute(
             "execution": hashes["capsule_hash"],
             "external_inputs": external_input_identity(input_records),
         })
-        if snapshot_hashes(temp_root)["source_hash"] != snapshot["source_hash"]:
+        if not snapshot_matches(snapshot, temp_root):
             raise ValueError("materialized source does not match its snapshot identity")
 
         if trigger is None:
@@ -251,7 +251,7 @@ def execute(
     output_hash, evidence_errors = _index_and_hash(running["run_id"], run_dir, root)
     source_error = None
     try:
-        if snapshot_hashes(run_dir)["source_hash"] != snapshot["source_hash"]:
+        if not snapshot_matches(snapshot, run_dir):
             source_error = "runner modified its pinned source"
     except Exception as exc:
         source_error = f"source verification failed: {exc}"

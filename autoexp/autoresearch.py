@@ -108,6 +108,7 @@ class AutoResearch:
         self._proc = None
         self._mu = threading.Lock()
         init_db(self.dir)
+        self._recover_stranded_attempts()
         if self._contract_ready():
             self._resolve_contract()
 
@@ -556,6 +557,33 @@ class AutoResearch:
         except (KeyError, TypeError, ValueError, json.JSONDecodeError):
             return None
 
+    def _recover_stranded_attempts(self):
+        from .store import db
+
+        conn = db(self.dir)
+        rows = conn.execute(
+            """select a.contract_id, a.attempt_id, a.metadata
+               from research_attempts a join research_contracts c
+                 on c.contract_id = a.contract_id
+               where c.experiment_id = ? and a.status = 'running'""",
+            (self.experiment_id,),
+        ).fetchall()
+        conn.close()
+        for row in rows:
+            metadata = json.loads(row["metadata"] or "{}")
+            pid = metadata.get("owner_pid") if isinstance(metadata, dict) else None
+            try:
+                # ponytail: local PID ownership is enough until attempts run off-host.
+                if isinstance(pid, int) and not isinstance(pid, bool) and pid > 0:
+                    os.kill(pid, 0)
+                    continue
+            except (OSError, TypeError, ValueError):
+                pass
+            self._fail_attempt(
+                f"{row['contract_id']}:{row['attempt_id']}",
+                "research attempt owner is no longer running",
+            )
+
     def begin_attempt(self, hypothesis):
         from .execution import execute
         from .provenance import create_trigger
@@ -597,7 +625,7 @@ class AutoResearch:
                        base_snapshot_id, candidate_snapshot_id, run_id, score, verdict,
                        best_score_before, improvement, created_at, ended_at,
                        failure_message, metadata
-                   ) values (?, ?, ?, ?, 'running', ?, ?, ?, null, null, null, ?, null, ?, null, null, '{}')""",
+                   ) values (?, ?, ?, ?, 'running', ?, ?, ?, null, null, null, ?, null, ?, null, null, ?)""",
                 (
                     contract["contract_id"],
                     attempt_id,
@@ -608,6 +636,7 @@ class AutoResearch:
                     candidate["snapshot_id"],
                     contract["best_score"],
                     now(),
+                    json.dumps({"owner_pid": os.getpid()}),
                 ),
             )
             conn.commit()

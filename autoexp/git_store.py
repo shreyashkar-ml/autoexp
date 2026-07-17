@@ -62,8 +62,8 @@ def commit_source_tree(source_root, parent_commit, message, root=None):
         "GIT_COMMITTER_EMAIL": "autoexp@local",
     }
     try:
-        _git(root, ["read-tree", parent_commit], env=env)
-        paths = source_paths(source_root)
+        _git(root, ["read-tree", "--empty"], env=env)
+        paths = [path for path in source_paths(source_root) if (source_root / path).exists()]
         _git(root, [f"--work-tree={source_root}", "add", "-f", "-A", "--", *paths], env=env)
         tree = _git(root, ["write-tree"], env=env)
         return _git(root, ["commit-tree", tree, "-p", parent_commit, "-m", message], env=env)

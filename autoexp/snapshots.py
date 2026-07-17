@@ -34,7 +34,7 @@ def _hash_file(path):
     return _hash_bytes(path.read_bytes()) if path.is_file() else _hash_bytes(b"")
 
 
-def _hash_declared_source(source_root, config):
+def _hash_declared_source(source_root, config, *, include_types=True):
     digest = hashlib.sha256()
     for item in sorted(config.get("files", []), key=lambda value: value.get("path", "")):
         if item.get("role") in {"secret-source", "generated-output"}:
@@ -45,6 +45,12 @@ def _hash_declared_source(source_root, config):
             raise ValueError(f"source contains unsupported symlink: {rel}")
         digest.update(rel.encode())
         digest.update(b"\0")
+        if include_types and path.is_file():
+            digest.update(b"file\0")
+        elif include_types and path.exists():
+            digest.update(b"other\0")
+        elif include_types:
+            digest.update(b"missing\0")
         if path.is_file():
             digest.update(path.read_bytes())
         digest.update(b"\0")
@@ -64,7 +70,7 @@ def _safe_change_path(source_root, rel):
     return path
 
 
-def snapshot_hashes(source_root):
+def snapshot_hashes(source_root, *, include_types=True):
     source_root = Path(source_root)
     config = read_json(source_root / PROJECT_CONFIG)
     runtime_config = {
@@ -73,7 +79,7 @@ def snapshot_hashes(source_root):
         if key in config
     }
     hashes = {
-        "script_hash": _hash_declared_source(source_root, config),
+        "script_hash": _hash_declared_source(source_root, config, include_types=include_types),
         "params_hash": _hash_file(source_root / PARAMS_FILE),
         "manifest_hash": _hash_file(source_root / STAGE_MANIFEST),
         "runtime_config_hash": _hash_bytes(
@@ -84,6 +90,15 @@ def snapshot_hashes(source_root):
         json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode()
     )
     return hashes
+
+
+def snapshot_matches(snapshot, source_root):
+    # ponytail: legacy snapshots lack type markers; remove fallback with 0.2 import support.
+    return any(
+        snapshot_hashes(source_root, include_types=include_types)["source_hash"]
+        == snapshot["source_hash"]
+        for include_types in (True, False)
+    )
 
 
 def _insert_snapshot(

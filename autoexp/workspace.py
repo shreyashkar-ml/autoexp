@@ -148,9 +148,17 @@ def register_repository(path=None, *, title=None):
     from .store import db
 
     root = _git_root(path or Path.cwd())
-    repo_id = hashlib.sha256(str(root).encode()).hexdigest()[:16]
     timestamp = now()
     conn = db()
+    existing = conn.execute(
+        "select repo_id, title from repositories where path = ?", (str(root),)
+    ).fetchone()
+    repo_id = (
+        existing["repo_id"]
+        if existing
+        else hashlib.sha256(str(root).encode()).hexdigest()[:16]
+    )
+    display = title or (existing["title"] if existing else root.name)
     conn.execute(
         """insert into repositories(repo_id, title, path, created_at, last_opened_at)
            values (?, ?, ?, ?, ?)
@@ -158,12 +166,12 @@ def register_repository(path=None, *, title=None):
              title = coalesce(nullif(excluded.title, ''), repositories.title),
              path = excluded.path,
              last_opened_at = excluded.last_opened_at""",
-        (repo_id, title or root.name, str(root), timestamp, timestamp),
+        (repo_id, display, str(root), timestamp, timestamp),
     )
     conn.commit()
     conn.close()
     repo_data_dir(repo_id).mkdir(parents=True, exist_ok=True)
-    return {"repo_id": repo_id, "title": title or root.name, "path": str(root)}
+    return {"repo_id": repo_id, "title": display, "path": str(root)}
 
 
 
