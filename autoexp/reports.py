@@ -20,9 +20,9 @@ def _hash_file(path):
 
 
 def _redacted_bytes(data, root):
-    from .runner import app_env
+    from .runner import redaction_env_values
 
-    for value in sorted({value.encode() for value in app_env(root).values() if value}, key=len, reverse=True):
+    for value in sorted({value.encode() for value in redaction_env_values(root) if value}, key=len, reverse=True):
         data = data.replace(value, b"[redacted]")
     return data
 

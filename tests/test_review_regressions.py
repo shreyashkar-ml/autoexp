@@ -1,25 +1,30 @@
+import hashlib
+import threading
 import json
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 from types import SimpleNamespace
+from urllib.request import urlopen
 
 import pytest
 
 import autoexp.importer as importer
+from autoexp.artifacts import list_artifacts
 from autoexp.autoresearch import AutoResearch
 from autoexp.cli import relink_cmd
 from autoexp.execution import execute
 from autoexp.runs import copy_run_source, restore_run_state
-from autoexp.server import view
+from autoexp.runtime import run_source
+from autoexp.server import AutoexpHTTPServer, AutoexpHandler, view
 from autoexp.snapshots import (
     _hash_declared_source, capture_workspace, materialize_snapshot,
     snapshot_hashes, snapshot_matches,
 )
 from autoexp.store import db
 from autoexp.workspace import (
-    create_experiment, declare_file, register_repository, run_dir_for,
+    create_experiment, declare_file, experiment_entry, register_repository, run_dir_for,
 )
 
 
@@ -254,12 +259,24 @@ def test_research_restore_only_reverts_agent_subject(tmp_path, monkeypatch):
     contract = research.state()["contract"]
     repo = Path(entry["repo_path"])
     (repo / "candidate.py").write_text("print('changed candidate')\n")
+    candidate = capture_workspace(
+        entry["experiment_id"], parent_snapshot_id=contract["best_snapshot_id"]
+    )
     (repo / "program.md").write_text("user changed the program\n")
 
-    research._restore_snapshot(contract["best_snapshot_id"], contract["subject_path"])
+    research._restore_snapshot(
+        contract["best_snapshot_id"], contract["subject_path"], candidate["snapshot_id"]
+    )
 
     assert (repo / "candidate.py").read_text() == "print('candidate')\n"
     assert (repo / "program.md").read_text() == "user changed the program\n"
+
+    (repo / "candidate.py").write_text("print('newer candidate')\n")
+    with pytest.raises(ValueError, match="newer candidate changes"):
+        research._restore_snapshot(
+            contract["best_snapshot_id"], contract["subject_path"], candidate["snapshot_id"]
+        )
+    assert (repo / "candidate.py").read_text() == "print('newer candidate')\n"
 
 
 def test_restore_refuses_modified_ignored_source(tmp_path, monkeypatch):
@@ -305,7 +322,7 @@ def test_only_secret_environment_values_are_redacted(tmp_path, monkeypatch):
     run = execute(entry["experiment_id"], environment={
         "AUTOEXP_RESEARCH_TAG": "a01",
         "AUTOEXP_RESEARCH_BUDGET_SEC": "300",
-        "API_TOKEN": "secret-value",
+        "API_TOKEN": "abc123",
     })
 
     metrics = json.loads(
@@ -317,3 +334,186 @@ def test_only_secret_environment_values_are_redacted(tmp_path, monkeypatch):
         "debug": "1",
         "token": "[redacted]",
     }
+
+
+def test_timeout_failure_message_redacts_short_secret(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOEXP_HOME", str(tmp_path / "home"))
+    repo = git_repo(tmp_path / "repo")
+    (repo / "main.py").write_text("print('ok')\n")
+    entry = create_experiment(
+        "test timeout redaction",
+        root=repo,
+        entrypoint="main.py",
+        config={"external_inputs": [{"name": "API_TOKEN", "kind": "secret"}]},
+    )
+
+    def timeout(*_args, **_kwargs):
+        raise subprocess.TimeoutExpired(
+            ["docker", "run", "-e", "API_TOKEN=abc123"], 1
+        )
+
+    monkeypatch.setattr("autoexp.execution.run_script_local", timeout)
+    run = execute(entry["experiment_id"], environment={"API_TOKEN": "abc123"})
+
+    assert run["status"] == "failed"
+    assert run["failure_kind"] == "timeout"
+    assert "abc123" not in run["failure_message"]
+    assert "[redacted]" in run["failure_message"]
+
+
+def _old_snapshot_hashes(root, config):
+    script = hashlib.sha256()
+    for path in sorted((root / "experiment").rglob("*")):
+        if path.is_file():
+            script.update(path.relative_to(root / "experiment").as_posix().encode())
+            script.update(b"\0")
+            script.update(path.read_bytes())
+            script.update(b"\0")
+
+    def file_hash(path):
+        return hashlib.sha256(path.read_bytes() if path.is_file() else b"").hexdigest()
+
+    runtime = {
+        key: config[key]
+        for key in ("runner", "sandbox", "runtime")
+        if key in config
+    }
+    hashes = {
+        "script_hash": script.hexdigest(),
+        "params_hash": file_hash(root / ".autoexp/params.json"),
+        "manifest_hash": file_hash(root / ".autoexp/stage.json"),
+        "runtime_config_hash": hashlib.sha256(
+            json.dumps(runtime, sort_keys=True, separators=(",", ":")).encode()
+        ).hexdigest(),
+    }
+    hashes["source_hash"] = hashlib.sha256(
+        json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return hashes
+
+
+def test_imports_and_executes_real_legacy_snapshot(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOEXP_HOME", str(tmp_path / "home"))
+    source = git_repo(tmp_path / "legacy")
+    control = source / ".autoexp"
+    experiment = source / "experiment"
+    control.mkdir()
+    experiment.mkdir()
+    config = {
+        "title": "legacy",
+        "description": "A real 0.2 layout",
+        "runner": "local",
+        "sandbox": {
+            "image": "python:3.12-slim",
+            "network": "none",
+            "cpus": "1",
+            "memory": "512m",
+        },
+        "runtime": {},
+        "report_instruction_file": ".autoexp/custom-report.md",
+        "source": {"root": "experiment", "editable": ["main.py"]},
+    }
+    stage = {
+        "name": "main.py",
+        "command": "python main.py --ctx ${CTX}",
+        "working_dir": "experiment",
+        "interface_version": "1",
+    }
+    (control / "project.json").write_text(json.dumps(config))
+    (control / "stage.json").write_text(json.dumps(stage))
+    (control / "params.json").write_text("{}")
+    (control / "params.schema.json").write_text(
+        json.dumps({"type": "object", "properties": {}})
+    )
+    (control / "instructions.md").write_text("Legacy agent guidance.\n")
+    (control / "custom-report.md").write_text("Keep this custom report guidance.\n")
+    (experiment / "main.py").write_text("print('legacy run')\n")
+    commit_repo(source, "legacy snapshot")
+    commit = subprocess.run(
+        ["git", "-C", str(source), "rev-parse", "HEAD"],
+        check=True,
+        stdout=subprocess.PIPE,
+        text=True,
+    ).stdout.strip()
+    subprocess.run(
+        ["git", "clone", "--bare", "-q", str(source), str(control / "repository")],
+        check=True,
+    )
+
+    hashes = _old_snapshot_hashes(source, config)
+    old = sqlite3.connect(control / "state.sqlite")
+    old.execute(
+        """create table source_snapshots(
+             snapshot_id text primary key, project_id text not null,
+             parent_snapshot_id text, git_commit text not null,
+             script_hash text not null, params_hash text not null,
+             manifest_hash text not null, runtime_config_hash text not null,
+             source_hash text not null, created_at text not null,
+             created_by_trigger_id text, label text, legacy_run_id text
+           )"""
+    )
+    old.execute(
+        """insert into source_snapshots values(
+             'legacy_snapshot', 'legacy_project', null, ?, ?, ?, ?, ?, ?,
+             '2025-01-01T00-00-00Z', null, 'Legacy snapshot', null
+           )""",
+        (
+            commit,
+            hashes["script_hash"],
+            hashes["params_hash"],
+            hashes["manifest_hash"],
+            hashes["runtime_config_hash"],
+            hashes["source_hash"],
+        ),
+    )
+    old.commit()
+    old.close()
+
+    summary = importer.import_legacy_project(source)
+    experiment_id = summary["experiment_id"]
+    assert summary["validated"]["snapshot_hashes"] == {"checked": 1, "ok": True}
+    assert experiment_entry(experiment_id)["report_guidance"] == "Keep this custom report guidance.\n"
+
+    restored = tmp_path / "restored-legacy"
+    materialize_snapshot("legacy_snapshot", restored, experiment_id)
+    assert snapshot_matches(hashes, restored)
+    run = execute(experiment_id, snapshot_id="legacy_snapshot")
+    assert run["status"] == "success"
+    assert [item["path"] for item in run_source(run["run_id"], experiment_id)["files"]] == [
+        "experiment/main.py"
+    ]
+
+
+def test_downloads_stream_complete_artifact_and_log(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOEXP_HOME", str(tmp_path / "home"))
+    repo = git_repo(tmp_path / "repo")
+    output_size = 16 * 1024 * 1024 + 257
+    (repo / "main.py").write_text(
+        "import os\n"
+        "from pathlib import Path\n"
+        f"Path(os.environ['AUTOEXP_OUTPUT_DIR'], 'large.bin').write_bytes(b'x' * {output_size})\n"
+        "print('L' * 70000)\n"
+    )
+    entry = create_experiment("test complete downloads", root=repo, entrypoint="main.py")
+    run = execute(entry["experiment_id"])
+    artifact = next(
+        item for item in list_artifacts(run["run_id"], entry["experiment_id"], "output")
+        if item["path"] == "output/large.bin"
+    )
+
+    server = AutoexpHTTPServer(("127.0.0.1", 0), AutoexpHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base = f"http://127.0.0.1:{server.server_port}/api/runs/{run['run_id']}"
+    try:
+        with urlopen(
+            f"{base}/artifacts/{artifact['artifact_id']}/content?download=1",
+            timeout=30,
+        ) as response:
+            assert response.read() == b"x" * output_size
+        with urlopen(f"{base}/logs/stdout?download=1", timeout=30) as response:
+            assert response.read() == b"L" * 70000 + b"\n"
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=5)

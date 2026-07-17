@@ -3,11 +3,10 @@
 import hashlib
 import json
 import os
-import re
 import uuid
 from pathlib import Path
 
-from .runner import app_env
+from .runner import SECRET_KEY, app_env, redaction_env_values
 from .runs import get_run
 from .snapshots import get_snapshot
 from .store import db, init_db
@@ -16,7 +15,6 @@ from .workspace import PROJECT_CONFIG, experiment_id, now, read_json, repository
 
 TRIGGER_KINDS = {"human", "ui", "cli", "agent", "autoresearch", "legacy"}
 INPUT_KINDS = {"env", "secret", "file", "mount", "network", "external-service", "service"}
-SECRET_KEY = re.compile(r"(?:secret|token|password|passwd|api[_-]?key|credential)", re.I)
 
 
 def _safe_metadata(value, key="", secrets=()):
@@ -52,7 +50,7 @@ def create_trigger(
     init_db(root)
     if kind not in TRIGGER_KINDS:
         raise ValueError(f"trigger kind must be one of: {', '.join(sorted(TRIGGER_KINDS))}")
-    secrets = tuple(app_env(root).values())
+    secrets = redaction_env_values(root)
     trigger = {
         "trigger_id": f"trigger_{uuid.uuid4().hex}",
         "kind": kind,
@@ -147,7 +145,7 @@ def _input_record(spec, environment, root):
         "fingerprint": fingerprint,
         "version": str(version) if version is not None else None,
         "reproducibility_state": state,
-        "metadata": _json(metadata, app_env(root).values()),
+        "metadata": _json(metadata, redaction_env_values(root)),
     }
 
 

@@ -57,6 +57,39 @@ def _hash_declared_source(source_root, config, *, include_types=True):
     return digest.hexdigest()
 
 
+def _legacy_snapshot_hashes(source_root, config):
+    """Reproduce the source identity written by repo-local Autoexp 0.2."""
+    digest = hashlib.sha256()
+    script_dir = source_root / "experiment"
+    if script_dir.is_symlink():
+        raise ValueError("script directory must not be a symlink")
+    for path in sorted(script_dir.rglob("*")) if script_dir.is_dir() else ():
+        if path.is_symlink():
+            raise ValueError(f"source contains unsupported symlink: {path.relative_to(script_dir)}")
+        if path.is_file():
+            digest.update(path.relative_to(script_dir).as_posix().encode())
+            digest.update(b"\0")
+            digest.update(path.read_bytes())
+            digest.update(b"\0")
+    runtime_config = {
+        key: config.get(key)
+        for key in ("runner", "sandbox", "runtime")
+        if key in config
+    }
+    hashes = {
+        "script_hash": digest.hexdigest(),
+        "params_hash": _hash_file(source_root / PARAMS_FILE),
+        "manifest_hash": _hash_file(source_root / STAGE_MANIFEST),
+        "runtime_config_hash": _hash_bytes(
+            json.dumps(runtime_config, sort_keys=True, separators=(",", ":")).encode()
+        ),
+    }
+    hashes["source_hash"] = _hash_bytes(
+        json.dumps(hashes, sort_keys=True, separators=(",", ":")).encode()
+    )
+    return hashes
+
+
 def _safe_change_path(source_root, rel):
     source_root = Path(source_root).resolve()
     path = source_root / rel
@@ -73,6 +106,8 @@ def _safe_change_path(source_root, rel):
 def snapshot_hashes(source_root, *, include_types=True):
     source_root = Path(source_root)
     config = read_json(source_root / PROJECT_CONFIG)
+    if "files" not in config and isinstance(config.get("source"), dict):
+        return _legacy_snapshot_hashes(source_root, config)
     runtime_config = {
         key: config.get(key)
         for key in ("runner", "sandbox", "runtime")

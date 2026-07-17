@@ -6,6 +6,7 @@ import ipaddress
 import json
 import mimetypes
 import os
+import shutil
 import subprocess
 import sys
 import time
@@ -16,7 +17,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, quote, unquote, urlparse
 from urllib.request import urlopen
 
-from .artifacts import artifact_content, artifact_detail, list_artifacts, read_log
+from .artifacts import artifact_content, artifact_detail, artifact_file, list_artifacts, read_log
 from .reports import list_documents, list_milestones, read_project_report
 from .review import review_session, submit_review
 from .runtime import list_runs, run_diff, run_overview, run_report, run_source
@@ -197,17 +198,28 @@ class AutoexpHandler(BaseHTTPRequestHandler):
             if len(parts) == 4 and parts[2] == "artifacts":
                 return self._json(artifact_detail(run_id, parts[3], root))
             if len(parts) == 5 and parts[2] == "artifacts" and parts[4] == "content":
+                if query.get("download", ["0"])[0] == "1":
+                    artifact, file_path = artifact_file(run_id, parts[3], root)
+                    return self._file(file_path, artifact["media_type"], Path(artifact["path"]).name)
                 offset = bounded_int(query.get("offset", [0])[0])
                 size = bounded_int(query.get("limit", [16 * 1024 * 1024])[0], minimum=1)
                 artifact, content = artifact_content(run_id, parts[3], root, offset=offset, limit=size)
-                return self._content(content, artifact["media_type"], Path(artifact["path"]).name, attachment=query.get("download", ["0"])[0] == "1")
+                return self._content(content, artifact["media_type"], Path(artifact["path"]).name)
             if len(parts) == 4 and parts[2] == "logs":
                 log = read_log(run_id, parts[3], root=root)
                 if query.get("download", ["0"])[0] == "1":
-                    return self._content(
-                        log["text"].encode(), "text/plain; charset=utf-8",
-                        f"{run_id}-{log['stream']}.log", attachment=True,
+                    artifact = next(
+                        (
+                            item for item in list_artifacts(run_id, root, "log")
+                            if item["path"] == f"logs/script.{log['stream']}.log"
+                        ),
+                        None,
                     )
+                    filename = f"{run_id}-{log['stream']}.log"
+                    if artifact:
+                        _, file_path = artifact_file(run_id, artifact["artifact_id"], root)
+                        return self._file(file_path, "text/plain; charset=utf-8", filename)
+                    return self._content(b"", "text/plain; charset=utf-8", filename, attachment=True)
                 return self._json(log)
         return self._json({"error": "not found"}, 404)
 
@@ -304,6 +316,19 @@ class AutoexpHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.end_headers()
         self.wfile.write(body)
+
+    def _file(self, path, content_type, filename):
+        path = Path(path)
+        safe = filename.replace('"', "").replace("\r", "").replace("\n", "")
+        self.send_response(200)
+        self._headers()
+        self.send_header("Content-Type", content_type)
+        self.send_header("Content-Security-Policy", "sandbox; default-src 'none'")
+        self.send_header("Content-Disposition", f'attachment; filename="{safe}"')
+        self.send_header("Content-Length", str(path.stat().st_size))
+        self.end_headers()
+        with path.open("rb") as handle:
+            shutil.copyfileobj(handle, self.wfile)
 
     def _static(self, path):
         rel = "index.html" if path in {"", "/"} else path.lstrip("/")

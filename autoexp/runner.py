@@ -2,6 +2,7 @@ import hashlib
 import json
 import os
 import platform
+import re
 import shlex
 import shutil
 import signal
@@ -11,8 +12,8 @@ from pathlib import Path
 
 from .store import db
 from .workspace import (
-    PARAMS_FILE, PROJECT_CONFIG, experiment_id, manifest_files, read_json,
-    repository_root, resolve_root, run_dir_for, safe_repository_path, script_manifest,
+    PARAMS_FILE, PROJECT_CONFIG, experiment_config, experiment_id, manifest_files,
+    read_json, repository_root, resolve_root, run_dir_for, safe_repository_path, script_manifest,
 )
 
 RUN_CONTEXT = {
@@ -20,8 +21,7 @@ RUN_CONTEXT = {
     "app_env_path": "", "script_params_path": "/workspace/source/.autoexp/params.json",
     "output_dir": "/workspace/run/output", "logs_dir": "/workspace/run/logs",
 }
-# ponytail: byte replacement skips short secrets; use format-aware redaction if needed.
-MIN_REDACTION_LENGTH = 8
+SECRET_KEY = re.compile(r"(?:secret|token|password|passwd|api[_-]?key|credential)", re.I)
 
 
 def hash_json(data):
@@ -110,7 +110,34 @@ def find_duplicate_output_run(hashes, output_hash, root=None):
 
 
 def _redaction_values(values):
-    return {str(value) for value in values if value and len(str(value)) >= MIN_REDACTION_LENGTH}
+    return {str(value) for value in values if value}
+
+
+def redaction_env_values(root):
+    """Return values whose key or declared source marks them as secret."""
+    root = resolve_root(root)
+    environment = app_env(root)
+    secret_names = {
+        key["name"]
+        for item in manifest_files(root)
+        if item["role"] == "secret-source"
+        for key in item["secret_keys"]
+    }
+    inputs = experiment_config(root).get("external_inputs", [])
+    if isinstance(inputs, dict):
+        inputs = [
+            {"name": name, **spec} if isinstance(spec, dict) else {"name": name}
+            for name, spec in inputs.items()
+        ]
+    secret_names.update(
+        item["name"]
+        for item in inputs
+        if isinstance(item, dict)
+        and item.get("kind") == "secret"
+        and isinstance(item.get("name"), str)
+    )
+    secret_names.update(name for name in environment if SECRET_KEY.search(name))
+    return tuple(value for name, value in environment.items() if name in secret_names)
 
 
 def _redact(text, values):
@@ -119,9 +146,9 @@ def _redact(text, values):
     return text
 
 
-def redact_secrets(text, root):
+def redact_secrets(text, root, secret_values=()):
     """Remove known secret-source values before text enters durable evidence."""
-    return _redact(str(text), app_env(root).values())
+    return _redact(str(text), [*redaction_env_values(root), *secret_values])
 
 
 def _capture(proc, logs, values, timeout_sec=None):
@@ -142,7 +169,7 @@ def _capture(proc, logs, values, timeout_sec=None):
 
 
 def scrub_secrets(run_dir, root, secret_values=()):
-    values = [*app_env(root).values(), *secret_values]
+    values = [*redaction_env_values(root), *secret_values]
     secrets = [
         value.encode() for value in sorted(_redaction_values(values), key=len, reverse=True)
     ]
@@ -204,7 +231,7 @@ def run_script(run_dir, root=None, source_root=None, *, extra_env=None, secret_v
     logs = Path(run_dir) / "logs"
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
-        return _capture(proc, logs, [*app_env(root).values(), *secret_values], timeout_sec)
+        return _capture(proc, logs, [*redaction_env_values(root), *secret_values], timeout_sec)
     except subprocess.TimeoutExpired:
         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         raise
@@ -262,7 +289,7 @@ def run_script_local(run_dir, root=None, source_root=None, *, extra_env=None, se
     env = os.environ | app_env(root) | (extra_env or {}) | {"AUTOEXP_RUN_DIR": str(Path(run_dir).resolve()), "AUTOEXP_SCRIPT_DIR": str(source_root.resolve()), "AUTOEXP_OUTPUT_DIR": str((Path(run_dir) / "output").resolve()), "PYTHONDONTWRITEBYTECODE": "1"}
     logs = Path(run_dir) / "logs"
     proc = subprocess.Popen(command, cwd=local_workdir(manifest, run_dir, source_root), env=env, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-    return _capture(proc, logs, [*app_env(root).values(), *secret_values], timeout_sec)
+    return _capture(proc, logs, [*redaction_env_values(root), *secret_values], timeout_sec)
 
 
 def runner_type(root, source_root=None):

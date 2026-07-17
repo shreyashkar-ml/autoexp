@@ -507,12 +507,29 @@ def script_manifest(root=None):
 def source_paths(root=None):
     root = Path(root) if root is not None else resolve_root()
     config_path = root / PROJECT_CONFIG
-    files = experiment_config(root).get("files", [])
+    config = experiment_config(root)
+    files = config.get("files", [])
     paths = [
         item["path"]
         for item in files
         if item.get("role") not in SNAPSHOT_EXCLUDED_ROLES
     ]
+    if "files" not in config:
+        source = config.get("source") if isinstance(config.get("source"), dict) else {}
+        source_dir = ensure_within_project(
+            source.get("root", "experiment"),
+            "legacy source path must stay inside its snapshot",
+        )
+        if (root / source_dir).is_dir():
+            paths.extend(
+                path.relative_to(root).as_posix()
+                for path in sorted((root / source_dir).rglob("*"))
+                if path.is_file()
+            )
+        guidance = config.get("report_instruction_file")
+        if isinstance(guidance, str) and is_within_project(guidance):
+            paths.append(Path(guidance).as_posix())
+        paths.extend((f"{AUTOEXP_DIR}/instructions.md", ".gitignore"))
     if config_path.is_file():
         paths.extend(
             (

@@ -148,7 +148,13 @@ def _safe_project_path(project_root, rel):
 def _editable_source_files(source_root):
     config = read_json(_safe_project_path(source_root, PROJECT_CONFIG))
     source = config.get("source") if isinstance(config.get("source"), dict) else {}
-    return tuple(source.get("editable") or ())
+    editable = tuple(source.get("editable") or ())
+    if "files" in config:
+        return editable
+    source_dir = Path(source.get("root", "experiment"))
+    if source_dir.is_absolute() or ".." in source_dir.parts:
+        raise ValueError("legacy source path must stay inside its snapshot")
+    return tuple((source_dir / path).as_posix() for path in editable)
 
 def run_source(run_id, root=None):
     """List a run's source files (excluding manifest/params), with one selected."""

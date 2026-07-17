@@ -23,6 +23,7 @@ from .runner import (
     hash_json,
     local_run_context,
     run_script,
+    redact_secrets,
     run_script_local,
     scrub_secrets,
 )
@@ -282,7 +283,7 @@ def execute(
             *( [source_error] if source_error else [] ),
             *evidence_errors,
             *( [bundle_error] if bundle_error else [] ),
-            *( [str(runner_error)] if runner_error is not None else [] ),
+            *( [redact_secrets(runner_error, root, secret_values)] if runner_error is not None else [] ),
         ]
         kind = (
             "source_mutation" if source_error

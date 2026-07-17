@@ -247,10 +247,14 @@ def _artifact(run_id, artifact_id, root):
     return run, _decode(row)
 
 
-def artifact_content(run_id, artifact_id, root=None, *, offset=0, limit=MAX_CONTENT_BYTES):
+def artifact_file(run_id, artifact_id, root=None):
     root = resolve_root(root)
     run, artifact = _artifact(run_id, artifact_id, root)
-    path = _safe_path(run, artifact, root)
+    return artifact, _safe_path(run, artifact, root)
+
+
+def artifact_content(run_id, artifact_id, root=None, *, offset=0, limit=MAX_CONTENT_BYTES):
+    artifact, path = artifact_file(run_id, artifact_id, root)
     offset = max(0, int(offset))
     limit = max(1, min(int(limit), MAX_CONTENT_BYTES))
     with path.open("rb") as handle:
@@ -260,9 +264,7 @@ def artifact_content(run_id, artifact_id, root=None, *, offset=0, limit=MAX_CONT
 
 
 def artifact_detail(run_id, artifact_id, root=None):
-    root = resolve_root(root)
-    run, artifact = _artifact(run_id, artifact_id, root)
-    path = _safe_path(run, artifact, root)
+    artifact, path = artifact_file(run_id, artifact_id, root)
     media_type = artifact["media_type"]
     size = artifact["size_bytes"]
     with path.open("rb") as handle:

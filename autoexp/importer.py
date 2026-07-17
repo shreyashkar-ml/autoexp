@@ -117,6 +117,19 @@ def _legacy_manifest(root, config):
     return items, stage
 
 
+def _legacy_report_guidance(root, config):
+    for raw in (config.get("report_instruction_file"), PROJECT_REPORT_INSTRUCTIONS):
+        if not isinstance(raw, str):
+            continue
+        rel = Path(raw)
+        if rel.is_absolute() or ".." in rel.parts or not rel.name:
+            continue
+        path = (root / rel).resolve()
+        if path.is_relative_to(root.resolve()) and path.is_file():
+            return path.read_text()
+    return None
+
+
 def _record_for_non_git_repo(root, config, stage, title, kind):
     path = str(root.resolve())
     repo_id = hashlib.sha256(path.encode()).hexdigest()[:16]
@@ -181,6 +194,7 @@ def _import_legacy_project(path, created):
     manifest, stage = _legacy_manifest(source, config)
     kind = "autoresearch" if config.get("mode") == "autoresearch" or "autoresearch" in config else "standard"
     title = config.get("title") or source.name
+    report_guidance = _legacy_report_guidance(source, config)
     try:
         entry = create_experiment(
             config.get("description") or "Imported legacy experiment",
@@ -195,6 +209,15 @@ def _import_legacy_project(path, created):
             raise
         experiment_id = _record_for_non_git_repo(source, config, stage, title, kind)
     created.append(experiment_id)
+
+    if report_guidance is not None:
+        conn = db()
+        conn.execute(
+            "update experiments set report_guidance = ? where experiment_id = ?",
+            (report_guidance, experiment_id),
+        )
+        conn.commit()
+        conn.close()
 
     from .workspace import experiment_entry
     entry = experiment_entry(experiment_id)

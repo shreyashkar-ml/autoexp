@@ -78,6 +78,32 @@ def run_stage_commit(run):
     return commit
 
 
+def _snapshot_file_items(src_root, config):
+    if "files" in config:
+        return config["files"]
+    source = config.get("source") if isinstance(config.get("source"), dict) else {}
+    source_dir = ensure_within_project(
+        source.get("root", "experiment"),
+        "legacy source path must stay inside its snapshot",
+    )
+    editable = {
+        ensure_within_project(path, "legacy editable path must stay inside its source")
+        for path in source.get("editable", [])
+    }
+    base = src_root / source_dir
+    if not base.is_dir():
+        return []
+    items = []
+    for path in sorted(base.rglob("*")):
+        if not path.is_file():
+            continue
+        rel = path.relative_to(src_root)
+        local = path.relative_to(base)
+        role = "editable-source" if local in editable or rel in editable else "supporting-source"
+        items.append({"path": rel.as_posix(), "role": role})
+    return items
+
+
 def copy_run_source(src_root, root, *, only=None):
     """Restore declared source files from a snapshot to the live repository."""
     src_root = Path(src_root).resolve()
@@ -87,7 +113,7 @@ def copy_run_source(src_root, root, *, only=None):
         if only is not None else None
     )
     config = read_json(src_root / ".autoexp/project.json")
-    for item in config.get("files", []):
+    for item in _snapshot_file_items(src_root, config):
         if item.get("role") in {"secret-source", "generated-output", "frozen-evaluator"}:
             continue
         rel = ensure_within_project(item["path"], "snapshot source path")
@@ -118,7 +144,7 @@ def _dirty_restore_paths(src_root, root):
     config = read_json(src_root / ".autoexp/project.json")
     paths = [
         str(ensure_within_project(item["path"], "snapshot source path"))
-        for item in config.get("files", [])
+        for item in _snapshot_file_items(src_root, config)
         if item.get("role") not in {"secret-source", "generated-output", "frozen-evaluator"}
     ]
     if not paths:

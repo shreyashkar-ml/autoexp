@@ -63,7 +63,12 @@ def standard_preflight(root=None, source_root=None):
         workdir_ok = bool(str(workdir)) and not workdir.is_absolute() and ".." not in workdir.parts
         add("working_dir", workdir_ok and (source_root / workdir).is_dir(), "stage working directory is missing or unsafe")
         entrypoint = str(manifest.get("name", ""))
-        add("entrypoint", bool(entrypoint) and safe_path(source_root, entrypoint) and (source_root / entrypoint).is_file(), f"missing entrypoint: {entrypoint}")
+        candidates = (Path(entrypoint), workdir / entrypoint)
+        entrypoint_ok = bool(entrypoint) and any(
+            safe_path(source_root, path) and (source_root / path).is_file()
+            for path in candidates
+        )
+        add("entrypoint", entrypoint_ok, f"missing entrypoint: {entrypoint}")
 
     requested = config.get("runner", "local") if isinstance(config, dict) else None
     add("runner", requested in {"local", "docker"}, "runner must be one of: local, docker")
@@ -75,7 +80,9 @@ def standard_preflight(root=None, source_root=None):
             add("image", bool((manifest or {}).get("image") or (sandbox or {}).get("image")), "Docker runner requires an image")
             ok, message = docker_ready()
             add("docker", ok, message)
-        add("report_guidance", (source_root / PROJECT_REPORT_INSTRUCTIONS).is_file(), "report guidance is missing from the snapshot")
+        guidance = config.get("report_instruction_file", PROJECT_REPORT_INSTRUCTIONS)
+        guidance_ok = isinstance(guidance, str) and safe_path(source_root, guidance) and (source_root / guidance).is_file()
+        add("report_guidance", guidance_ok, "report guidance is missing from the snapshot")
 
     ok = all(item["ok"] or not item["required"] for item in checks)
     result = {"ok": ok, "checks": checks, "runner": requested if ok else None}
