@@ -518,7 +518,7 @@ class AutoResearch:
             "failure_message": session.get("failure_message"),
         }
 
-    def _restore_snapshot(self, snapshot_id):
+    def _restore_snapshot(self, snapshot_id, subject_path):
         from .runs import copy_run_source
         from .snapshots import materialize_snapshot
 
@@ -526,7 +526,7 @@ class AutoResearch:
             return
         with tempfile.TemporaryDirectory(prefix="autoexp-research-restore-") as tmp:
             materialize_snapshot(snapshot_id, tmp, self.dir)
-            copy_run_source(tmp, self.dir)
+            copy_run_source(tmp, self.dir, only={subject_path})
 
     def _score_run(self, run_id, contract):
         from .artifacts import artifact_content, list_artifacts
@@ -724,7 +724,8 @@ class AutoResearch:
         )
         conn.commit()
         conn.close()
-        self._restore_snapshot(attempt["base_snapshot_id"])
+        contract = self._decode_contract(self._contract_row(attempt["contract_id"]))
+        self._restore_snapshot(attempt["base_snapshot_id"], contract["subject_path"])
         self._update_session(attempt.get("session_id"), phase="propose", attempt_id=None)
         return self._attempt(key)
 
@@ -793,7 +794,7 @@ class AutoResearch:
         conn.commit()
         conn.close()
         if not improves:
-            self._restore_snapshot(attempt["base_snapshot_id"])
+            self._restore_snapshot(attempt["base_snapshot_id"], contract["subject_path"])
         self._update_session(attempt.get("session_id"), phase="propose", attempt_id=None)
         return self._attempt(key)
 

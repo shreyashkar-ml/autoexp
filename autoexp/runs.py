@@ -1,3 +1,4 @@
+import filecmp
 import json
 import os
 import shutil
@@ -77,15 +78,21 @@ def run_stage_commit(run):
     return commit
 
 
-def copy_run_source(src_root, root):
+def copy_run_source(src_root, root, *, only=None):
     """Restore declared source files from a snapshot to the live repository."""
     src_root = Path(src_root).resolve()
     root = resolve_root(root)
+    only = (
+        {ensure_within_project(path, "snapshot source path") for path in only}
+        if only is not None else None
+    )
     config = read_json(src_root / ".autoexp/project.json")
     for item in config.get("files", []):
         if item.get("role") in {"secret-source", "generated-output", "frozen-evaluator"}:
             continue
         rel = ensure_within_project(item["path"], "snapshot source path")
+        if only is not None and rel not in only:
+            continue
         source = src_root / rel
         cursor = src_root
         for part in rel.parts:
@@ -107,7 +114,8 @@ def copy_run_source(src_root, root):
 
 
 def _dirty_restore_paths(src_root, root):
-    config = read_json(Path(src_root) / ".autoexp/project.json")
+    src_root = Path(src_root)
+    config = read_json(src_root / ".autoexp/project.json")
     paths = [
         str(ensure_within_project(item["path"], "snapshot source path"))
         for item in config.get("files", [])
@@ -119,7 +127,29 @@ def _dirty_restore_paths(src_root, root):
         ["git", "-C", str(repository_root(root)), "status", "--porcelain", "--", *paths],
         check=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
     )
-    return proc.stdout.strip()
+    if proc.stdout.strip():
+        return proc.stdout.strip()
+    ignored = subprocess.run(
+        ["git", "-C", str(repository_root(root)), "check-ignore", "-z", "--stdin"],
+        input="\0".join(paths) + "\0", stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE, text=True,
+    )
+    if ignored.returncode not in (0, 1):
+        ignored.check_returncode()
+    ignored_paths = set(ignored.stdout.split("\0"))
+    changed = []
+    for raw in paths:
+        if raw not in ignored_paths:
+            continue
+        source = src_root / raw
+        target = safe_repository_path(root, raw)
+        if target.exists() and not (
+            source.is_file()
+            and target.is_file()
+            and filecmp.cmp(source, target, shallow=False)
+        ):
+            changed.append(f"!! {raw}")
+    return "\n".join(changed)
 
 
 def source_root_for_run(run, root=None):

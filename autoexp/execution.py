@@ -123,6 +123,7 @@ def execute(
 ):
     """Execute current source, a snapshot, or a historical run as a new run."""
     root = resolve_root(root)
+    environment = {str(key): str(value) for key, value in (environment or {}).items()}
     require_autoexp_git_repo(root)
     init_db(root)
     snapshot, parent = _source_request(root, run_id, snapshot_id)
@@ -159,6 +160,11 @@ def execute(
             preflight = require_preflight(root, temp_root)
         hashes = compute_hashes(temp_root)
         input_records = inventory_external_inputs(temp_root, root, environment)
+        secret_values = [
+            environment[record["name"]]
+            for record in input_records
+            if record["kind"] == "secret" and record["name"] in environment
+        ]
         hashes["capsule_hash"] = hash_json({
             "execution": hashes["capsule_hash"],
             "external_inputs": external_input_identity(input_records),
@@ -232,6 +238,7 @@ def execute(
             root=root,
             source_root=run_dir,
             extra_env=environment,
+            secret_values=secret_values,
             timeout_sec=timeout_sec,
         )
     except KeyboardInterrupt:
@@ -239,7 +246,7 @@ def execute(
     except Exception as exc:
         runner_error = exc
     try:
-        scrub_secrets(run_dir, root, environment)
+        scrub_secrets(run_dir, root, secret_values)
     except Exception:
         for name in ("output", "logs", "report"):
             shutil.rmtree(run_dir / name, ignore_errors=True)

@@ -2,6 +2,7 @@ import json
 import sqlite3
 import subprocess
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -17,7 +18,9 @@ from autoexp.snapshots import (
     snapshot_hashes, snapshot_matches,
 )
 from autoexp.store import db
-from autoexp.workspace import create_experiment, declare_file, register_repository
+from autoexp.workspace import (
+    create_experiment, declare_file, register_repository, run_dir_for,
+)
 
 
 def git_repo(path):
@@ -243,3 +246,74 @@ def test_failed_import_cleans_up_and_can_retry(tmp_path, monkeypatch):
 def test_view_rejects_non_loopback_bind():
     with pytest.raises(ValueError, match="loopback"):
         view(host="0.0.0.0", open_browser=False)
+
+
+def test_research_restore_only_reverts_agent_subject(tmp_path, monkeypatch):
+    entry = research_experiment(tmp_path, monkeypatch)
+    research = AutoResearch(entry["experiment_id"])
+    contract = research.state()["contract"]
+    repo = Path(entry["repo_path"])
+    (repo / "candidate.py").write_text("print('changed candidate')\n")
+    (repo / "program.md").write_text("user changed the program\n")
+
+    research._restore_snapshot(contract["best_snapshot_id"], contract["subject_path"])
+
+    assert (repo / "candidate.py").read_text() == "print('candidate')\n"
+    assert (repo / "program.md").read_text() == "user changed the program\n"
+
+
+def test_restore_refuses_modified_ignored_source(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOEXP_HOME", str(tmp_path / "home"))
+    repo = git_repo(tmp_path / "repo")
+    (repo / ".gitignore").write_text("ignored.txt\n")
+    (repo / "main.py").write_text("print('ok')\n")
+    (repo / "ignored.txt").write_text("snapshot value\n")
+    entry = create_experiment("test ignored restore", root=repo, entrypoint="main.py")
+    declare_file(entry["experiment_id"], "ignored.txt", "supporting-source")
+    commit_repo(repo, "initial")
+    run = execute(entry["experiment_id"])
+
+    (repo / "ignored.txt").write_text("uncommitted ignored value\n")
+    assert subprocess.run(
+        ["git", "-C", str(repo), "status", "--porcelain"],
+        check=True, stdout=subprocess.PIPE, text=True,
+    ).stdout == ""
+    with pytest.raises(ValueError, match="ignored.txt"):
+        restore_run_state(run["run_id"], entry["experiment_id"])
+
+
+def test_only_secret_environment_values_are_redacted(tmp_path, monkeypatch):
+    monkeypatch.setenv("AUTOEXP_HOME", str(tmp_path / "home"))
+    repo = git_repo(tmp_path / "repo")
+    (repo / ".env").write_text("DEBUG=1\n")
+    (repo / "main.py").write_text(
+        "import json, os\n"
+        "from pathlib import Path\n"
+        "Path(os.environ['AUTOEXP_OUTPUT_DIR'], 'metrics.json').write_text(json.dumps({\n"
+        "    'tag': os.environ['AUTOEXP_RESEARCH_TAG'],\n"
+        "    'budget': os.environ['AUTOEXP_RESEARCH_BUDGET_SEC'],\n"
+        "    'debug': os.environ['DEBUG'],\n"
+        "    'token': os.environ['API_TOKEN'],\n"
+        "}))\n"
+    )
+    entry = create_experiment(
+        "test selective redaction",
+        root=repo,
+        entrypoint="main.py",
+        config={"external_inputs": [{"name": "API_TOKEN", "kind": "secret"}]},
+    )
+    run = execute(entry["experiment_id"], environment={
+        "AUTOEXP_RESEARCH_TAG": "a01",
+        "AUTOEXP_RESEARCH_BUDGET_SEC": "300",
+        "API_TOKEN": "secret-value",
+    })
+
+    metrics = json.loads(
+        (run_dir_for(run, entry["experiment_id"]) / "output/metrics.json").read_text()
+    )
+    assert metrics == {
+        "tag": "a01",
+        "budget": "300",
+        "debug": "1",
+        "token": "[redacted]",
+    }

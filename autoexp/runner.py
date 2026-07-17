@@ -20,6 +20,8 @@ RUN_CONTEXT = {
     "app_env_path": "", "script_params_path": "/workspace/source/.autoexp/params.json",
     "output_dir": "/workspace/run/output", "logs_dir": "/workspace/run/logs",
 }
+# ponytail: byte replacement skips short secrets; use format-aware redaction if needed.
+MIN_REDACTION_LENGTH = 8
 
 
 def hash_json(data):
@@ -107,16 +109,20 @@ def find_duplicate_output_run(hashes, output_hash, root=None):
     return None
 
 
+def _redaction_values(values):
+    return {str(value) for value in values if value and len(str(value)) >= MIN_REDACTION_LENGTH}
+
+
 def _redact(text, values):
-    for value in sorted({str(value) for value in values if value}, key=len, reverse=True):
+    for value in sorted(_redaction_values(values), key=len, reverse=True):
         text = text.replace(value, "[redacted]")
     return text
 
 
-def redact_secrets(text, root, extra_env=None):
+def redact_secrets(text, root):
     """Remove known secret-source values before text enters durable evidence."""
-    values = [*app_env(root).values(), *(extra_env or {}).values()]
-    return _redact(str(text), values)
+    return _redact(str(text), app_env(root).values())
+
 
 def _capture(proc, logs, values, timeout_sec=None):
     try:
@@ -135,9 +141,11 @@ def _capture(proc, logs, values, timeout_sec=None):
     return proc.returncode
 
 
-def scrub_secrets(run_dir, root, extra_env=None):
-    values = [*app_env(root).values(), *(extra_env or {}).values()]
-    secrets = [str(value).encode() for value in values if value]
+def scrub_secrets(run_dir, root, secret_values=()):
+    values = [*app_env(root).values(), *secret_values]
+    secrets = [
+        value.encode() for value in sorted(_redaction_values(values), key=len, reverse=True)
+    ]
     for directory in ("output", "logs", "report"):
         base = Path(run_dir) / directory
         if not base.is_dir():
@@ -174,7 +182,7 @@ def secret_source_paths(root):
     return paths
 
 
-def run_script(run_dir, root=None, source_root=None, *, extra_env=None, timeout_sec=None):
+def run_script(run_dir, root=None, source_root=None, *, extra_env=None, secret_values=(), timeout_sec=None):
     root = resolve_root(root)
     source_root = root if source_root is None else Path(source_root)
     cfg = read_json(source_root / PROJECT_CONFIG)
@@ -196,7 +204,7 @@ def run_script(run_dir, root=None, source_root=None, *, extra_env=None, timeout_
     logs = Path(run_dir) / "logs"
     proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
     try:
-        return _capture(proc, logs, [*app_env(root).values(), *(extra_env or {}).values()], timeout_sec)
+        return _capture(proc, logs, [*app_env(root).values(), *secret_values], timeout_sec)
     except subprocess.TimeoutExpired:
         subprocess.run(["docker", "rm", "-f", container_name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=False)
         raise
@@ -241,7 +249,7 @@ def local_workdir(manifest, run_dir, source_root):
     return target
 
 
-def run_script_local(run_dir, root=None, source_root=None, *, extra_env=None, timeout_sec=None):
+def run_script_local(run_dir, root=None, source_root=None, *, extra_env=None, secret_values=(), timeout_sec=None):
     root = resolve_root(root)
     source_root = root if source_root is None else Path(source_root)
     manifest = script_manifest(source_root)
@@ -254,7 +262,7 @@ def run_script_local(run_dir, root=None, source_root=None, *, extra_env=None, ti
     env = os.environ | app_env(root) | (extra_env or {}) | {"AUTOEXP_RUN_DIR": str(Path(run_dir).resolve()), "AUTOEXP_SCRIPT_DIR": str(source_root.resolve()), "AUTOEXP_OUTPUT_DIR": str((Path(run_dir) / "output").resolve()), "PYTHONDONTWRITEBYTECODE": "1"}
     logs = Path(run_dir) / "logs"
     proc = subprocess.Popen(command, cwd=local_workdir(manifest, run_dir, source_root), env=env, shell=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, start_new_session=True)
-    return _capture(proc, logs, [*app_env(root).values(), *(extra_env or {}).values()], timeout_sec)
+    return _capture(proc, logs, [*app_env(root).values(), *secret_values], timeout_sec)
 
 
 def runner_type(root, source_root=None):
