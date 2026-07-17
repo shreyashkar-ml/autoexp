@@ -190,6 +190,8 @@ def index_execution_artifacts(run_id, root=None):
     root = resolve_root(root)
     init_db(root)
     run = get_run(run_id, root)
+    from .runner import scrub_secrets
+    scrub_secrets(run_dir_for(run, root), root)
     return [
         *_index_directory(run, "logs", "log", root),
         *_index_directory(run, "output", "output", root),
@@ -201,6 +203,8 @@ def index_report_artifacts(run_id, root=None):
     root = resolve_root(root)
     init_db(root)
     run = get_run(run_id, root)
+    from .runner import scrub_secrets
+    scrub_secrets(run_dir_for(run, root), root)
     return _index_directory(
         run,
         "report",
@@ -208,26 +212,6 @@ def index_report_artifacts(run_id, root=None):
         root,
         exclude={"report_bundle.json"},
     )
-
-
-def migrate_existing_artifacts(root=None):
-    """Index recoverable v0.1 evidence without changing its files."""
-    root = resolve_root(root)
-    conn = db(root)
-    run_ids = [row[0] for row in conn.execute("select run_id from runs").fetchall()]
-    conn.close()
-    for run_id in run_ids:
-        run = get_run(run_id, root)
-        _index_directory(run, "logs", "log", root, strict=False)
-        _index_directory(run, "output", "output", root, strict=False)
-        _index_directory(
-            run,
-            "report",
-            "report",
-            root,
-            exclude={"report_bundle.json"},
-            strict=False,
-        )
 
 
 def list_artifacts(run_id, root=None, category=None):

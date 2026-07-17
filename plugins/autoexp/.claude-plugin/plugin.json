@@ -1,7 +1,8 @@
 {
   "name": "autoexp",
+  "version": "0.3.0",
   "displayName": "Autoexp",
-  "description": "Run and review reproducible local experiments with Autoexp.",
+  "description": "Run agent-led experiments and open browser feedback reviews from existing repositories.",
   "author": {
     "name": "Shreyashkar Sahu",
     "url": "https://github.com/shreyashkar-ml"
@@ -9,5 +10,5 @@
   "homepage": "https://github.com/shreyashkar-ml/autoexp",
   "repository": "https://github.com/shreyashkar-ml/autoexp",
   "license": "Apache-2.0",
-  "keywords": ["experiments", "autoresearch", "mcp"]
+  "keywords": ["agents", "experiments", "autoresearch", "review"]
 }

@@ -1,134 +1,253 @@
+"""One global SQLite ledger and one private Git snapshot store per worktree."""
+
+from __future__ import annotations
+
 import json
+import os
 import sqlite3
 import subprocess
 from pathlib import Path
 
-from .workspace import die, resolve_root, source_paths
-
-
-AUTOEXP_GIT_DIR = ".autoexp/repository"
-AUTOEXP_DB = ".autoexp/state.sqlite"
-
-
-IMMUTABILITY_TRIGGERS = """
-create trigger if not exists runs_terminal_immutable
-before update on runs
-when old.status in ('success', 'failed', 'canceled') and (
-    new.run_id is not old.run_id or
-    new.run_dir is not old.run_dir or
-    new.output_hash is not old.output_hash or
-    new.capsule_hash is not old.capsule_hash or
-    new.script_name is not old.script_name or
-    new.script_hash is not old.script_hash or
-    new.script_env_hash is not old.script_env_hash or
-    new.runtime_context_hash is not old.runtime_context_hash or
-    new.stage_commit is not old.stage_commit or
-    new.status is not old.status or
-    new.stage_status is not old.stage_status or
-    new.created_at is not old.created_at or
-    new.source_snapshot_id is not old.source_snapshot_id or
-    new.parent_run_id is not old.parent_run_id or
-    new.trigger_id is not old.trigger_id or
-    new.exit_code is not old.exit_code or
-    new.runner is not old.runner or
-    new.runner_identity is not old.runner_identity or
-    new.started_at is not old.started_at or
-    new.ended_at is not old.ended_at or
-    new.duration_ms is not old.duration_ms or
-    new.failure_kind is not old.failure_kind or
-    new.failure_message is not old.failure_message or
-    new.reproduces_run_id is not old.reproduces_run_id
+from .workspace import (
+    die,
+    experiment_id,
+    project_id,
+    repo_data_dir,
+    resolve_root,
+    user_data_dir,
 )
-begin
-    select raise(abort, 'terminal run is immutable');
-end;
 
-create trigger if not exists runs_terminal_no_delete
-before delete on runs
+
+SCHEMA = """
+pragma foreign_keys = on;
+create table if not exists schema_metadata(schema_version integer not null);
+insert into schema_metadata(schema_version)
+select 1 where not exists(select 1 from schema_metadata);
+
+create table if not exists repositories(
+  repo_id text primary key, title text not null, path text not null unique,
+  created_at text not null, last_opened_at text not null
+);
+create table if not exists experiments(
+  experiment_id text primary key,
+  repo_id text not null references repositories(repo_id),
+  title text not null, objective text not null,
+  kind text not null check(kind in ('standard', 'autoresearch')),
+  status text not null,
+  runner text not null check(runner in ('local', 'docker')),
+  stage text not null check(json_valid(stage)),
+  config text not null check(json_valid(config)),
+  params text not null check(json_valid(params)),
+  params_schema text not null check(json_valid(params_schema)),
+  report_guidance text not null,
+  data_path text not null unique,
+  created_at text not null, updated_at text not null
+);
+create index if not exists idx_experiments_repo on experiments(repo_id, updated_at desc);
+create table if not exists manifest_files(
+  experiment_id text not null references experiments(experiment_id),
+  path text not null, role text not null, description text not null default '',
+  content_hash text, available integer not null check(available in (0, 1)),
+  secret_keys text not null default '[]' check(json_valid(secret_keys)),
+  updated_at text not null, primary key(experiment_id, path)
+);
+create table if not exists triggers(
+  trigger_id text primary key,
+  experiment_id text not null references experiments(experiment_id),
+  kind text not null, actor_name text, session_id text, request_id text,
+  metadata text not null default '{}' check(json_valid(metadata)), created_at text not null
+);
+create table if not exists source_snapshots(
+  snapshot_id text primary key,
+  repo_id text not null references repositories(repo_id),
+  experiment_id text not null references experiments(experiment_id),
+  parent_snapshot_id text references source_snapshots(snapshot_id),
+  git_commit text not null, script_hash text not null, params_hash text not null,
+  manifest_hash text not null, runtime_config_hash text not null, source_hash text not null,
+  created_at text not null, created_by_trigger_id text references triggers(trigger_id),
+  label text, legacy_run_id text unique
+);
+create index if not exists idx_snapshots_experiment on source_snapshots(experiment_id, created_at desc);
+create table if not exists runs(
+  run_id text primary key,
+  experiment_id text not null references experiments(experiment_id),
+  run_dir text not null, report_path text not null, output_hash text not null,
+  capsule_hash text not null, script_name text not null, script_hash text not null,
+  script_env_hash text not null, runtime_context_hash text not null, stage_commit text not null,
+  status text not null check(status in ('queued', 'running', 'success', 'failed', 'canceled')),
+  stage_status text not null check(json_valid(stage_status)), created_at text not null,
+  source_snapshot_id text references source_snapshots(snapshot_id),
+  parent_run_id text references runs(run_id), trigger_id text references triggers(trigger_id),
+  exit_code integer, runner text, runner_identity text, started_at text, ended_at text,
+  duration_ms integer, failure_kind text, failure_message text,
+  reproduces_run_id text references runs(run_id)
+);
+create index if not exists idx_runs_experiment on runs(experiment_id, created_at desc);
+create index if not exists idx_runs_capsule on runs(experiment_id, capsule_hash, status);
+create table if not exists artifacts(
+  artifact_id text primary key, run_id text not null references runs(run_id) on delete restrict,
+  category text not null check(category in ('output', 'log', 'report')),
+  path text not null, media_type text not null, content_hash text not null,
+  size_bytes integer not null check(size_bytes >= 0), created_at text not null,
+  metadata text not null default '{}' check(json_valid(metadata)), unique(run_id, path)
+);
+create table if not exists run_external_inputs(
+  run_id text not null references runs(run_id) on delete restrict,
+  name text not null, kind text not null, present integer not null check(present in (0, 1)),
+  fingerprint text, version text,
+  reproducibility_state text not null check(reproducibility_state in ('pinned', 'unpinned', 'redacted')),
+  metadata text not null default '{}' check(json_valid(metadata)), primary key(run_id, name)
+);
+create table if not exists milestones(
+  milestone_id text primary key,
+  experiment_id text not null references experiments(experiment_id),
+  target_kind text not null check(target_kind in ('run', 'attempt')), target_id text not null,
+  title text not null, significance text not null, actor_name text, created_at text not null,
+  unique(experiment_id, target_kind, target_id)
+);
+create table if not exists documents(
+  document_id text primary key,
+  experiment_id text not null references experiments(experiment_id),
+  run_id text references runs(run_id), kind text not null check(kind in ('report', 'insight')),
+  title text not null, path text not null, content_hash text not null,
+  size_bytes integer not null, created_at text not null, unique(experiment_id, path)
+);
+create table if not exists review_sessions(
+  session_id text primary key,
+  experiment_id text not null references experiments(experiment_id),
+  token_hash text not null unique,
+  status text not null check(status in ('waiting', 'completed', 'expired')),
+  expires_at integer not null, notes text not null default '[]' check(json_valid(notes)),
+  created_at text not null, completed_at text
+);
+create table if not exists research_contracts(
+  contract_id text primary key,
+  experiment_id text not null references experiments(experiment_id),
+  parent_contract_id text references research_contracts(contract_id),
+  status text not null check(status in ('active', 'superseded')), contract_hash text not null,
+  metric text not null, direction text not null check(direction in ('min', 'max')),
+  baseline_score real, best_score real, best_snapshot_id text references source_snapshots(snapshot_id),
+  evaluator_path text not null, evaluator_hash text not null, program_path text not null,
+  subject_path text not null, budget_sec integer not null check(budget_sec > 0),
+  metric_source text not null check(json_valid(metric_source)),
+  agent_command text not null check(json_valid(agent_command)), created_at text not null, ended_at text
+);
+create unique index if not exists idx_research_contract_active
+on research_contracts(experiment_id) where status = 'active';
+create table if not exists research_sessions(
+  session_id text primary key, contract_id text not null references research_contracts(contract_id),
+  status text not null check(status in ('running', 'stopped', 'completed', 'failed', 'interrupted')),
+  phase text not null check(phase in ('idle', 'propose', 'train', 'score')),
+  attempt_id text, pid integer, log_path text not null, started_at text not null,
+  ended_at text, failure_message text
+);
+create unique index if not exists idx_research_session_running
+on research_sessions(contract_id) where status = 'running';
+create table if not exists research_attempts(
+  contract_id text not null references research_contracts(contract_id), attempt_id text not null,
+  sequence integer not null check(sequence > 0), session_id text references research_sessions(session_id),
+  status text not null check(status in ('running', 'scored', 'failed')), hypothesis text not null,
+  base_snapshot_id text references source_snapshots(snapshot_id),
+  candidate_snapshot_id text references source_snapshots(snapshot_id), run_id text references runs(run_id),
+  score real, verdict text check(verdict in ('kept', 'reverted')), best_score_before real,
+  improvement real, created_at text, ended_at text, failure_message text,
+  metadata text not null default '{}' check(json_valid(metadata)),
+  primary key(contract_id, attempt_id), unique(contract_id, sequence)
+);
+create unique index if not exists idx_research_attempt_running
+on research_attempts(contract_id) where status = 'running';
+create table if not exists imports(
+  import_id text primary key, source_path text not null unique,
+  experiment_id text not null references experiments(experiment_id),
+  summary text not null check(json_valid(summary)), created_at text not null
+);
+
+create trigger if not exists runs_validate_transition before update of status on runs
+when new.status != old.status and not (
+  (old.status = 'queued' and new.status = 'running') or
+  (old.status = 'running' and new.status in ('success', 'failed', 'canceled'))
+) begin select raise(abort, 'invalid run status transition'); end;
+create trigger if not exists runs_terminal_no_delete before delete on runs
 when old.status in ('success', 'failed', 'canceled')
-begin
-    select raise(abort, 'terminal run is immutable');
-end;
+begin select raise(abort, 'terminal run is immutable'); end;
+create trigger if not exists runs_terminal_immutable before update on runs
+when old.status in ('success', 'failed', 'canceled')
+begin select raise(abort, 'terminal run is immutable'); end;
+create trigger if not exists artifacts_immutable_no_update before update on artifacts
+when old.category = 'report' or exists(
+  select 1 from runs where run_id = old.run_id and status in ('success', 'failed', 'canceled')
+) begin select raise(abort, 'artifact is immutable'); end;
+create trigger if not exists snapshots_immutable_no_update before update on source_snapshots
+begin select raise(abort, 'source snapshot is immutable'); end;
+create trigger if not exists snapshots_immutable_no_delete before delete on source_snapshots
+begin select raise(abort, 'source snapshot is immutable'); end;
+create trigger if not exists triggers_immutable_no_update before update on triggers
+begin select raise(abort, 'trigger is immutable'); end;
+create trigger if not exists triggers_immutable_no_delete before delete on triggers
+begin select raise(abort, 'trigger is immutable'); end;
+create trigger if not exists documents_immutable_no_update before update on documents
+begin select raise(abort, 'document is immutable'); end;
+create trigger if not exists documents_immutable_no_delete before delete on documents
+begin select raise(abort, 'document is immutable'); end;
+create trigger if not exists milestones_immutable_no_update before update on milestones
+begin select raise(abort, 'milestone is immutable'); end;
+create trigger if not exists milestones_immutable_no_delete before delete on milestones
+begin select raise(abort, 'milestone is immutable'); end;
+create trigger if not exists attempts_terminal_no_update before update on research_attempts
+when old.status in ('scored', 'failed')
+begin select raise(abort, 'research attempt is immutable'); end;
+create trigger if not exists attempts_terminal_no_delete before delete on research_attempts
+when old.status in ('scored', 'failed')
+begin select raise(abort, 'research attempt is immutable'); end;
+create trigger if not exists inputs_terminal_no_update before update on run_external_inputs
+when exists(select 1 from runs where run_id = old.run_id and status in ('success', 'failed', 'canceled'))
+begin select raise(abort, 'run input evidence is immutable'); end;
+create trigger if not exists inputs_terminal_no_delete before delete on run_external_inputs
+when exists(select 1 from runs where run_id = old.run_id and status in ('success', 'failed', 'canceled'))
+begin select raise(abort, 'run input evidence is immutable'); end;
 
-create trigger if not exists artifacts_terminal_no_insert
-before insert on artifacts
-when new.category in ('output', 'log') and exists(
-    select 1 from runs where run_id = new.run_id
-    and status in ('success', 'failed', 'canceled')
-)
-begin
-    select raise(abort, 'terminal execution artifacts are immutable');
-end;
-
-create trigger if not exists artifacts_immutable_no_update
-before update on artifacts
-when old.category = 'report' or
-    (old.category in ('output', 'log') and exists(
-        select 1 from runs where run_id = old.run_id
-        and status in ('success', 'failed', 'canceled')
-    ))
-begin
-    select raise(abort, 'artifact is immutable');
-end;
-
-create trigger if not exists artifacts_immutable_no_delete
-before delete on artifacts
-when old.category = 'report' or
-    (old.category in ('output', 'log') and exists(
-        select 1 from runs where run_id = old.run_id
-        and status in ('success', 'failed', 'canceled')
-    ))
-begin
-    select raise(abort, 'artifact is immutable');
-end;
-
-create trigger if not exists external_inputs_terminal_no_insert
-before insert on run_external_inputs
-when exists(
-    select 1 from runs where run_id = new.run_id
-    and status in ('success', 'failed', 'canceled')
-)
-begin
-    select raise(abort, 'terminal run external inputs are immutable');
-end;
-
-create trigger if not exists external_inputs_terminal_no_update
-before update on run_external_inputs
-when exists(
-    select 1 from runs where run_id = old.run_id
-    and status in ('success', 'failed', 'canceled')
-)
-begin
-    select raise(abort, 'terminal run external inputs are immutable');
-end;
-
-create trigger if not exists external_inputs_terminal_no_delete
-before delete on run_external_inputs
-when exists(
-    select 1 from runs where run_id = old.run_id
-    and status in ('success', 'failed', 'canceled')
-)
-begin
-    select raise(abort, 'terminal run external inputs are immutable');
-end;
+create trigger if not exists artifacts_immutable_no_delete before delete on artifacts
+when old.category = 'report' or exists(
+  select 1 from runs where run_id = old.run_id and status in ('success', 'failed', 'canceled')
+) begin select raise(abort, 'artifact is immutable'); end;
 """
 
 
-# ======================================================================
-#  Private Git: script/config snapshots separate from the user's repo
-# ======================================================================
+def db(root=None):
+    path = user_data_dir() / "state.sqlite"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    conn.row_factory = sqlite3.Row
+    conn.execute("pragma foreign_keys = on")
+    conn.executescript(SCHEMA)
+    return conn
 
-def autoexp_git(args, root=None, capture=False, check=True):
-    """Run git against the project's private snapshot repository."""
-    root = resolve_root(root)
-    cmd = ["git", "--git-dir", str(root / AUTOEXP_GIT_DIR), "--work-tree", str(root), *args]
+
+def private_git_dir(root):
+    return repo_data_dir(project_id(root)) / "repository"
+
+
+def _git_env():
+    return os.environ | {
+        "GIT_AUTHOR_NAME": "Autoexp",
+        "GIT_AUTHOR_EMAIL": "autoexp@local",
+        "GIT_COMMITTER_NAME": "Autoexp",
+        "GIT_COMMITTER_EMAIL": "autoexp@local",
+    }
+
+
+def autoexp_git(args, root=None, capture=False, check=True, *, input_text=None, env=None):
+    git_dir = private_git_dir(resolve_root(root))
+    cmd = ["git", "--git-dir", str(git_dir), *args]
     try:
         proc = subprocess.run(
             cmd,
             check=check,
+            input=input_text,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            env=_git_env() | (env or {}),
         )
     except FileNotFoundError:
         die("required command not found: git")
@@ -136,410 +255,57 @@ def autoexp_git(args, root=None, capture=False, check=True):
 
 
 def require_autoexp_git_repo(root=None):
-    """Fail unless the private git store exists and is rooted at the project."""
     root = resolve_root(root)
-    git_dir = root / AUTOEXP_GIT_DIR
-    if (
-        git_dir.is_symlink()
-        or not git_dir.resolve().is_relative_to(root.resolve())
-        or not git_dir.is_dir()
-    ):
-        die(f"{root} is missing its Autoexp git repository")
-    top = autoexp_git(["rev-parse", "--show-toplevel"], root=root, capture=True)
-    if Path(top).resolve() != root.resolve():
-        die("refusing to run git outside the autoexp project")
+    git_dir = private_git_dir(root)
+    if git_dir.is_dir():
+        return git_dir
+    git_dir.parent.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        ["git", "init", "--bare", str(git_dir)],
+        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    tree = autoexp_git(["mktree"], root, capture=True, input_text="")
+    commit = autoexp_git(["commit-tree", tree, "-m", "autoexp snapshot root"], root, capture=True)
+    autoexp_git(["update-ref", "refs/heads/main", commit], root)
+    return git_dir
 
 
 def current_autoexp_commit(root=None):
-    return autoexp_git(["rev-parse", "HEAD"], root=root, capture=True)
-
-
-def git_status(paths, root=None):
-    return autoexp_git(["status", "--porcelain", "--", *paths], root=root, capture=True)
-
-
-def git_commit_source(message, root=None):
-    """Stage and commit the source set; return (commit, changed?)."""
-    paths = source_paths(root)
-    autoexp_git(["add", "-f", *paths], root=root)
-    staged = autoexp_git(["diff", "--cached", "--name-only", "--", *paths], root=root, capture=True)
-    if not staged:
-        return current_autoexp_commit(root), False
-    autoexp_git(["commit", "-m", message, "--", *paths], root=root)
-    return current_autoexp_commit(root), True
-
-
-# ======================================================================
-#  Run index (index.sqlite)
-# ======================================================================
-
-def db(root=None):
     root = resolve_root(root)
-    conn = sqlite3.connect(root / AUTOEXP_DB)
-    conn.row_factory = sqlite3.Row
-    conn.execute("pragma foreign_keys = on")
-    return conn
+    require_autoexp_git_repo(root)
+    conn = db()
+    row = conn.execute(
+        """select git_commit from source_snapshots
+           where experiment_id = ? order by created_at desc, rowid desc limit 1""",
+        (experiment_id(root),),
+    ).fetchone()
+    conn.close()
+    return row[0] if row else autoexp_git(["rev-parse", "refs/heads/main"], root, capture=True)
 
 
 def init_db(root=None):
     root = resolve_root(root)
-    conn = db(root)
-    has_runs = conn.execute(
-        "select 1 from sqlite_master where type = 'table' and name = 'runs'"
-    ).fetchone()
-    conn.execute(
-        """create table if not exists schema_metadata(
-            schema_version integer not null,
-            legacy_snapshot_migration_complete integer not null default 0
-        )"""
-    )
-    version = conn.execute("select schema_version from schema_metadata").fetchone()
-    if version is None:
-        conn.execute(
-            "insert into schema_metadata(schema_version) values (?)",
-            (1 if has_runs else 0,),
-        )
-        version = (1 if has_runs else 0,)
-
-    if version[0] < 1:
-        conn.executescript(
-            """
-        begin;
-        create table if not exists runs(
-            run_id text primary key, run_dir text not null, report_path text not null,
-            output_hash text not null, capsule_hash text not null, script_name text not null,
-            script_hash text not null, script_env_hash text not null,
-            runtime_context_hash text not null, stage_commit text not null,
-            status text not null, stage_status text not null, created_at text not null
-        );
-        create index if not exists idx_runs_capsule on runs(capsule_hash, status);
-        update schema_metadata set schema_version = 1;
-        commit;
-            """
-        )
-
-    if version[0] < 2:
-        conn.executescript(
-            """
-            begin;
-            create table source_snapshots(
-                snapshot_id text primary key,
-                project_id text not null,
-                parent_snapshot_id text references source_snapshots(snapshot_id),
-                git_commit text not null,
-                script_hash text not null,
-                params_hash text not null,
-                manifest_hash text not null,
-                runtime_config_hash text not null,
-                source_hash text not null,
-                created_at text not null,
-                created_by_trigger_id text,
-                label text,
-                legacy_run_id text unique
-            );
-            create index idx_source_snapshots_hash on source_snapshots(source_hash);
-            alter table runs add column source_snapshot_id text references source_snapshots(snapshot_id);
-            update schema_metadata
-            set schema_version = 2, legacy_snapshot_migration_complete = 0;
-            commit;
-            """
-        )
-
-    if version[0] < 3:
-        conn.executescript(
-            """
-            begin;
-            create table triggers(
-                trigger_id text primary key,
-                kind text not null,
-                actor_name text,
-                session_id text,
-                request_id text,
-                metadata text not null default '{}',
-                created_at text not null
-            );
-            create index idx_triggers_request on triggers(request_id);
-
-            create table artifacts(
-                artifact_id text primary key,
-                run_id text not null references runs(run_id) on delete restrict,
-                category text not null check(category in ('output', 'log', 'report')),
-                path text not null,
-                media_type text not null,
-                content_hash text not null,
-                size_bytes integer not null check(size_bytes >= 0),
-                created_at text not null,
-                metadata text not null default '{}',
-                unique(run_id, path)
-            );
-            create index idx_artifacts_run_category on artifacts(run_id, category);
-
-            create table run_external_inputs(
-                run_id text not null references runs(run_id) on delete restrict,
-                name text not null,
-                kind text not null,
-                present integer not null check(present in (0, 1)),
-                fingerprint text,
-                version text,
-                reproducibility_state text not null
-                    check(reproducibility_state in ('pinned', 'unpinned', 'redacted')),
-                metadata text not null default '{}',
-                primary key(run_id, name)
-            );
-
-            alter table runs add column parent_run_id text references runs(run_id);
-            alter table runs add column trigger_id text references triggers(trigger_id);
-            alter table runs add column exit_code integer;
-            alter table runs add column runner text;
-            alter table runs add column runner_identity text;
-            alter table runs add column started_at text;
-            alter table runs add column ended_at text;
-            alter table runs add column duration_ms integer;
-            alter table runs add column failure_kind text;
-            alter table runs add column failure_message text;
-            alter table runs add column reproduces_run_id text references runs(run_id);
-            alter table schema_metadata add column standard_migration_complete integer not null default 0;
-            create index idx_runs_parent on runs(parent_run_id);
-            create index idx_runs_trigger on runs(trigger_id);
-            create index idx_runs_reproduces on runs(reproduces_run_id);
-
-            create trigger runs_validate_insert
-            before insert on runs
-            when new.status not in ('queued', 'running', 'success', 'failed', 'canceled')
-            begin
-                select raise(abort, 'invalid run status');
-            end;
-
-            create trigger runs_validate_transition
-            before update of status on runs
-            when new.status != old.status and not (
-                (old.status = 'queued' and new.status = 'running') or
-                (old.status = 'running' and new.status in ('success', 'failed', 'canceled'))
-            )
-            begin
-                select raise(abort, 'invalid run status transition');
-            end;
-
-            update schema_metadata set schema_version = 3;
-            commit;
-            """
-        )
-
-    if version[0] < 4:
-        conn.executescript(
-            """
-            begin;
-            create table research_contracts(
-                contract_id text primary key,
-                project_id text not null,
-                parent_contract_id text references research_contracts(contract_id),
-                status text not null check(status in ('active', 'superseded')),
-                contract_hash text not null,
-                metric text not null,
-                direction text not null check(direction in ('min', 'max')),
-                baseline_score real,
-                best_score real,
-                best_snapshot_id text references source_snapshots(snapshot_id),
-                evaluator_path text not null,
-                evaluator_hash text not null,
-                program_path text not null,
-                subject_path text not null,
-                budget_sec integer not null check(budget_sec > 0),
-                metric_source text not null check(json_valid(metric_source)),
-                agent_command text not null check(json_valid(agent_command)),
-                created_at text not null,
-                ended_at text
-            );
-            create unique index idx_research_contracts_active
-            on research_contracts(project_id) where status = 'active';
-
-            create table research_sessions(
-                session_id text primary key,
-                contract_id text not null references research_contracts(contract_id),
-                status text not null check(status in (
-                    'running', 'stopped', 'completed', 'failed', 'interrupted'
-                )),
-                phase text not null check(phase in ('idle', 'propose', 'train', 'score')),
-                attempt_id text,
-                pid integer,
-                log_path text not null,
-                started_at text not null,
-                ended_at text,
-                failure_message text,
-                check(
-                    (status = 'running' and ended_at is null) or
-                    (status != 'running' and ended_at is not null)
-                )
-            );
-            create unique index idx_research_sessions_running
-            on research_sessions(contract_id) where status = 'running';
-
-            create table research_attempts(
-                contract_id text not null references research_contracts(contract_id),
-                attempt_id text not null,
-                sequence integer not null check(sequence > 0),
-                session_id text references research_sessions(session_id),
-                status text not null check(status in ('running', 'scored', 'failed')),
-                hypothesis text not null check(length(trim(hypothesis)) > 0),
-                base_snapshot_id text references source_snapshots(snapshot_id),
-                candidate_snapshot_id text references source_snapshots(snapshot_id),
-                run_id text references runs(run_id),
-                score real,
-                verdict text check(verdict in ('kept', 'reverted')),
-                best_score_before real,
-                improvement real,
-                created_at text,
-                ended_at text,
-                failure_message text,
-                metadata text not null default '{}' check(json_valid(metadata)),
-                check(
-                    (status = 'running' and score is null and verdict is null and ended_at is null) or
-                    (status = 'scored' and score is not null and verdict is not null and ended_at is not null) or
-                    (status = 'failed' and verdict is null and ended_at is not null)
-                ),
-                primary key(contract_id, attempt_id),
-                unique(contract_id, sequence)
-            );
-            create unique index idx_research_attempts_run
-            on research_attempts(run_id) where run_id is not null;
-            create unique index idx_research_attempts_running
-            on research_attempts(contract_id) where status = 'running';
-
-            create trigger research_attempts_validate_transition
-            before update of status on research_attempts
-            when new.status != old.status and not (
-                old.status = 'running' and new.status in ('scored', 'failed')
-            )
-            begin
-                select raise(abort, 'invalid research attempt status transition');
-            end;
-
-            create trigger research_attempts_terminal_immutable
-            before update on research_attempts
-            when old.status in ('scored', 'failed')
-            begin
-                select raise(abort, 'terminal research attempt is immutable');
-            end;
-
-            create trigger research_attempts_terminal_no_delete
-            before delete on research_attempts
-            when old.status in ('scored', 'failed')
-            begin
-                select raise(abort, 'terminal research attempt is immutable');
-            end;
-
-            create trigger research_sessions_terminal_immutable
-            before update on research_sessions
-            when old.status in ('stopped', 'completed', 'failed', 'interrupted')
-            begin
-                select raise(abort, 'terminal research session is immutable');
-            end;
-
-            create trigger research_sessions_terminal_no_delete
-            before delete on research_sessions
-            when old.status in ('stopped', 'completed', 'failed', 'interrupted')
-            begin
-                select raise(abort, 'terminal research session is immutable');
-            end;
-
-            create trigger research_contracts_superseded_immutable
-            before update on research_contracts
-            when old.status = 'superseded'
-            begin
-                select raise(abort, 'superseded research contract is immutable');
-            end;
-
-            create trigger research_contracts_superseded_no_delete
-            before delete on research_contracts
-            when old.status = 'superseded'
-            begin
-                select raise(abort, 'superseded research contract is immutable');
-            end;
-
-            alter table schema_metadata add column
-                research_migration_complete integer not null default 0;
-            update schema_metadata set schema_version = 4;
-            commit;
-            """
-        )
-
-    if version[0] < 5:
-        conn.executescript(
-            """
-            begin;
-            create table milestones(
-                milestone_id text primary key,
-                target_kind text not null check(target_kind in ('run', 'attempt')),
-                target_id text not null,
-                title text not null check(length(trim(title)) > 0),
-                significance text not null check(length(trim(significance)) > 0),
-                actor_name text,
-                created_at text not null,
-                unique(target_kind, target_id)
-            );
-            create index idx_milestones_created on milestones(created_at desc);
-            update schema_metadata set schema_version = 5;
-            commit;
-            """
-        )
-    conn.commit()
-    migration_complete = conn.execute(
-        "select legacy_snapshot_migration_complete from schema_metadata"
-    ).fetchone()[0]
-    conn.close()
-
-    if not migration_complete:
-        from .snapshots import migrate_legacy_run_snapshots
-
-        if migrate_legacy_run_snapshots(root):
-            conn = db(root)
-            conn.execute(
-                "update schema_metadata set legacy_snapshot_migration_complete = 1"
-            )
-            conn.commit()
-            conn.close()
-
-    conn = db(root)
-    standard_migration_complete = conn.execute(
-        "select standard_migration_complete from schema_metadata"
-    ).fetchone()[0]
-    conn.close()
-    if not standard_migration_complete:
-        from .artifacts import migrate_existing_artifacts
-        from .provenance import migrate_legacy_provenance
-
-        migrate_legacy_provenance(root)
-        migrate_existing_artifacts(root)
-        conn = db(root)
-        conn.execute("update schema_metadata set standard_migration_complete = 1")
-        conn.commit()
-        conn.close()
-
-    conn = db(root)
-    conn.executescript(IMMUTABILITY_TRIGGERS)
-    conn.close()
+    require_autoexp_git_repo(root)
+    (root / "runs").mkdir(parents=True, exist_ok=True)
+    return root
 
 
 RUN_COLUMNS = (
-    "run_id", "run_dir", "report_path", "output_hash", "capsule_hash", "script_name",
-    "script_hash", "script_env_hash", "runtime_context_hash", "stage_commit",
+    "run_id", "experiment_id", "run_dir", "report_path", "output_hash", "capsule_hash",
+    "script_name", "script_hash", "script_env_hash", "runtime_context_hash", "stage_commit",
     "status", "stage_status", "created_at", "source_snapshot_id", "parent_run_id",
     "trigger_id", "exit_code", "runner", "runner_identity", "started_at", "ended_at",
     "duration_ms", "failure_kind", "failure_message", "reproduces_run_id",
 )
 
 
-def _row_for_db(meta):
-    """Copy meta and JSON-encode the columns the table stores as text."""
-    row = {**meta}
-    row["stage_status"] = json.dumps(row["stage_status"])
-    return row
-
-
 def insert_run(meta, root=None):
-    from .runs import script_name
-
+    root = resolve_root(root)
     row = {
+        "experiment_id": experiment_id(root),
         "run_dir": f"runs/{meta['run_id']}",
         "report_path": "",
         "output_hash": "",
@@ -555,14 +321,12 @@ def insert_run(meta, root=None):
         "failure_kind": None,
         "failure_message": None,
         "reproduces_run_id": None,
-        "script_name": meta.get("script_name") or script_name(meta["run_id"], root),
         **meta,
     }
-    row = _row_for_db(row)
-    placeholders = ", ".join(f":{col}" for col in RUN_COLUMNS)
-    conn = db(root)
+    row["stage_status"] = json.dumps(row["stage_status"])
+    conn = db()
     conn.execute(
-        f"insert into runs({', '.join(RUN_COLUMNS)}) values({placeholders})",
+        f"insert into runs({', '.join(RUN_COLUMNS)}) values({', '.join(':' + c for c in RUN_COLUMNS)})",
         row,
     )
     conn.commit()
@@ -570,14 +334,14 @@ def insert_run(meta, root=None):
 
 
 def update_run(meta, root=None):
-    conn = db(root)
+    conn = db()
     existing = conn.execute("select * from runs where run_id = ?", (meta["run_id"],)).fetchone()
-    if existing is None:
+    if not existing:
         conn.close()
         raise ValueError(f"unknown run_id: {meta['run_id']}")
-    current = dict(existing)
-    current["stage_status"] = json.loads(current["stage_status"])
-    row = _row_for_db(current | meta)
+    row = dict(existing) | meta
+    if not isinstance(row["stage_status"], str):
+        row["stage_status"] = json.dumps(row["stage_status"])
     assignments = ", ".join(f"{col}=:{col}" for col in RUN_COLUMNS if col != "run_id")
     conn.execute(f"update runs set {assignments} where run_id=:run_id", row)
     conn.commit()

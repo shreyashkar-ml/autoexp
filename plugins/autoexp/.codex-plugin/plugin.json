@@ -1,7 +1,7 @@
 {
   "name": "autoexp",
-  "version": "0.1.0",
-  "description": "Run and review reproducible local experiments with Autoexp.",
+  "version": "0.3.0+codex.20260717153347",
+  "description": "Run agent-led experiments and open browser feedback reviews from existing repositories.",
   "author": {
     "name": "Shreyashkar Sahu",
     "url": "https://github.com/shreyashkar-ml"
@@ -9,22 +9,27 @@
   "homepage": "https://github.com/shreyashkar-ml/autoexp",
   "repository": "https://github.com/shreyashkar-ml/autoexp",
   "license": "Apache-2.0",
-  "keywords": ["experiments", "autoresearch", "mcp"],
+  "keywords": [
+    "agents",
+    "experiments",
+    "autoresearch",
+    "review"
+  ],
   "skills": "./skills/",
-  "mcpServers": {
-    "autoexp": {
-      "command": "autoexp",
-      "args": ["mcp"]
-    }
-  },
   "interface": {
     "displayName": "Autoexp",
-    "shortDescription": "Run reproducible agent-led experiments.",
-    "longDescription": "Use Autoexp to run experiments, inspect artifacts, compare attempts, write reports, and drive metric-based Autoresearch loops.",
+    "shortDescription": "Run experiments and review evidence with your agent.",
+    "longDescription": "Start agent-led experiments in an existing repository, preserve immutable evidence, optimize metric-driven Autoresearch attempts, and return browser feedback directly to the agent.",
     "developerName": "Shreyashkar Sahu",
     "category": "Productivity",
-    "capabilities": ["Interactive", "Write"],
+    "capabilities": [
+      "Interactive",
+      "Write"
+    ],
     "websiteURL": "https://github.com/shreyashkar-ml/autoexp",
-    "defaultPrompt": "Use Autoexp to run and compare experiments for this project."
+    "defaultPrompt": [
+      "Use $autoexp:autoexp to start a focused experiment in this repository.",
+      "Use $autoexp:autoexp-review to open the browser review and wait for feedback."
+    ]
   }
 }

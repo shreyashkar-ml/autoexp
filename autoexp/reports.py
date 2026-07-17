@@ -1,128 +1,146 @@
+"""Global report guidance, immutable documents, and synthesis evidence."""
+
+import hashlib
 import uuid
 from pathlib import Path
 
 from .runs import get_run, script_name, source_root_for_run
 from .workspace import (
-    APP_ENV,
-    PARAMS_FILE,
-    PROJECT_CONFIG,
-    PROJECT_REPORT,
-    PROJECT_REPORT_INSTRUCTIONS,
-    ensure_within_project,
-    read_json,
-    resolve_root,
-    run_dir_for,
-    write_json,
-    now,
+    PARAMS_FILE, PROJECT_REPORT, experiment_entry, experiment_id, manifest_files,
+    now, repository_root, resolve_root, run_dir_for, safe_repository_path, write_json,
 )
 
 
-INSIDE_PROJECT_MSG = "report instruction file must stay inside the autoexp project"
-REPORT_CONTRACT = """Use `runs/<run_id>/report/report_bundle.json` as the source of truth for report context. The bundle contains the run id, script name, available `.env` variable names, run metadata, and project-relative paths to the report instruction, experiment params, output artifacts, logs, and expected report directory. Read referenced files only as needed.
-
-Write generated report files under `runs/<run_id>/report/`. Prefer `runs/<run_id>/report/report.md` for the main report unless the user asks for a different filename or format. Additional generated images, tables, data files, or appendices may also live in that same report directory.
-
-Do not assume access to secret values. The bundle intentionally includes environment variable names only. Base the report only on the bundled artifacts and the user's request.
-
-Write the final file as ordinary Markdown, not as a patch or diff. Never prefix every line with `+`, `-`, or other diff markers."""
-
-PROJECT_REPORT_CONTRACT = """Synthesize the project as a whole, not one run at a time. Use `project_summary` as the index, inspect milestone evidence and linked per-run reports as needed, and explain the objective, approaches tried, meaningful comparisons, failures, conclusions, and recommended next steps. Distinguish recorded evidence from inference. Write the finished Markdown with `write_project_report`."""
+REPORT_CONTRACT = """Use the global run report bundle as the source of truth. Read only the referenced immutable outputs, logs, source snapshot, report guidance, and safe secret-key availability metadata. Never request or include secret values. Write generated report files under the run's global report directory."""
+PROJECT_REPORT_CONTRACT = """Synthesize the experiment as a whole from recorded runs, milestones, reports, insights, and Autoresearch attempts. Distinguish evidence from inference and cite run IDs."""
 
 
-def _safe_path(base, rel, message=INSIDE_PROJECT_MSG):
-    base = Path(base).resolve()
-    path = base / rel
-    if path.is_symlink() or not path.resolve().is_relative_to(base):
-        raise ValueError(message)
-    return path
+def _hash_file(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def _config(root):
-    config = read_json(_safe_path(root, PROJECT_CONFIG))
-    if not isinstance(config, dict):
-        raise ValueError(f"{PROJECT_CONFIG} must contain a JSON object")
-    return config
+def _redacted_bytes(data, root):
+    from .runner import app_env
+
+    for value in sorted({value.encode() for value in app_env(root).values() if value}, key=len, reverse=True):
+        data = data.replace(value, b"[redacted]")
+    return data
 
 
 def app_env_keys(root=None):
-    """Names of the variables declared in .env (values are never returned)."""
-    root = resolve_root(root)
-    path = _safe_path(root, APP_ENV, ".env must stay inside the autoexp project")
-    if not path.exists():
-        return []
-    keys = []
-    for line in path.read_text().splitlines():
-        line = line.strip()
-        if line and not line.startswith("#") and "=" in line:
-            keys.append(line.split("=", 1)[0].strip())
-    return keys
+    return [
+        key["name"]
+        for item in manifest_files(root)
+        if item["role"] == "secret-source"
+        for key in item["secret_keys"]
+    ]
 
 
 def report_instruction(root=None):
-    """Read the editable, project-specific report guidance."""
-    root = resolve_root(root)
-    configured = _config(root).get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS
-    path = ensure_within_project(configured, INSIDE_PROJECT_MSG)
-    target = _safe_path(root, path)
-    if not target.is_file():
-        raise FileNotFoundError(f"missing report instruction file: {configured}")
-    text = target.read_text().rstrip()
-    if text.endswith(REPORT_CONTRACT):
-        text = text.removesuffix(REPORT_CONTRACT).rstrip()
-    return {"source": target.relative_to(root).as_posix(), "text": text + "\n"}
+    entry = experiment_entry(resolve_root(root))
+    return {"source": "global:report-guidance", "text": entry["report_guidance"]}
 
 
 def report_generation_instruction(root=None):
-    """Join project guidance with Autoexp's invariant report contract."""
     instruction = report_instruction(root)
     return {**instruction, "text": f"{instruction['text'].rstrip()}\n\n{REPORT_CONTRACT}\n"}
 
 
 def set_report_instruction(path, root=None):
-    """Point the project at a different report-instruction file."""
     root = resolve_root(root)
-    path = Path(path)
-    if path.is_absolute():
-        try:
-            path = path.relative_to(root)
-        except ValueError:
-            raise ValueError(INSIDE_PROJECT_MSG)
-    path = ensure_within_project(path, INSIDE_PROJECT_MSG)
-    if not _safe_path(root, path).is_file():
-        raise FileNotFoundError(f"missing report instruction file: {path}")
-    config_path = _safe_path(root, PROJECT_CONFIG)
-    cfg = _config(root)
-    cfg["report_instruction_file"] = path.as_posix()
-    write_json(config_path, cfg)
-    return path.as_posix()
+    source = Path(path).expanduser()
+    if not source.is_absolute():
+        source = safe_repository_path(root, source)
+    if not source.is_file() or not source.resolve().is_relative_to(repository_root(root)):
+        raise ValueError("report guidance must be a file inside the registered repository")
+    return write_report_instruction(source.read_text(), root)
 
 
 def write_report_instruction(text, root=None):
-    """Overwrite the active report-instruction file's text."""
+    from .store import db
+
     if not isinstance(text, str):
         raise ValueError("text must be a string")
     root = resolve_root(root)
-    config_path = _safe_path(root, PROJECT_CONFIG)
-    cfg = _config(root)
-    path = ensure_within_project(
-        cfg.get("report_instruction_file") or PROJECT_REPORT_INSTRUCTIONS,
-        INSIDE_PROJECT_MSG,
+    from .runner import redact_secrets
+    text = redact_secrets(text, root)
+    conn = db()
+    conn.execute(
+        "update experiments set report_guidance = ?, updated_at = ? where experiment_id = ?",
+        (text, now(), experiment_id(root)),
     )
-    target = _safe_path(root, path)
-    target.parent.mkdir(parents=True, exist_ok=True)
-    target.write_text(text)
-    if cfg.get("report_instruction_file") != path.as_posix():
-        cfg["report_instruction_file"] = path.as_posix()
-        write_json(config_path, cfg)
+    conn.commit()
+    conn.close()
     return report_instruction(root)
 
 
-def read_project_report(root=None):
-    """Read the one mutable synthesis report for the whole project."""
+def _document(root, path, kind, title, run_id=None):
+    from .store import db
+
     root = resolve_root(root)
-    path = _safe_path(root, PROJECT_REPORT, "project report must stay inside the autoexp project")
+    path = Path(path).resolve()
+    if kind not in {"report", "insight"}:
+        raise ValueError("document kind must be report or insight")
+    if not path.is_file() or not path.is_relative_to(root.resolve()):
+        raise ValueError("document must stay inside global Autoexp storage")
+    rel = path.relative_to(root).as_posix()
+    document_id = f"doc_{uuid.uuid4().hex[:12]}"
+    conn = db()
+    if run_id:
+        owner = conn.execute("select experiment_id from runs where run_id = ?", (run_id,)).fetchone()
+        if not owner or owner["experiment_id"] != experiment_id(root):
+            conn.close()
+            raise ValueError("document run_id must belong to this experiment")
+    conn.execute(
+        """insert into documents(document_id, experiment_id, run_id, kind, title, path,
+             content_hash, size_bytes, created_at) values (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (
+            document_id, experiment_id(root), run_id, kind, title, rel,
+            _hash_file(path), path.stat().st_size, now(),
+        ),
+    )
+    conn.commit()
+    row = conn.execute("select * from documents where document_id = ?", (document_id,)).fetchone()
+    conn.close()
+    return dict(row)
+
+
+def list_documents(root=None, kind=None):
+    from .store import db
+
+    root = resolve_root(root)
+    conn = db()
+    sql = "select * from documents where experiment_id = ?"
+    args = [experiment_id(root)]
+    if kind:
+        sql += " and kind = ?"
+        args.append(kind)
+    rows = conn.execute(sql + " order by created_at desc, rowid desc", args).fetchall()
+    conn.close()
+    return [dict(row) for row in rows]
+
+
+def add_document(path, *, kind, title=None, root=None, run_id=None):
+    root = resolve_root(root)
+    source = Path(path).expanduser().resolve()
+    if not source.is_file():
+        raise FileNotFoundError(source)
+    directory = root / ("insights" if kind == "insight" else "reports")
+    directory.mkdir(parents=True, exist_ok=True)
+    destination = directory / f"{source.stem}-{uuid.uuid4().hex[:8]}{source.suffix}"
+    destination.write_bytes(_redacted_bytes(source.read_bytes(), root))
+    return _document(root, destination, kind, title or source.stem.replace("_", " "), run_id)
+
+
+def read_project_report(root=None):
+    root = resolve_root(root)
+    documents = [item for item in list_documents(root, "report") if item.get("run_id") is None]
+    if documents:
+        path = root / documents[0]["path"]
+    else:
+        path = root / PROJECT_REPORT
     return {
-        "path": PROJECT_REPORT,
+        "path": path.relative_to(root).as_posix() if path.is_relative_to(root) else PROJECT_REPORT,
         "text": path.read_text(errors="replace") if path.is_file() else "",
         "exists": path.is_file(),
     }
@@ -132,40 +150,50 @@ def write_project_report(text, root=None):
     if not isinstance(text, str):
         raise ValueError("text must be a string")
     root = resolve_root(root)
-    path = _safe_path(root, PROJECT_REPORT, "project report must stay inside the autoexp project")
+    from .runner import redact_secrets
+    path = root / "reports" / f"experiment-report-{uuid.uuid4().hex[:8]}.md"
     path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(text)
-    return read_project_report(root)
+    path.write_text(redact_secrets(text, root))
+    return _document(root, path, "report", "Experiment report")
 
 
 def mark_milestone(*, title, significance, run_id=None, attempt_id=None, actor_name=None, root=None):
-    """Attach one concise, append-only finding to a recorded run or research attempt."""
     from .store import db, init_db
 
     root = resolve_root(root)
     init_db(root)
     if bool(run_id) == bool(attempt_id):
         raise ValueError("provide exactly one of run_id or attempt_id")
-    if not isinstance(title, str) or not title.strip():
-        raise ValueError("title is required")
-    if not isinstance(significance, str) or not significance.strip():
-        raise ValueError("significance is required")
+    if not isinstance(title, str) or not title.strip() or not isinstance(significance, str) or not significance.strip():
+        raise ValueError("title and significance are required")
     kind, target = ("run", run_id) if run_id else ("attempt", attempt_id)
-    conn = db(root)
+    conn = db()
     if kind == "run":
-        exists = conn.execute("select 1 from runs where run_id = ?", (target,)).fetchone()
+        exists = conn.execute(
+            "select 1 from runs where run_id = ? and experiment_id = ?",
+            (target, experiment_id(root)),
+        ).fetchone()
     else:
         exists = conn.execute(
-            "select 1 from research_attempts where attempt_id = ? or contract_id || ':' || attempt_id = ?",
-            (target, target),
+            """select 1 from research_attempts a join research_contracts c
+                 on c.contract_id = a.contract_id
+               where a.attempt_id = ? and c.experiment_id = ?""",
+            (target, experiment_id(root)),
         ).fetchone()
     if not exists:
         conn.close()
         raise ValueError(f"unknown {kind}: {target}")
+    from .runner import redact_secrets
     milestone_id = f"ms_{uuid.uuid4().hex[:12]}"
     conn.execute(
-        "insert into milestones values (?, ?, ?, ?, ?, ?, ?)",
-        (milestone_id, kind, target, title.strip()[:120], significance.strip(), actor_name, now()),
+        "insert into milestones values (?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            milestone_id, experiment_id(root), kind, target,
+            redact_secrets(title.strip()[:120], root),
+            redact_secrets(significance.strip(), root),
+            redact_secrets(str(actor_name), root) if actor_name is not None else None,
+            now(),
+        ),
     )
     conn.commit()
     conn.close()
@@ -173,103 +201,58 @@ def mark_milestone(*, title, significance, run_id=None, attempt_id=None, actor_n
 
 
 def list_milestones(root=None):
-    """Return remarkable evidence with enough linked context for an agent to inspect it."""
-    from .runtime import run_report
     from .store import db, init_db
 
     root = resolve_root(root)
     init_db(root)
-    conn = db(root)
-    rows = conn.execute("select * from milestones order by created_at desc, rowid desc").fetchall()
-    items = []
-    for row in rows:
-        item = dict(row)
-        run_id = item["target_id"] if item["target_kind"] == "run" else None
-        if item["target_kind"] == "attempt":
-            attempt = conn.execute(
-                """select contract_id, attempt_id, hypothesis, score, verdict, improvement, run_id
-                   from research_attempts
-                   where attempt_id = ? or contract_id || ':' || attempt_id = ?
-                   order by rowid desc limit 1""",
-                (item["target_id"], item["target_id"]),
-            ).fetchone()
-            item["attempt"] = dict(attempt) if attempt else None
-            run_id = attempt["run_id"] if attempt else None
-        item["run_id"] = run_id
-        if run_id:
-            report = run_report(run_id, root)
-            item["report_path"] = report.get("path") or ""
-            item["report_excerpt"] = report.get("text", "")[:4000]
-        items.append(item)
+    conn = db()
+    rows = conn.execute(
+        "select * from milestones where experiment_id = ? order by created_at desc, rowid desc",
+        (experiment_id(root),),
+    ).fetchall()
     conn.close()
-    return items
+    return [dict(row) for row in rows]
 
 
 def project_summary(root=None, limit=20):
-    """Return the compact project-level evidence index used for final synthesis."""
     from .runtime import list_runs
-    from .workspace import project_entry, project_mode
+    from .workspace import project_mode
 
     root = resolve_root(root)
-    mode = project_mode(root)
     result = {
-        "project": project_entry(root),
-        "mode": mode,
-        "project_report": read_project_report(root),
-        "milestones": list_milestones(root),
-        "runs": list_runs(limit, root),
+        "experiment": experiment_entry(root), "mode": project_mode(root),
+        "project_report": read_project_report(root), "documents": list_documents(root),
+        "milestones": list_milestones(root), "runs": list_runs(limit, root),
         "report_contract": PROJECT_REPORT_CONTRACT,
     }
-    if mode == "autoresearch":
+    if result["mode"] == "autoresearch":
         from .autoresearch import for_project
-
-        state = for_project(root).state()
-        result["autoresearch"] = {
-            "objective": state["objective"],
-            "contract": state["contract"],
-            "experiments": state["experiments"],
-            "loop": state["loop"],
-        }
+        result["autoresearch"] = for_project(root).state()
     return result
 
 
 def write_report_bundle(run_id, root=None):
-    """Write runs/<id>/report/report_bundle.json: pointers a reporter needs in one place."""
     root = resolve_root(root)
     run = get_run(run_id, root)
     run_dir = run_dir_for(run, root)
     if not run_dir.exists():
-        raise FileNotFoundError(f"missing run directory: {run_dir.relative_to(root)}")
+        raise FileNotFoundError(f"missing run directory: {run_dir}")
     source_root = source_root_for_run(run, root)
-    params_path = _safe_path(source_root, PARAMS_FILE, "run params path is unsafe")
-    report_dir = _safe_path(run_dir, "report", "run report directory is unsafe")
-    bundle_path = _safe_path(report_dir, "report_bundle.json", "report bundle path is unsafe")
+    report_dir = run_dir / "report"
+    bundle_path = report_dir / "report_bundle.json"
     report_dir.mkdir(parents=True, exist_ok=True)
     from .artifacts import list_artifacts
-
     indexed = list_artifacts(run_id, root)
-    run_prefix = run_dir.relative_to(root).as_posix()
     bundle = {
-        "bundle_path": bundle_path.relative_to(root).as_posix(),
-        "run_id": run_id,
+        "bundle_path": bundle_path.relative_to(root).as_posix(), "run_id": run_id,
         "script": run.get("script_name") or script_name(run_id, source_root),
-        "report": run.get("report_path") or "",
         "report_dir": report_dir.relative_to(root).as_posix(),
-        "app_env_keys": app_env_keys(root),
-        "instruction": report_instruction(root)["source"],
-        "script_params": params_path.relative_to(root).as_posix() if params_path.exists() else "",
+        "secret_keys": app_env_keys(root), "instruction": "global:report-guidance",
+        "script_params": (source_root / PARAMS_FILE).relative_to(root).as_posix(),
         "run": {key: run.get(key) for key in ("status", "created_at", "output_hash", "capsule_hash")},
         "artifacts": {
-            "output": [
-                f"{run_prefix}/{item['path']}"
-                for item in indexed
-                if item["category"] == "output"
-            ],
-            "logs": [
-                f"{run_prefix}/{item['path']}"
-                for item in indexed
-                if item["category"] == "log"
-            ],
+            category: [f"{run['run_dir']}/{item['path']}" for item in indexed if item["category"] == category]
+            for category in ("output", "log", "report")
         },
     }
     write_json(bundle_path, bundle)
