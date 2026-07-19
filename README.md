@@ -4,20 +4,38 @@
 
 # autoexp
 
-**Harness engineering for agent-led experimentation and Autoresearch.**
+**Harness engineering for agent-led `experimentation` and `autoresearch`.**
 
-Autoexp is a harness engineering framework for coding agents working inside an existing Git repository. It turns one-off edits and shell commands into a controlled experiment loop: define what may change, pin exactly what ran, capture the evidence, judge the outcome, and keep or revert the result.
+Autoexp is a local, browser-based experimentation surface for AI coding agents: Claude Code, Codex, OpenCode, Pi.
 
 Coding agents are already good at proposing code. The harder problem is the harness around those proposals: source boundaries, reproducible execution, external inputs, evaluators, artifacts, lineage, rollback, and human review. Autoexp supplies that infrastructure while your repository remains the editable source of truth.
 
 - **Harness-first** — connect source, runners, inputs, evaluators, evidence, and decisions in one reproducible loop.
 - **Agent-native** — describe the goal in natural language; the installed skill handles the workflow.
-- **Works in the repo you already have** — no `.autoexp`, generated agent instructions, or copied project tree.
 - **Two decision policies** — compare open-ended variants with Standard experiments or optimize a frozen scalar metric with Autoresearch.
 - **Evidence, not chat history** — every attempt remains inspectable and reproducible, including failures and reverted candidates.
 - **Human review when it matters** — the agent can open a browser handoff and receive your scoped feedback directly.
 
-![Autoexp dashboard showing experiment variants, immutable run evidence, milestones, and the project report](assets/autoexp_demo.png)
+<table>
+  <tr>
+    <td width="36%">
+      <h3>Standard Experiments</h3>
+      <p>Compare variants, inspect immutable evidence, and turn results into a clear recommendation.</p>
+    </td>
+    <td width="64%">
+      <img src="assets/autoexp_demo.png" alt="Autoexp dashboard showing experiment variants, immutable run evidence, milestones, and the project report">
+    </td>
+  </tr>
+  <tr>
+    <td width="36%">
+      <h3>Autoresearch</h3>
+      <p>Optimize a measurable objective with a frozen evaluator and a keep-or-revert loop.</p>
+    </td>
+    <td width="64%">
+      <img src="assets/autoresearch_demo.png" alt="Autoexp Autoresearch dashboard showing the scored loop, final state, and attempt ledger">
+    </td>
+  </tr>
+</table>
 
 ## The harness model
 
@@ -35,32 +53,47 @@ Autoexp does not replace your benchmark, simulator, evaluator, or domain logic. 
 
 ## Install and connect your agent
 
-Install the runtime and bare agent commands in one step:
+First, install the runtime:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/shreyashkar-ml/autoexp/main/install.sh | bash
 ```
 
-The installer updates the `autoexp` CLI and installs `$autoexp` / `$autoexp-review` for Codex plus `/autoexp` / `/autoexp-review` for Claude Code. Restart your agent after installation.
+Then choose your agent and install its plugin:
+
+<table>
+  <tr>
+    <td width="50%">
+      <details open>
+        <summary><strong>Codex</strong></summary>
+        <br>
+        <pre><code>codex plugin marketplace add shreyashkar-ml/autoexp
+codex plugin add autoexp@autoexp</code></pre>
+      </details>
+    </td>
+    <td width="50%">
+      <details>
+        <summary><strong>Claude Code</strong></summary>
+        <br>
+        <pre><code>claude plugin marketplace add shreyashkar-ml/autoexp
+claude plugin install autoexp@autoexp</code></pre>
+      </details>
+    </td>
+  </tr>
+</table>
+
+Restart your agent after both steps.
 
 Supports macOS, Linux, and WSL. Requires `uv`, Git, curl, and Python 3.11+. Docker is optional per experiment. Autoexp does not need a model API key or an MCP server.
 
 <details>
-<summary>CLI-only or marketplace installation</summary>
+<summary>CLI-only installation</summary>
 
 ```bash
 uv tool install "git+https://github.com/shreyashkar-ml/autoexp.git"
 ```
 
-This installs only the runtime. The plugin marketplaces remain available, but plugin-provided skills are necessarily namespaced:
-
-```bash
-codex plugin marketplace add shreyashkar-ml/autoexp
-codex plugin add autoexp@autoexp
-
-claude plugin marketplace add shreyashkar-ml/autoexp
-claude plugin install autoexp@autoexp
-```
+This installs only the runtime.
 
 </details>
 
@@ -135,8 +168,6 @@ The agent creates or adapts three ordinary repository boundaries—a research pr
 3. execute an immutable run and extract the configured metric;
 4. keep an improvement or restore the prior best;
 5. retain the hypothesis, score, verdict, artifacts, and diff either way.
-
-![Autoexp Autoresearch dashboard showing the scored loop, final state, and attempt ledger](assets/autoresearch_demo.png)
 
 A deliberate evaluator change starts a new contract boundary. Reverted attempts remain first-class evidence; only the current-best pointer moves back.
 
