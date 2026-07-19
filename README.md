@@ -4,19 +4,34 @@
 
 # autoexp
 
-**Turn your coding agent into a disciplined experimenter.**
+**Harness engineering for agent-led experimentation and Autoresearch.**
 
-Autoexp is an agent-first plugin for running experiments and Autoresearch inside an existing Git repository. Tell Codex, Claude Code, or another Agent Skills-compatible coding agent what you want to test. The agent adapts the repository, runs focused variants, compares evidence, and brings the results back through a visual review surface.
+Autoexp is a harness engineering framework for coding agents working inside an existing Git repository. It turns one-off edits and shell commands into a controlled experiment loop: define what may change, pin exactly what ran, capture the evidence, judge the outcome, and keep or revert the result.
 
-You do not create an Autoexp project, maintain a second workspace, or hand-configure run folders. Your repository stays the editable source of truth; Autoexp gives the agent a local execution ledger for immutable source snapshots, logs, artifacts, diffs, reports, scores, and decisions.
+Coding agents are already good at proposing code. The harder problem is the harness around those proposals: source boundaries, reproducible execution, external inputs, evaluators, artifacts, lineage, rollback, and human review. Autoexp supplies that infrastructure while your repository remains the editable source of truth.
 
+- **Harness-first** — connect source, runners, inputs, evaluators, evidence, and decisions in one reproducible loop.
 - **Agent-native** — describe the goal in natural language; the installed skill handles the workflow.
 - **Works in the repo you already have** — no `.autoexp`, generated agent instructions, or copied project tree.
-- **Standard experiments and Autoresearch** — compare open-ended variants or optimize against a frozen scalar evaluator.
+- **Two decision policies** — compare open-ended variants with Standard experiments or optimize a frozen scalar metric with Autoresearch.
 - **Evidence, not chat history** — every attempt remains inspectable and reproducible, including failures and reverted candidates.
 - **Human review when it matters** — the agent can open a browser handoff and receive your scoped feedback directly.
 
 ![Autoexp dashboard showing experiment variants, immutable run evidence, milestones, and the project report](assets/autoexp_demo.png)
+
+## The harness model
+
+Autoexp provides the reusable control plane around project-specific experiments:
+
+| Harness layer | Autoexp responsibility |
+| --- | --- |
+| Source boundary | Declare editable, supporting, input, secret, and frozen files. |
+| Execution boundary | Pin source, parameters, external inputs, runner identity, and environment handoff. |
+| Evidence boundary | Seal logs, outputs, artifacts, reports, hashes, lineage, and diffs. |
+| Decision boundary | Compare variants manually or keep/revert candidates from a frozen metric. |
+| Review boundary | Return inspectable evidence and scoped human feedback to the agent. |
+
+Autoexp does not replace your benchmark, simulator, evaluator, or domain logic. It composes them into a reliable harness that an agent can operate repeatedly.
 
 ## Install and connect your agent
 
@@ -84,28 +99,28 @@ The plugin teaches the agent to:
 6. preserve the conclusion outside the repository and open a review handoff when your judgement is needed.
 
 ```text
-You describe the experiment
+You define the objective and harness boundaries
           ↓
-Your agent edits and runs the existing repository
+Your agent proposes a focused repository change
           ↓
-Autoexp seals every attempt, artifact, score, and diff
+Autoexp pins execution and seals the resulting evidence
           ↓
-Browser review returns structured feedback to the agent
+A metric or human review decides what happens next
 ```
 
-Autoexp creates no repository-local configuration, `runs/` directory, `.mcp.json`, `.codex`, or generated report files. If the repository lacks an experiment harness, the agent creates normal project files that follow the repository’s conventions—not Autoexp scaffolding.
+Autoexp creates no repository-local configuration, `runs/` directory, `.mcp.json`, `.codex`, or generated report files. If the repository lacks a benchmark or evaluator, the agent creates normal project files that follow the repository’s conventions—not Autoexp scaffolding.
 
-## Two experimentation flows
+## Two policies on one harness
 
 ### Standard experiments
 
-Use Standard mode for qualitative, comparative, exploratory, and multi-variant work: prompt comparisons, architecture alternatives, benchmark studies, data transformations, simulation outputs, or any investigation where one scalar cannot decide the winner.
+Standard mode leaves the verdict to the agent or a human reviewer. Use it for qualitative, comparative, exploratory, and multi-variant work: prompt comparisons, architecture alternatives, benchmark studies, data transformations, simulation outputs, or any investigation where one scalar cannot decide the winner.
 
 The agent iterates through normal repository changes and asks Autoexp to seal each run. Autoexp keeps the exact source, runner identity, logs, outputs, artifacts, lineage, and diff, while the agent reasons across the complete record instead of relying on conversation memory.
 
 ### Autoresearch
 
-Use Autoresearch only when a stable scalar metric and a frozen evaluator can automatically decide whether a candidate should be kept or reverted.
+Autoresearch adds an automatic keep/revert policy to the same harness. Use it only when a stable scalar metric and a frozen evaluator can decide whether a candidate improved.
 
 ```text
 Use Autoexp Autoresearch to improve validation_accuracy in this repository.
