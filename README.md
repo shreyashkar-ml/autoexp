@@ -41,7 +41,7 @@ Then choose your agent and install its plugin:
 
 <details>
 <summary>Codex</Summary>
-```text
+```bash
 codex plugin marketplace add shreyashkar-ml/autoexp
 codex plugin add autoexp@autoexp
 ```
@@ -49,7 +49,7 @@ codex plugin add autoexp@autoexp
 
 <details>
 <summary>Claude</summary>
-```text
+```bash
 claude plugin marketplace add shreyashkar-ml/autoexp
 claude plugin install autoexp@autoexp
 ```
