@@ -40,7 +40,8 @@ curl -fsSL https://raw.githubusercontent.com/shreyashkar-ml/autoexp/main/install
 Then choose your agent and install its plugin:
 
 <details>
-<summary>Codex</Summary>
+<summary>Codex</summary>
+
 ```bash
 codex plugin marketplace add shreyashkar-ml/autoexp
 codex plugin add autoexp@autoexp
@@ -49,6 +50,7 @@ codex plugin add autoexp@autoexp
 
 <details>
 <summary>Claude</summary>
+
 ```bash
 claude plugin marketplace add shreyashkar-ml/autoexp
 claude plugin install autoexp@autoexp
